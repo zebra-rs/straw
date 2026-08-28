@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 112 112">
+  <defs>
+    <clipPath id="glass"><path id="gp" d="M32.8125 32.8125 H79.1875 L74.375 87.5 Q73.71875 92.96875 68.25 92.96875 H43.75 Q38.28125 92.96875 37.625 87.5 Z"/></clipPath>
+    <clipPath id="straw"><rect x="-4.15625" y="-39.375" width="8.3125" height="78.75" rx="4.15625"/></clipPath>
+  </defs>
+  <!-- tile -->
+  <rect width="112" height="112" rx="24.5" fill="#FFC94D"/>
+  <g transform="translate(56 56) scale(1.18) translate(-56 -56)">
+  <!-- glass body -->
+  <use href="#gp" fill="#FFFFFF" fill-opacity="0.55"/>
+  <!-- liquid -->
+  <g clip-path="url(#glass)">
+    <rect x="30.625" y="59.0625" width="52.5" height="37.1875" fill="#3D9BF5"/>
+    <ellipse cx="56" cy="59.0625" rx="25.15625" ry="4.15625" fill="#7CC3FF"/>
+  </g>
+  <!-- straw -->
+  <g transform="translate(60.375 51.40625) rotate(18)">
+    <g clip-path="url(#straw)">
+      <rect x="-4.15625" y="-39.375" width="8.3125" height="78.75" fill="#F7F7F7"/>
+      <rect x="-13.125" y="-48.34375" width="26.25" height="4.8125" transform="rotate(-45 0 -45.9375)" fill="#E5484D"/>
+      <rect x="-13.125" y="-36.3125" width="26.25" height="4.8125" transform="rotate(-45 0 -33.90625)" fill="#E5484D"/>
+      <rect x="-13.125" y="-24.28125" width="26.25" height="4.8125" transform="rotate(-45 0 -21.875)" fill="#E5484D"/>
+      <rect x="-13.125" y="-12.25" width="26.25" height="4.8125" transform="rotate(-45 0 -9.84375)" fill="#E5484D"/>
+      <rect x="-13.125" y="-0.21875" width="26.25" height="4.8125" transform="rotate(-45 0 2.1875)" fill="#E5484D"/>
+      <rect x="-13.125" y="11.8125" width="26.25" height="4.8125" transform="rotate(-45 0 14.21875)" fill="#E5484D"/>
+      <rect x="-13.125" y="23.84375" width="26.25" height="4.8125" transform="rotate(-45 0 26.25)" fill="#E5484D"/>
+      <rect x="-13.125" y="35.875" width="26.25" height="4.8125" transform="rotate(-45 0 38.28125)" fill="#E5484D"/>
+    </g>
+  </g>
+  <!-- liquid tint over submerged straw -->
+  <g clip-path="url(#glass)">
+    <rect x="30.625" y="59.0625" width="52.5" height="37.1875" fill="#3D9BF5" fill-opacity="0.55"/>
+  </g>
+  <!-- glass outline -->
+  <use href="#gp" fill="none" stroke="#FFFFFF" stroke-width="2.84375" stroke-linejoin="round"/>
+  </g>
+</svg>
