@@ -9,6 +9,8 @@
 //! - network → client: parse → route lookup → TTL decrement → session sink
 
 pub mod icmp;
+pub mod limiter;
+pub mod nat;
 pub mod packet;
 pub mod router;
 pub mod tun;
@@ -20,9 +22,11 @@ use tokio::sync::mpsc;
 
 use crate::capsule::{AssignedAddress, IpAddressRange};
 use crate::error::ForwardingError;
+use crate::metrics::Metrics;
 use crate::session::SessionId;
 
 use self::icmp::{IcmpErrorKind, IcmpSource, build_icmp_error};
+use self::limiter::{RateLimits, SessionLimiter};
 use self::router::RouteTable;
 
 /// Where a client packet ended up.
@@ -60,12 +64,17 @@ pub struct ForwardingEngine {
     session_sinks: DashMap<SessionId, mpsc::Sender<Bytes>>,
     /// Per-session egress policies (the advertised routes).
     policies: DashMap<SessionId, EgressPolicy>,
+    /// Per-session token buckets; absent when limits are unlimited.
+    limiters: DashMap<SessionId, SessionLimiter>,
     /// Packets bound for the network; `None` when running without a TUN.
     tun_tx: Option<mpsc::Sender<Bytes>>,
     /// Tunnel MTU enforced on both directions.
     mtu: usize,
     /// Source addresses for generated ICMP errors (the pool gateways).
     icmp_source: IcmpSource,
+    /// Per-session rate limits applied to client traffic.
+    limits: RateLimits,
+    metrics: Arc<Metrics>,
 }
 
 impl ForwardingEngine {
@@ -74,14 +83,19 @@ impl ForwardingEngine {
         tun_tx: Option<mpsc::Sender<Bytes>>,
         mtu: u16,
         icmp_source: IcmpSource,
+        limits: RateLimits,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             route_table,
             session_sinks: DashMap::new(),
             policies: DashMap::new(),
+            limiters: DashMap::new(),
             tun_tx,
             mtu: mtu as usize,
             icmp_source,
+            limits,
+            metrics,
         }
     }
 
@@ -94,21 +108,52 @@ impl ForwardingEngine {
     pub fn register_session(&self, id: SessionId, sink: mpsc::Sender<Bytes>, policy: EgressPolicy) {
         self.session_sinks.insert(id, sink);
         self.policies.insert(id, policy);
+        if !self.limits.is_unlimited() {
+            self.limiters.insert(id, SessionLimiter::new(self.limits));
+        }
     }
 
-    /// Remove a session's sink and policy (teardown).
+    /// Remove a session's sink, policy and limiter (teardown).
     pub fn unregister_session(&self, id: SessionId) {
         self.session_sinks.remove(&id);
         self.policies.remove(&id);
+        self.limiters.remove(&id);
     }
 
     /// Process a packet received from a client tunnel.
     ///
-    /// Validates (BCP 38 source check, MTU, destination sanity, egress
-    /// policy), acts as one IP hop (TTL decrement), then either hairpins to
-    /// another session or hands the packet to the TUN device. Drops that a
-    /// router would report earn an ICMP error back to the sender (§7.2).
+    /// Rate-limits, validates (BCP 38 source check, MTU, destination
+    /// sanity, egress policy), acts as one IP hop (TTL decrement), then
+    /// either hairpins to another session or hands the packet to the TUN
+    /// device. Drops that a router would report earn an ICMP error back to
+    /// the sender (§7.2).
     pub fn forward_from_client(
+        &self,
+        from: SessionId,
+        assigned: &[AssignedAddress],
+        packet: Vec<u8>,
+    ) -> Result<Forwarded, ForwardingError> {
+        Metrics::add(&self.metrics.bytes_from_client_total, packet.len() as u64);
+
+        // Rate limiting first: over-limit traffic must not cost validation
+        // work, and is dropped silently (Step 25).
+        if let Some(limiter) = self.limiters.get(&from)
+            && !limiter.try_consume(packet.len() as u64)
+        {
+            Metrics::incr(&self.metrics.packets_rate_limited_total);
+            return Err(ForwardingError::RateLimited);
+        }
+
+        let result = self.forward_validated(from, assigned, packet);
+        match &result {
+            Ok(Forwarded::Hairpin(_)) => Metrics::incr(&self.metrics.packets_hairpin_total),
+            Ok(Forwarded::Tun) => Metrics::incr(&self.metrics.packets_tun_out_total),
+            Err(_) => Metrics::incr(&self.metrics.packets_dropped_total),
+        }
+        result
+    }
+
+    fn forward_validated(
         &self,
         from: SessionId,
         assigned: &[AssignedAddress],
@@ -182,6 +227,7 @@ impl ForwardingEngine {
         if let Err(e) = self.deliver_to_session(to, Bytes::from(icmp_packet)) {
             tracing::trace!(session = %to, "ICMP error not delivered: {e}");
         } else {
+            Metrics::incr(&self.metrics.icmp_errors_sent_total);
             tracing::trace!(session = %to, ?kind, "ICMP error sent");
         }
     }
@@ -207,10 +253,14 @@ impl ForwardingEngine {
             .session_sinks
             .get(&id)
             .ok_or(ForwardingError::NoRoute)?;
+        let len = packet.len() as u64;
         // Datagram semantics: drop on backpressure instead of blocking the
         // whole data plane.
         sink.try_send(packet)
-            .map_err(|_| ForwardingError::Congested)
+            .map_err(|_| ForwardingError::Congested)?;
+        Metrics::incr(&self.metrics.packets_to_client_total);
+        Metrics::add(&self.metrics.bytes_to_client_total, len);
+        Ok(())
     }
 
     /// Drive TUN → sessions: read packets from the TUN ingress channel and
@@ -256,12 +306,21 @@ mod tests {
     }
 
     fn engine_no_tun(mtu: u16) -> (Arc<ForwardingEngine>, Arc<RouteTable>) {
+        engine_with_limits(mtu, RateLimits::default())
+    }
+
+    fn engine_with_limits(
+        mtu: u16,
+        limits: RateLimits,
+    ) -> (Arc<ForwardingEngine>, Arc<RouteTable>) {
         let table = Arc::new(RouteTable::new());
         let engine = Arc::new(ForwardingEngine::new(
             table.clone(),
             None,
             mtu,
             test_icmp_source(),
+            limits,
+            Arc::new(Metrics::default()),
         ));
         (engine, table)
     }
@@ -394,6 +453,42 @@ mod tests {
         assert_eq!(icmp_reply[20], 11, "Time Exceeded");
         // The quoted original still carries TTL 1 (pre-decrement).
         assert_eq!(icmp_reply[28 + 8], 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_drops_excess_packets() {
+        let (engine, table) = engine_with_limits(
+            1400,
+            RateLimits {
+                packets_per_sec: 2,
+                bytes_per_sec: 0,
+            },
+        );
+        let a = SessionId(0);
+        let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        engine.register_session(a, tx_a, allow_all_policy());
+        table.insert_client_addr(addr_a.into(), a);
+
+        let ping = || build_ipv4_icmp_echo(addr_a, addr_a, false, 1, 1, b"x", 64);
+        assert!(
+            engine
+                .forward_from_client(a, &assigned(addr_a), ping())
+                .is_ok()
+        );
+        assert!(
+            engine
+                .forward_from_client(a, &assigned(addr_a), ping())
+                .is_ok()
+        );
+        let err = engine
+            .forward_from_client(a, &assigned(addr_a), ping())
+            .unwrap_err();
+        assert!(matches!(err, ForwardingError::RateLimited));
+        // Two delivered, nothing else (silent drop: no ICMP either).
+        assert!(rx_a.recv().await.is_some());
+        assert!(rx_a.recv().await.is_some());
+        assert!(rx_a.try_recv().is_err());
     }
 
     #[tokio::test]

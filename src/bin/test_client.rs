@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use straw::client::{TlsMode, TunnelClient};
+use straw::client::{ClientAuth, TlsMode, TunnelClient};
 use straw::error::ProxyError;
 use straw::forwarding::packet::{build_ipv4_icmp_echo, parse_packet};
 
@@ -37,6 +37,10 @@ struct Args {
     /// Trust this CA / self-signed certificate (PEM).
     #[arg(long, conflicts_with = "insecure")]
     ca_cert: Option<PathBuf>,
+
+    /// Authenticate with this bearer token.
+    #[arg(long)]
+    bearer_token: Option<String>,
 
     /// Ping this tunnel address instead of the client's own assigned one.
     #[arg(long)]
@@ -85,7 +89,12 @@ async fn run() -> Result<(), ProxyError> {
         "connecting to {} (sni {})...",
         args.server_addr, args.server_name
     );
-    let mut client = TunnelClient::connect(args.server_addr, &args.server_name, tls_mode).await?;
+    let auth = match &args.bearer_token {
+        Some(token) => ClientAuth::Bearer(token.clone()),
+        None => ClientAuth::None,
+    };
+    let mut client =
+        TunnelClient::connect_with(args.server_addr, &args.server_name, tls_mode, auth).await?;
     println!("tunnel accepted (200, capsule-protocol)");
 
     client.wait_for_assignment().await?;

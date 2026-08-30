@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use http::{Method, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::capsule::{
     AddressRequest, AssignedAddress, Capsule, CapsuleBuffer, IpAddressRange, RequestedAddress,
@@ -31,6 +31,24 @@ pub enum TlsMode {
     Insecure,
     /// Trust exactly this CA / self-signed certificate.
     Ca(CertificateDer<'static>),
+    /// Trust `ca` and present a client certificate (mTLS).
+    Mtls {
+        ca: CertificateDer<'static>,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    },
+}
+
+/// Request-level credentials sent with the Extended CONNECT.
+#[derive(Debug, Clone, Default)]
+pub enum ClientAuth {
+    #[default]
+    None,
+    Bearer(String),
+    Basic {
+        user: String,
+        password: String,
+    },
 }
 
 type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -59,9 +77,24 @@ impl TunnelClient {
         server_name: &str,
         tls_mode: TlsMode,
     ) -> Result<Self, ProxyError> {
+        Self::connect_with(server_addr, server_name, tls_mode, ClientAuth::None).await
+    }
+
+    /// [`TunnelClient::connect`] with request credentials.
+    pub async fn connect_with(
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls_mode: TlsMode,
+        auth: ClientAuth,
+    ) -> Result<Self, ProxyError> {
         let tls_config = match tls_mode {
             TlsMode::Insecure => tls::build_client_tls_config_insecure()?,
             TlsMode::Ca(cert) => tls::build_client_tls_config_with_ca(cert)?,
+            TlsMode::Mtls {
+                ca,
+                cert_chain,
+                key,
+            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
         };
         let quic_tls =
             QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
@@ -101,11 +134,24 @@ impl TunnelClient {
             unreachable!("connect-ip is a valid protocol token");
         };
         let authority = format!("{server_name}:{}", server_addr.port());
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(Method::CONNECT)
             .uri(format!("https://{authority}/.well-known/masque/ip/*/*/"))
             .header("capsule-protocol", "?1")
-            .extension(protocol)
+            .extension(protocol);
+        match auth {
+            ClientAuth::None => {}
+            ClientAuth::Bearer(token) => {
+                builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            ClientAuth::Basic { user, password } => {
+                use base64::Engine as _;
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+                builder = builder.header(http::header::AUTHORIZATION, format!("Basic {encoded}"));
+            }
+        }
+        let request = builder
             .body(())
             .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?;
 

@@ -80,6 +80,84 @@ pub fn build_server_tls_config(
     Ok(config)
 }
 
+/// Server config that additionally requires a client certificate chaining
+/// to `client_ca` (mTLS, design §11.3).
+pub fn build_server_tls_config_with_client_auth(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    client_ca: Vec<CertificateDer<'static>>,
+) -> Result<rustls::ServerConfig, ProxyError> {
+    let mut roots = RootCertStore::empty();
+    for ca in client_ca {
+        roots.add(ca).map_err(|e| ProxyError::Tls(e.to_string()))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        ring_provider(),
+    )
+    .build()
+    .map_err(|e| ProxyError::Tls(e.to_string()))?;
+
+    let mut config = rustls::ServerConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ProxyError::Tls(e.to_string()))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| ProxyError::Tls(e.to_string()))?;
+    config.alpn_protocols = vec![ALPN_H3.to_vec()];
+    Ok(config)
+}
+
+/// Client config trusting `ca` and presenting a client certificate (mTLS).
+pub fn build_client_tls_config_mtls(
+    ca: CertificateDer<'static>,
+    client_chain: Vec<CertificateDer<'static>>,
+    client_key: PrivateKeyDer<'static>,
+) -> Result<ClientConfig, ProxyError> {
+    let mut roots = RootCertStore::empty();
+    roots.add(ca).map_err(|e| ProxyError::Tls(e.to_string()))?;
+    let mut config = ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| ProxyError::Tls(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_chain, client_key)
+        .map_err(|e| ProxyError::Tls(e.to_string()))?;
+    config.alpn_protocols = vec![ALPN_H3.to_vec()];
+    Ok(config)
+}
+
+/// Generate a CA certificate plus a client certificate signed by it.
+/// Test/dev helper for mTLS setups.
+#[allow(clippy::type_complexity)]
+pub fn generate_client_ca_and_cert(
+    client_name: &str,
+) -> Result<
+    (
+        CertificateDer<'static>,
+        CertificateDer<'static>,
+        PrivateKeyDer<'static>,
+    ),
+    ProxyError,
+> {
+    let err = |e: rcgen::Error| ProxyError::Tls(format!("certificate generation failed: {e}"));
+
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).map_err(err)?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().map_err(err)?;
+    let ca_cert = ca_params.self_signed(&ca_key).map_err(err)?;
+    let ca_der = ca_cert.der().clone();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let client_key = rcgen::KeyPair::generate().map_err(err)?;
+    let client_params =
+        rcgen::CertificateParams::new(vec![client_name.to_string()]).map_err(err)?;
+    let client_cert = client_params.signed_by(&client_key, &issuer).map_err(err)?;
+
+    let key = PrivateKeyDer::try_from(client_key.serialize_der())
+        .map_err(|e| ProxyError::Tls(format!("invalid generated key: {e}")))?;
+    Ok((ca_der, client_cert.der().clone(), key))
+}
+
 /// Build a client config that trusts a specific CA/self-signed certificate.
 pub fn build_client_tls_config_with_ca(
     ca_cert: CertificateDer<'static>,

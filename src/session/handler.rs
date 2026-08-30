@@ -53,12 +53,39 @@ pub async fn handle_connect_ip_stream(
         }
     };
 
+    // 2. Authenticate (Step 24). The client certificate, when present, was
+    // already verified against --client-ca during the TLS handshake.
+    let peer_cert = quinn_conn
+        .peer_identity()
+        .and_then(|any| {
+            any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|certs| certs.first().cloned());
+    let auth_ctx = match ctx.auth.authenticate(req.headers(), peer_cert.as_ref()) {
+        Ok(auth_ctx) => auth_ctx,
+        Err(e) => {
+            crate::metrics::Metrics::incr(&ctx.metrics.auth_failures_total);
+            tracing::info!("authentication failed: {e}");
+            stream
+                .send_response(
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(())
+                        .unwrap(),
+                )
+                .await?;
+            stream.finish().await?;
+            return Err(e);
+        }
+    };
+
     let stream_id = stream.id().into_inner();
     let session_id = SessionId::compose(conn_seq, stream_id);
     let qsid = quarter_stream_id(stream_id);
 
-    // 2. Create the session (enforces the session limit).
-    let session = TunnelSession::new(session_id, scope);
+    // 3. Create the session (enforces the session limit).
+    let session = TunnelSession::new(session_id, scope, auth_ctx);
     if let Err(e) = ctx.sessions.insert(session) {
         stream
             .send_response(
@@ -175,6 +202,7 @@ async fn run_tunnel(
     );
     ctx.sessions.set_assigned(session_id, assigned.clone());
 
+    crate::metrics::Metrics::incr(&ctx.metrics.sessions_total);
     tracing::info!(
         session = %session_id,
         addrs = ?assigned.iter().map(|a| a.ip_address).collect::<Vec<_>>(),

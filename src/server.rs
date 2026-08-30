@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicServerConfig;
+use tokio::sync::watch;
 
 use crate::address_pool::AddressPool;
 use crate::config::ProxyConfig;
 use crate::datagram::CONTEXT_ID_IP_PACKET;
 use crate::error::ProxyError;
 use crate::forwarding::ForwardingEngine;
+use crate::metrics::Metrics;
+use crate::session::auth::Authenticator;
 use crate::session::{SessionId, SessionManager};
 
 /// Shared state handed to every connection and session task.
@@ -22,6 +25,8 @@ pub struct ProxyContext {
     pub sessions: SessionManager,
     pub pool: AddressPool,
     pub engine: Arc<ForwardingEngine>,
+    pub auth: Authenticator,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Build the QUIC server endpoint (TLS, ALPN h3, DATAGRAM support).
@@ -48,18 +53,35 @@ pub fn build_endpoint(
     Ok(endpoint)
 }
 
-/// Accept QUIC connections until the endpoint closes.
-pub async fn run_server(endpoint: quinn::Endpoint, ctx: Arc<ProxyContext>) {
+/// Accept QUIC connections until the endpoint closes or shutdown begins.
+///
+/// On shutdown, established connections receive an HTTP/3 GOAWAY and keep
+/// serving in-flight tunnels; the caller enforces the grace period.
+pub async fn run_server(
+    endpoint: quinn::Endpoint,
+    ctx: Arc<ProxyContext>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let conn_seq = AtomicU64::new(0);
-    while let Some(incoming) = endpoint.accept().await {
+    loop {
+        let incoming = tokio::select! {
+            incoming = endpoint.accept() => incoming,
+            _ = shutdown.changed() => {
+                tracing::info!("shutdown: no longer accepting connections");
+                return;
+            }
+        };
+        let Some(incoming) = incoming else { return };
+
         let seq = conn_seq.fetch_add(1, Ordering::Relaxed);
         let ctx = ctx.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
                     tracing::info!(%remote, conn = seq, "connection established");
-                    if let Err(e) = handle_connection(conn, seq, ctx).await {
+                    if let Err(e) = handle_connection(conn, seq, ctx, shutdown).await {
                         tracing::debug!(conn = seq, "connection ended: {e}");
                     }
                 }
@@ -69,10 +91,33 @@ pub async fn run_server(endpoint: quinn::Endpoint, ctx: Arc<ProxyContext>) {
     }
 }
 
+/// Reap sessions with no client activity past the configured timeout
+/// (Step 26). Dropping the engine sink wakes the session handler, which
+/// then runs its normal teardown.
+pub fn spawn_idle_reaper(ctx: Arc<ProxyContext>) -> Option<tokio::task::JoinHandle<()>> {
+    let timeout = Duration::from_secs(ctx.config.session_idle_timeout_sec);
+    if timeout.is_zero() {
+        return None;
+    }
+    let interval = (timeout / 2).clamp(Duration::from_millis(250), Duration::from_secs(30));
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            for id in ctx.sessions.idle_sessions(timeout) {
+                tracing::info!(session = %id, "closing idle session");
+                ctx.engine.unregister_session(id);
+            }
+        }
+    }))
+}
+
 async fn handle_connection(
     conn: quinn::Connection,
     conn_seq: u64,
     ctx: Arc<ProxyContext>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ProxyError> {
     // Keep a raw handle for DATAGRAM I/O before h3 wraps the connection.
     let datagram_conn = conn.clone();
@@ -88,7 +133,19 @@ async fn handle_connection(
         .await?;
 
     let result = loop {
-        match h3_conn.accept().await {
+        let resolver = tokio::select! {
+            resolver = h3_conn.accept() => resolver,
+            _ = shutdown.changed() => {
+                // Send GOAWAY: no new requests, existing tunnels continue
+                // until the grace period closes the endpoint (Step 29).
+                tracing::debug!(conn = conn_seq, "sending GOAWAY");
+                if let Err(e) = h3_conn.shutdown(0).await {
+                    break Err(e.into());
+                }
+                continue;
+            }
+        };
+        match resolver {
             Ok(Some(resolver)) => {
                 let quinn_conn = conn.clone();
                 let ctx = ctx.clone();

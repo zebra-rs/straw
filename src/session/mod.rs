@@ -1,5 +1,6 @@
 //! Per-tunnel session state and the concurrent session table.
 
+pub mod auth;
 pub mod handler;
 
 use std::sync::Arc;
@@ -60,12 +61,14 @@ pub struct TunnelSession {
     pub client_routes: Vec<IpAddressRange>,
     /// Addresses the client assigned to the proxy end (site-to-site).
     pub proxy_addresses: Vec<AssignedAddress>,
+    /// How this session authenticated.
+    pub auth: auth::AuthContext,
     /// Timestamp of last activity for idle timeout (Phase 4).
     pub last_activity: Instant,
 }
 
 impl TunnelSession {
-    pub fn new(id: SessionId, scope: RequestScope) -> Self {
+    pub fn new(id: SessionId, scope: RequestScope, auth: auth::AuthContext) -> Self {
         Self {
             id,
             scope,
@@ -73,6 +76,7 @@ impl TunnelSession {
             advertised_routes: Vec::new(),
             client_routes: Vec::new(),
             proxy_addresses: Vec::new(),
+            auth,
             last_activity: Instant::now(),
         }
     }
@@ -148,6 +152,16 @@ impl SessionManager {
         self.assigned.remove(&id);
     }
 
+    /// Sessions whose last activity is older than `max_idle` (Step 26).
+    pub fn idle_sessions(&self, max_idle: std::time::Duration) -> Vec<SessionId> {
+        let now = Instant::now();
+        self.sessions
+            .iter()
+            .filter(|s| now.duration_since(s.last_activity) > max_idle)
+            .map(|s| s.id)
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
@@ -175,19 +189,37 @@ mod tests {
         assert_eq!(id.stream_id(), 44);
     }
 
+    fn session(id: SessionId) -> TunnelSession {
+        TunnelSession::new(id, scope(), auth::AuthContext::default())
+    }
+
     #[test]
     fn session_limit_enforced() {
         let mgr = SessionManager::new(1);
-        mgr.insert(TunnelSession::new(SessionId(1), scope()))
-            .unwrap();
-        assert!(
-            mgr.insert(TunnelSession::new(SessionId(2), scope()))
-                .is_err()
-        );
+        mgr.insert(session(SessionId(1))).unwrap();
+        assert!(mgr.insert(session(SessionId(2))).is_err());
         mgr.remove(SessionId(1));
+        assert!(mgr.insert(session(SessionId(2))).is_ok());
+    }
+
+    #[test]
+    fn idle_sessions_reported() {
+        let mgr = SessionManager::new(10);
+        mgr.insert(session(SessionId(1))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(
+            mgr.idle_sessions(std::time::Duration::from_millis(1)),
+            vec![SessionId(1)]
+        );
         assert!(
-            mgr.insert(TunnelSession::new(SessionId(2), scope()))
-                .is_ok()
+            mgr.idle_sessions(std::time::Duration::from_secs(3600))
+                .is_empty()
+        );
+        // Activity resets the clock.
+        mgr.touch(SessionId(1));
+        assert!(
+            mgr.idle_sessions(std::time::Duration::from_millis(4))
+                .is_empty()
         );
     }
 
@@ -195,7 +227,7 @@ mod tests {
     fn assigned_snapshot_tracks_updates() {
         let mgr = SessionManager::new(10);
         let id = SessionId(4);
-        mgr.insert(TunnelSession::new(id, scope())).unwrap();
+        mgr.insert(session(id)).unwrap();
         assert!(mgr.assigned_snapshot(id).unwrap().is_empty());
 
         mgr.set_assigned(

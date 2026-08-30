@@ -9,28 +9,40 @@ use std::time::Duration;
 use rustls::pki_types::CertificateDer;
 use straw::address_pool::AddressPool;
 use straw::capsule::{IpAddressRange, RequestedAddress};
-use straw::client::{TlsMode, TunnelClient};
+use straw::client::{ClientAuth, TlsMode, TunnelClient};
 use straw::config::ProxyConfig;
 use straw::forwarding::ForwardingEngine;
 use straw::forwarding::icmp::IcmpSource;
+use straw::forwarding::limiter::RateLimits;
 use straw::forwarding::packet::{build_ipv4_icmp_echo, build_ipv6_icmpv6_echo, parse_packet};
 use straw::forwarding::router::RouteTable;
-use straw::server::{ProxyContext, build_endpoint, run_server};
+use straw::metrics::Metrics;
+use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
+use straw::session::auth::Authenticator;
 use straw::tls;
 
 struct TestServer {
     addr: SocketAddr,
     cert: CertificateDer<'static>,
     endpoint: quinn::Endpoint,
+    ctx: Arc<ProxyContext>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl TestServer {
     async fn start() -> Self {
-        Self::start_with(|_| {}).await
+        Self::start_full(|_| {}, None).await
     }
 
     async fn start_with(customize: impl FnOnce(&mut ProxyConfig)) -> Self {
+        Self::start_full(customize, None).await
+    }
+
+    async fn start_full(
+        customize: impl FnOnce(&mut ProxyConfig),
+        client_ca: Option<CertificateDer<'static>>,
+    ) -> Self {
         straw::init_crypto();
         // Enable with e.g. RUST_LOG=straw=trace; safe to call repeatedly.
         let _ = tracing_subscriber::fmt()
@@ -48,19 +60,37 @@ impl TestServer {
         customize(&mut config);
 
         let (cert, key) = tls::generate_self_signed_cert(&["localhost"]).unwrap();
-        let tls_config = tls::build_server_tls_config(vec![cert.clone()], key).unwrap();
+        let tls_config = match client_ca {
+            Some(ca) => {
+                tls::build_server_tls_config_with_client_auth(vec![cert.clone()], key, vec![ca])
+                    .unwrap()
+            }
+            None => tls::build_server_tls_config(vec![cert.clone()], key).unwrap(),
+        };
 
+        let auth = Authenticator::new(
+            config.auth_mode,
+            config.auth_token.clone(),
+            config.basic_credentials().unwrap(),
+        );
+        let metrics = Arc::new(Metrics::default());
         let route_table = Arc::new(RouteTable::new());
         let pool = AddressPool::new(config.ipv4_pool, config.ipv6_pool);
         let icmp_source = IcmpSource {
             v4: pool.ipv4_gateway().0,
             v6: pool.ipv6_gateway().map(|(addr, _)| addr),
         };
+        let limits = RateLimits {
+            packets_per_sec: config.max_packet_rate,
+            bytes_per_sec: config.max_byte_rate,
+        };
         let engine = Arc::new(ForwardingEngine::new(
             route_table,
             None,
             config.mtu,
             icmp_source,
+            limits,
+            metrics.clone(),
         ));
         let sessions = SessionManager::new(config.max_sessions);
 
@@ -72,13 +102,19 @@ impl TestServer {
             sessions,
             pool,
             engine,
+            auth,
+            metrics,
         });
-        tokio::spawn(run_server(endpoint.clone(), ctx));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(run_server(endpoint.clone(), ctx.clone(), shutdown_rx));
+        spawn_idle_reaper(ctx.clone());
 
         Self {
             addr,
             cert,
             endpoint,
+            ctx,
+            shutdown_tx,
         }
     }
 
@@ -462,4 +498,221 @@ async fn spoofed_source_is_dropped() {
     );
 
     client.close().await;
+}
+
+// ---------------- Phase 4 ----------------
+
+#[tokio::test]
+async fn bearer_auth_enforced() {
+    let server = TestServer::start_with(|c| {
+        c.auth_mode = straw::session::auth::AuthMode::Bearer;
+        c.auth_token = vec!["sekrit".into()];
+    })
+    .await;
+
+    // No credentials: the proxy answers 401 and no session exists.
+    let denied =
+        TunnelClient::connect(server.addr, "localhost", TlsMode::Ca(server.cert.clone())).await;
+    match denied {
+        Err(straw::error::ProxyError::Http(msg)) => assert!(msg.contains("401"), "{msg}"),
+        Err(e) => panic!("expected 401 rejection, got error {e}"),
+        Ok(_) => panic!("expected 401 rejection, got a tunnel"),
+    }
+    assert!(server.ctx.sessions.is_empty());
+    assert_eq!(
+        server
+            .ctx
+            .metrics
+            .auth_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // Wrong token: rejected too.
+    let wrong = TunnelClient::connect_with(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::Bearer("nope".into()),
+    )
+    .await;
+    assert!(wrong.is_err());
+
+    // Correct token: tunnel established end to end.
+    let mut client = TunnelClient::connect_with(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::Bearer("sekrit".into()),
+    )
+    .await
+    .expect("authenticated client connects");
+    client.wait_for_assignment().await.unwrap();
+    assert!(client.ipv4_address().is_some());
+    client.close().await;
+}
+
+#[tokio::test]
+async fn basic_auth_enforced() {
+    let server = TestServer::start_with(|c| {
+        c.auth_mode = straw::session::auth::AuthMode::Basic;
+        c.auth_basic = vec!["alice:wonder".into()];
+    })
+    .await;
+
+    let denied = TunnelClient::connect_with(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::Basic {
+            user: "alice".into(),
+            password: "wrong".into(),
+        },
+    )
+    .await;
+    assert!(denied.is_err());
+
+    let mut client = TunnelClient::connect_with(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::Basic {
+            user: "alice".into(),
+            password: "wonder".into(),
+        },
+    )
+    .await
+    .expect("authenticated client connects");
+    client.wait_for_assignment().await.unwrap();
+    client.close().await;
+}
+
+#[tokio::test]
+async fn mtls_requires_client_certificate() {
+    let (ca, client_cert, client_key) = tls::generate_client_ca_and_cert("straw-client").unwrap();
+    let server = TestServer::start_full(
+        |c| {
+            c.auth_mode = straw::session::auth::AuthMode::Mtls;
+            c.client_ca = Some("unused-by-test.pem".into());
+        },
+        Some(ca.clone()),
+    )
+    .await;
+
+    // Without a client certificate the TLS handshake itself fails.
+    let no_cert =
+        TunnelClient::connect(server.addr, "localhost", TlsMode::Ca(server.cert.clone())).await;
+    assert!(no_cert.is_err(), "handshake must fail without client cert");
+
+    // With a certificate chaining to the CA, the tunnel works.
+    let mut client = TunnelClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Mtls {
+            ca: server.cert.clone(),
+            cert_chain: vec![client_cert],
+            key: client_key,
+        },
+    )
+    .await
+    .expect("mTLS client connects");
+    client.wait_for_assignment().await.unwrap();
+    let addr = client.ipv4_address().unwrap();
+    let echo = build_ipv4_icmp_echo(addr, addr, false, 1, 1, b"mtls", 64);
+    client.send_packet(echo).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .expect("hairpin within 5s")
+        .unwrap();
+    assert_eq!(&reply[28..], b"mtls");
+    client.close().await;
+}
+
+#[tokio::test]
+async fn idle_sessions_are_reaped() {
+    let server = TestServer::start_with(|c| {
+        c.session_idle_timeout_sec = 1;
+    })
+    .await;
+    let mut client = server.client().await;
+    client.wait_for_assignment().await.unwrap();
+    assert_eq!(server.ctx.sessions.len(), 1);
+
+    // Stay silent past the timeout; the reaper (interval 500ms) closes us.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        server.ctx.sessions.is_empty(),
+        "idle session must be reaped"
+    );
+
+    // The client observes the stream closing.
+    let observed = tokio::time::timeout(Duration::from_secs(5), client.process_next_capsules())
+        .await
+        .expect("stream close observed within 5s");
+    assert!(observed.is_err(), "tunnel stream should be closed");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_counters() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = TestServer::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = listener.local_addr().unwrap();
+    tokio::spawn(straw::metrics::serve_metrics(listener, server.ctx.clone()));
+
+    // Generate some traffic first.
+    let mut client = server.client().await;
+    client.wait_for_assignment().await.unwrap();
+    let addr = client.ipv4_address().unwrap();
+    let echo = build_ipv4_icmp_echo(addr, addr, false, 1, 1, b"count me", 64);
+    client.send_packet(echo).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut socket = tokio::net::TcpStream::connect(metrics_addr).await.unwrap();
+    socket
+        .write_all(b"GET /metrics HTTP/1.1\r\nhost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).await.unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("straw_sessions_total 1"));
+    assert!(response.contains("straw_sessions_active 1"));
+    assert!(response.contains("straw_packets_hairpin_total 1"));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_keeps_existing_tunnels_until_drained() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    client.wait_for_assignment().await.unwrap();
+    let addr = client.ipv4_address().unwrap();
+
+    // Begin shutdown: GOAWAY goes out, but the in-flight tunnel still works.
+    server.shutdown_tx.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let echo = build_ipv4_icmp_echo(addr, addr, false, 2, 1, b"draining", 64);
+    client.send_packet(echo).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .expect("tunnel alive during grace period")
+        .unwrap();
+    assert_eq!(&reply[28..], b"draining");
+
+    // Client finishes; the session drains.
+    client.close().await;
+    for _ in 0..50 {
+        if server.ctx.sessions.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(server.ctx.sessions.is_empty(), "sessions drained");
 }

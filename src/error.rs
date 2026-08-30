@@ -50,6 +50,9 @@ pub enum ForwardingError {
 
     #[error("forwarding queue full, packet dropped")]
     Congested,
+
+    #[error("session rate limit exceeded, packet dropped")]
+    RateLimited,
 }
 
 /// Top-level proxy error.

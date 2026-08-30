@@ -1308,6 +1308,7 @@ dependencies = [
 name = "straw"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "clap",
  "dashmap",
@@ -1317,6 +1318,7 @@ dependencies = [
  "ipnet",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "thiserror",
  "tokio",

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
+use crate::session::auth::AuthMode;
+
 /// straw — RFC 9484 CONNECT-IP proxy server (IP over MASQUE).
 #[derive(Debug, Clone, Parser)]
 #[command(name = "straw", version, about)]
@@ -62,6 +64,47 @@ pub struct ProxyConfig {
     /// Maximum number of concurrent sessions.
     #[arg(long, default_value_t = 1000)]
     pub max_sessions: usize,
+
+    /// Authentication required from clients.
+    #[arg(long, value_enum, default_value_t = AuthMode::None)]
+    pub auth_mode: AuthMode,
+
+    /// Accepted bearer token(s) for --auth-mode bearer (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub auth_token: Vec<String>,
+
+    /// Accepted user:password pair(s) for --auth-mode basic (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub auth_basic: Vec<String>,
+
+    /// PEM CA bundle that client certificates must chain to (--auth-mode mtls).
+    #[arg(long)]
+    pub client_ca: Option<PathBuf>,
+
+    /// Close sessions with no client activity for this many seconds; 0 disables.
+    #[arg(long, default_value_t = 300)]
+    pub session_idle_timeout_sec: u64,
+
+    /// Per-session packet rate limit (packets/sec); 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_packet_rate: u64,
+
+    /// Per-session byte rate limit (bytes/sec); 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub max_byte_rate: u64,
+
+    /// Serve Prometheus metrics on this address (e.g. 127.0.0.1:9090).
+    #[arg(long)]
+    pub metrics_listen: Option<SocketAddr>,
+
+    /// With --tun on Linux: masquerade pool traffic out this interface and
+    /// enable IP forwarding (iptables + sysctl).
+    #[arg(long)]
+    pub nat_interface: Option<String>,
+
+    /// Seconds to let sessions drain after SIGINT/SIGTERM before closing.
+    #[arg(long, default_value_t = 5)]
+    pub shutdown_grace_sec: u64,
 }
 
 impl Default for ProxyConfig {
@@ -80,6 +123,16 @@ impl Default for ProxyConfig {
             tun_name: "straw0".to_string(),
             idle_timeout_ms: 30_000,
             max_sessions: 1000,
+            auth_mode: AuthMode::None,
+            auth_token: Vec::new(),
+            auth_basic: Vec::new(),
+            client_ca: None,
+            session_idle_timeout_sec: 300,
+            max_packet_rate: 0,
+            max_byte_rate: 0,
+            metrics_listen: None,
+            nat_interface: None,
+            shutdown_grace_sec: 5,
         }
     }
 }
@@ -87,13 +140,53 @@ impl Default for ProxyConfig {
 impl ProxyConfig {
     /// Validate cross-field constraints not expressible in clap.
     pub fn validate(&self) -> Result<(), crate::error::ProxyError> {
+        use crate::error::ProxyError;
         if self.mtu < 1280 {
-            return Err(crate::error::ProxyError::Config(format!(
+            return Err(ProxyError::Config(format!(
                 "MTU {} is below the IPv6 minimum of 1280",
                 self.mtu
             )));
         }
+        match self.auth_mode {
+            AuthMode::Bearer if self.auth_token.is_empty() => {
+                return Err(ProxyError::Config(
+                    "--auth-mode bearer requires at least one --auth-token".into(),
+                ));
+            }
+            AuthMode::Basic if self.auth_basic.is_empty() => {
+                return Err(ProxyError::Config(
+                    "--auth-mode basic requires at least one --auth-basic user:pass".into(),
+                ));
+            }
+            AuthMode::Mtls if self.client_ca.is_none() => {
+                return Err(ProxyError::Config(
+                    "--auth-mode mtls requires --client-ca".into(),
+                ));
+            }
+            _ => {}
+        }
+        self.basic_credentials()?;
+        if self.nat_interface.is_some() && !self.tun {
+            return Err(ProxyError::Config("--nat-interface requires --tun".into()));
+        }
         Ok(())
+    }
+
+    /// Parse --auth-basic entries into (user, password) pairs.
+    pub fn basic_credentials(&self) -> Result<Vec<(String, String)>, crate::error::ProxyError> {
+        self.auth_basic
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once(':')
+                    .map(|(u, p)| (u.to_string(), p.to_string()))
+                    .ok_or_else(|| {
+                        crate::error::ProxyError::Config(format!(
+                            "--auth-basic entry {entry:?} is not user:password"
+                        ))
+                    })
+            })
+            .collect()
     }
 }
 
