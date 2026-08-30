@@ -35,3 +35,10 @@ tun = { version = "0.8.14", features = ["async"] }
 # next h3 release ships).
 [patch.crates-io]
 h3 = { path = "vendor/h3" }
+# quinn-proto 0.11.17's datagram drop loop double-decrements its buffer
+# accounting; the first overfull send buffer then underflows the counter and
+# every later send_datagram panics ("payload_bytes desynchronized"), killing
+# the tunnel under sustained datagram load (found by the Phase D iperf3 UDP
+# sweep). Vendored with the one-line fix; upstream main has it, no 0.11.x
+# release does. Drop when one ships.
+quinn-proto = { path = "vendor/quinn-proto" }
