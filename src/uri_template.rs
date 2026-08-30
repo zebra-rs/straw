@@ -154,30 +154,33 @@ mod tests {
 
     #[test]
     fn test_specific_ip_and_protocol() {
-        let scope =
-            parse_connect_ip_path("/.well-known/masque/ip/192.168.1.1/6/").unwrap();
+        let scope = parse_connect_ip_path("/.well-known/masque/ip/192.168.1.1/6/").unwrap();
         assert_eq!(
             scope.target,
-            Some(Target::Prefix(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 32))
+            Some(Target::Prefix(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                32
+            ))
         );
         assert_eq!(scope.ip_proto, Some(6));
     }
 
     #[test]
     fn test_ip_prefix_percent_encoded() {
-        let scope =
-            parse_connect_ip_path("/.well-known/masque/ip/192.168.1.0%2F24/0/").unwrap();
+        let scope = parse_connect_ip_path("/.well-known/masque/ip/192.168.1.0%2F24/0/").unwrap();
         assert_eq!(
             scope.target,
-            Some(Target::Prefix(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24))
+            Some(Target::Prefix(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)),
+                24
+            ))
         );
         assert_eq!(scope.ip_proto, Some(0));
     }
 
     #[test]
     fn test_ipv6_target() {
-        let scope =
-            parse_connect_ip_path("/.well-known/masque/ip/2001%3Adb8%3A%3A1/17/").unwrap();
+        let scope = parse_connect_ip_path("/.well-known/masque/ip/2001%3Adb8%3A%3A1/17/").unwrap();
         assert_eq!(
             scope.target,
             Some(Target::Prefix(
@@ -204,8 +207,7 @@ mod tests {
 
     #[test]
     fn test_hostname_target() {
-        let scope =
-            parse_connect_ip_path("/.well-known/masque/ip/example.com/0/").unwrap();
+        let scope = parse_connect_ip_path("/.well-known/masque/ip/example.com/0/").unwrap();
         assert_eq!(
             scope.target,
             Some(Target::Hostname("example.com".to_string()))
@@ -215,8 +217,7 @@ mod tests {
 
     #[test]
     fn test_hostname_wildcard_proto() {
-        let scope =
-            parse_connect_ip_path("/.well-known/masque/ip/vpn.example.org/*/").unwrap();
+        let scope = parse_connect_ip_path("/.well-known/masque/ip/vpn.example.org/*/").unwrap();
         assert_eq!(
             scope.target,
             Some(Target::Hostname("vpn.example.org".to_string()))

@@ -5,7 +5,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use crate::error::DecodeError;
 
 use super::address_assign::decode_ip_address;
-use super::codec::{write_varint};
+use super::codec::write_varint;
 use super::{IpAddressRange, RouteAdvertisement};
 
 impl RouteAdvertisement {
@@ -135,11 +135,7 @@ mod tests {
 
     use super::*;
 
-    fn make_v4_range(
-        start: [u8; 4],
-        end: [u8; 4],
-        ip_protocol: u8,
-    ) -> IpAddressRange {
+    fn make_v4_range(start: [u8; 4], end: [u8; 4], ip_protocol: u8) -> IpAddressRange {
         IpAddressRange {
             ip_version: 4,
             start_ip: IpAddr::V4(Ipv4Addr::from(start)),
@@ -148,11 +144,7 @@ mod tests {
         }
     }
 
-    fn make_v6_range(
-        start: [u8; 16],
-        end: [u8; 16],
-        ip_protocol: u8,
-    ) -> IpAddressRange {
+    fn make_v6_range(start: [u8; 16], end: [u8; 16], ip_protocol: u8) -> IpAddressRange {
         IpAddressRange {
             ip_version: 6,
             start_ip: IpAddr::V6(Ipv6Addr::from(start)),
@@ -176,11 +168,7 @@ mod tests {
     #[test]
     fn test_roundtrip_full_tunnel_v4() {
         let original = RouteAdvertisement {
-            ip_address_ranges: vec![make_v4_range(
-                [0, 0, 0, 0],
-                [255, 255, 255, 255],
-                0,
-            )],
+            ip_address_ranges: vec![make_v4_range([0, 0, 0, 0], [255, 255, 255, 255], 0)],
         };
         let mut buf = BytesMut::new();
         original.encode_payload(&mut buf);
@@ -286,15 +274,9 @@ mod tests {
         // Manually encode out-of-order ranges (bypass encode which sorts)
         let mut buf = BytesMut::new();
         // Range 1: 10.1.0.0 (comes after 10.0.0.0)
-        encode_ip_address_range(
-            &make_v4_range([10, 1, 0, 0], [10, 1, 0, 255], 0),
-            &mut buf,
-        );
+        encode_ip_address_range(&make_v4_range([10, 1, 0, 0], [10, 1, 0, 255], 0), &mut buf);
         // Range 2: 10.0.0.0 (should come first)
-        encode_ip_address_range(
-            &make_v4_range([10, 0, 0, 0], [10, 0, 0, 255], 0),
-            &mut buf,
-        );
+        encode_ip_address_range(&make_v4_range([10, 0, 0, 0], [10, 0, 0, 255], 0), &mut buf);
 
         let result = RouteAdvertisement::decode(&buf);
         assert!(result.is_err());
@@ -336,11 +318,7 @@ mod tests {
     #[test]
     fn test_full_capsule_encode() {
         let original = RouteAdvertisement {
-            ip_address_ranges: vec![make_v4_range(
-                [0, 0, 0, 0],
-                [255, 255, 255, 255],
-                0,
-            )],
+            ip_address_ranges: vec![make_v4_range([0, 0, 0, 0], [255, 255, 255, 255], 0)],
         };
         let mut buf = BytesMut::new();
         original.encode(&mut buf);

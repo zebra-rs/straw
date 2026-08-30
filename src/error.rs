@@ -44,6 +44,12 @@ pub enum ForwardingError {
 
     #[error("no route to destination")]
     NoRoute,
+
+    #[error("destination {0} outside advertised routes")]
+    NotAllowed(IpAddr),
+
+    #[error("forwarding queue full, packet dropped")]
+    Congested,
 }
 
 /// Top-level proxy error.
@@ -66,4 +72,49 @@ pub enum ProxyError {
 
     #[error("session not found: {0}")]
     SessionNotFound(u64),
+
+    #[error("TLS error: {0}")]
+    Tls(String),
+
+    #[error("QUIC error: {0}")]
+    Quic(String),
+
+    #[error("HTTP/3 error: {0}")]
+    Http(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("address pool exhausted")]
+    PoolExhausted,
+}
+
+impl From<h3::error::StreamError> for ProxyError {
+    fn from(e: h3::error::StreamError) -> Self {
+        ProxyError::Http(e.to_string())
+    }
+}
+
+impl From<h3::error::ConnectionError> for ProxyError {
+    fn from(e: h3::error::ConnectionError) -> Self {
+        ProxyError::Http(e.to_string())
+    }
+}
+
+impl From<quinn::ConnectionError> for ProxyError {
+    fn from(e: quinn::ConnectionError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
+}
+
+impl From<quinn::ConnectError> for ProxyError {
+    fn from(e: quinn::ConnectError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
+}
+
+impl From<quinn::SendDatagramError> for ProxyError {
+    fn from(e: quinn::SendDatagramError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
 }

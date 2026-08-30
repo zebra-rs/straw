@@ -162,7 +162,10 @@ mod tests {
     fn test_rfc9000_examples() {
         // RFC 9000 §A.1 sample encodings
         let cases: &[(&[u8], u64)] = &[
-            (&[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c], 151_288_809_941_952_652),
+            (
+                &[0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c],
+                151_288_809_941_952_652,
+            ),
             (&[0x9d, 0x7f, 0x3e, 0x7d], 494_878_333),
             (&[0x7b, 0xbd], 15_293),
             (&[0x25], 37),

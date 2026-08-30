@@ -212,8 +212,8 @@ mod tests {
     fn test_roundtrip_unprompted_and_requested() {
         let original = AddressAssign {
             assigned_addresses: vec![
-                make_v4_addr(0, [10, 100, 0, 1], 32),   // unprompted (request_id=0)
-                make_v4_addr(42, [10, 100, 0, 2], 32),  // in response to request 42
+                make_v4_addr(0, [10, 100, 0, 1], 32), // unprompted (request_id=0)
+                make_v4_addr(42, [10, 100, 0, 2], 32), // in response to request 42
             ],
         };
         let mut buf = BytesMut::new();

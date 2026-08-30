@@ -2,7 +2,29 @@
 name = "straw"
 version = "0.1.0"
 edition = "2024"
+default-run = "straw"
 
 [dependencies]
 bytes = "1"
+clap = { version = "4.6.6", features = ["derive"] }
+dashmap = "6.2.1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.5.0"
+ipnet = "2.12.1"
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log", "platform-verifier"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 thiserror = "2"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun = { version = "0.8.14", features = ["async"] }
+
+# h3 0.0.8 with upstream's ConnectIp protocol variant backported
+# (hyperium/h3 master already has it; drop this vendored patch when the
+# next h3 release ships).
+[patch.crates-io]
+h3 = { path = "vendor/h3" }
