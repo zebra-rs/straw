@@ -24,6 +24,7 @@
 pub mod alloc;
 pub mod context;
 pub mod handler;
+pub mod observe;
 pub mod socket;
 
 use std::sync::Arc;
@@ -52,6 +53,8 @@ pub struct UdpBindState {
     /// qsid-keyed (via `SessionId`) sinks delivering peer datagrams to each
     /// bind session's bound socket.
     sessions: DashMap<SessionId, mpsc::Sender<Bytes>>,
+    /// On-path punch observer (relay-assisted traversal), when `--punch-observe`.
+    observe: Option<Arc<observe::PunchObserver>>,
 }
 
 impl UdpBindState {
@@ -62,6 +65,7 @@ impl UdpBindState {
             policy: DestinationPolicy::default(),
             egress_limits: RateLimits::default(),
             sessions: DashMap::new(),
+            observe: None,
         }
     }
 
@@ -76,7 +80,19 @@ impl UdpBindState {
             policy,
             egress_limits,
             sessions: DashMap::new(),
+            observe: None,
         }
+    }
+
+    /// Attach an on-path punch observer (relay-assisted traversal). Call before
+    /// wrapping this state in an `Arc`.
+    pub fn set_observer(&mut self, obs: Arc<observe::PunchObserver>) {
+        self.observe = Some(obs);
+    }
+
+    /// The punch observer, if `--punch-observe` is on.
+    pub fn observer(&self) -> Option<&Arc<observe::PunchObserver>> {
+        self.observe.as_ref()
     }
 
     /// Whether bind mode is enabled on this relay.

@@ -93,6 +93,12 @@ if [ "$NAT_MODE" = cone ]; then
 else
     echo "  NAT_MODE=symmetric — MASQUERADE; punch best-effort (set NAT_MODE=cone for EIM)"
 fi
+# STRATEGY selects the peers' NAT-traversal strategy; relay-assisted also turns
+# on the relay's on-path observer.
+STRATEGY=${STRATEGY:-basic}
+OBSERVE_FLAG=""
+[ "$STRATEGY" = relay-assisted ] && OBSERVE_FLAG="--udp-bind-observe"
+echo "  STRATEGY=$STRATEGY${OBSERVE_FLAG:+ (relay observer on)}"
 
 log "sanity"
 ip netns exec natpunch_pa ping -c1 -W2 192.0.2.1 >/dev/null && echo "  peerA → relay OK" || fail "peerA → relay"
@@ -105,7 +111,7 @@ log "relay: straw --udp-bind"
 ip netns exec natpunch_r env RUST_LOG=straw=info "$BIN/straw" \
     --listen 192.0.2.1:$PORT --udp-bind --udp-bind-public-ips 192.0.2.1 \
     --udp-bind-port-lo 30000 --udp-bind-port-hi 30999 --udp-bind-allow-dest 192.0.2.0/24 \
-    --auth-mode bearer --auth-token s3cret >"$OUT/np_relay.log" 2>&1 &
+    --auth-mode bearer --auth-token s3cret $OBSERVE_FLAG >"$OUT/np_relay.log" 2>&1 &
 for _ in $(seq 100); do grep -q listening "$OUT/np_relay.log" && break; sleep 0.1; done
 grep -q listening "$OUT/np_relay.log" || { cat "$OUT/np_relay.log"; fail "relay start"; exit 1; }
 
@@ -122,7 +128,7 @@ log "peerA listens (issuer)"
 ( printf 'HELLO-FROM-A\n'; sleep "$HOLD" ) | ip netns exec natpunch_pa env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" listen --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" \
+    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
     >"$OUT/np_listen.out" 2>"$OUT/np_listen.err" &
 LISTEN_PID=$!
 for _ in $(seq 100); do [ -s "$OUT/np_listen.out" ] && break; sleep 0.1; done
@@ -133,7 +139,7 @@ log "peerB connects (holder)"
 ( printf 'HELLO-FROM-B\n'; sleep "$HOLD" ) | ip netns exec natpunch_pb env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" connect "$TOKEN" --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" \
+    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
     >"$OUT/np_connect.out" 2>"$OUT/np_connect.err" || true
 wait "$LISTEN_PID" 2>/dev/null || true
 sleep 1

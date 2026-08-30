@@ -20,6 +20,7 @@ use crate::p2p::relay_socket::inner_endpoint;
 use crate::p2p::token::TokenV2;
 
 /// How to reach and authenticate to the relay (the outer connection).
+#[derive(Clone)]
 pub struct RelayAccess {
     pub addr: SocketAddr,
     pub server_name: String,
@@ -87,6 +88,7 @@ pub async fn listen(
     relay: RelayAccess,
     identity: &Identity,
     expected_peer: Option<SpkiPin>,
+    peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<Listener, ProxyError> {
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
     let paddr = bind.public_addr;
@@ -97,7 +99,7 @@ pub async fn listen(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let endpoint = inner_endpoint(bind.into_relay_socket(), Some(quic))
+    let endpoint = inner_endpoint(bind.into_relay_socket(peer_reflexive_sink), Some(quic))
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     Ok(Listener {
         paddr,
@@ -113,6 +115,7 @@ pub async fn connect(
     relay: RelayAccess,
     identity: &Identity,
     token: &TokenV2,
+    peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<PeerConnection, ProxyError> {
     let issuer: SocketAddr = token
         .paddr
@@ -130,7 +133,7 @@ pub async fn connect(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let endpoint = inner_endpoint(bind.into_relay_socket(), None)
+    let endpoint = inner_endpoint(bind.into_relay_socket(peer_reflexive_sink), None)
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     let conn = endpoint
         .connect_with(quic, issuer, "peer")

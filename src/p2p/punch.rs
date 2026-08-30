@@ -176,6 +176,44 @@ impl Puncher {
         remotes: &[SocketAddr],
         timeout: Duration,
     ) -> Result<quinn::Connection, ProxyError> {
+        // Feed the fixed target set, then close the channel so no more arrive.
+        let (targets_tx, targets_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+        for &r in remotes {
+            let _ = targets_tx.send(r);
+        }
+        drop(targets_tx);
+        self.race(my_pin, peer_pin, targets_rx, timeout).await
+    }
+
+    /// Like [`punch`], but targets keep arriving on `targets_rx` for the whole
+    /// window — relay-assisted traversal dials the peer's advertised candidates
+    /// first (to bootstrap the on-path observation) and then the real
+    /// peer-facing sources the relay signals as they come in.
+    pub async fn punch_dynamic(
+        &self,
+        my_pin: SpkiPin,
+        peer_pin: Option<SpkiPin>,
+        targets_rx: tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<quinn::Connection, ProxyError> {
+        self.race(my_pin, peer_pin, targets_rx, timeout).await
+    }
+
+    /// The simultaneous-open core: accept inbound probes, dial every target as
+    /// it arrives, and return the one connection both peers converge on.
+    ///
+    /// Up to two connections can complete (each side's dial). Keep the first,
+    /// but wait a short grace for a possible duplicate; on a genuine duplicate
+    /// the tie-break (design §5.3.4, §2.1) picks the canonical one — the
+    /// connection whose *client* is the lower-pinned peer — so both sides
+    /// converge. A lone success is kept regardless of role.
+    async fn race(
+        &self,
+        my_pin: SpkiPin,
+        peer_pin: Option<SpkiPin>,
+        mut targets_rx: tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<quinn::Connection, ProxyError> {
         // (role, connection): Client = we dialed it, Server = we accepted it.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Role, quinn::Connection)>(8);
 
@@ -192,34 +230,11 @@ impl Puncher {
             }
         });
 
-        // Outbound dials.
-        for &remote in remotes {
-            match self
-                .endpoint
-                .connect_with(self.client_config.clone(), remote, "peer")
-            {
-                Ok(connecting) => {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        if let Ok(conn) = connecting.await {
-                            let _ = tx.send((Role::Client, conn)).await;
-                        }
-                    });
-                }
-                Err(e) => tracing::debug!(%remote, "punch dial not started: {e}"),
-            }
-        }
-        drop(tx);
-
-        // Simultaneous open can complete up to two connections (each side's
-        // dial). Keep the first, but wait a short grace for a possible
-        // duplicate; on a genuine duplicate the tie-break picks the canonical
-        // one — the connection whose *client* is the lower-pinned peer — so
-        // both sides converge. A lone success is kept regardless of role
-        // (asymmetric NAT often lets only one direction through).
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
         let mut collected: Vec<(Role, quinn::Connection)> = Vec::new();
+        let mut dialed: Vec<SocketAddr> = Vec::new();
+        let mut targets_open = true;
         let grace = Duration::from_millis(300);
         let result = loop {
             let waiting_grace = !collected.is_empty();
@@ -230,15 +245,46 @@ impl Puncher {
                 _ = tokio::time::sleep(grace), if waiting_grace => {
                     break Ok(pick(&mut collected, my_pin, peer_pin));
                 }
+                target = targets_rx.recv(), if targets_open => match target {
+                    Some(remote) if !dialed.contains(&remote) => {
+                        dialed.push(remote);
+                        self.spawn_dial(remote, tx.clone());
+                    }
+                    Some(_) => {}
+                    None => targets_open = false,
+                },
                 next = rx.recv() => match next {
                     Some(item) => collected.push(item),
                     None if waiting_grace => break Ok(pick(&mut collected, my_pin, peer_pin)),
+                    // `tx` is still held here, so this only fires once every
+                    // clone is gone — practically the deadline governs instead.
                     None => break Err(ProxyError::Quic("all punch attempts failed".into())),
                 },
             }
         };
         accept_task.abort();
         result
+    }
+
+    /// Spawn one dial toward `remote`, reporting a completed connection on `tx`.
+    fn spawn_dial(
+        &self,
+        remote: SocketAddr,
+        tx: tokio::sync::mpsc::Sender<(Role, quinn::Connection)>,
+    ) {
+        match self
+            .endpoint
+            .connect_with(self.client_config.clone(), remote, "peer")
+        {
+            Ok(connecting) => {
+                tokio::spawn(async move {
+                    if let Ok(conn) = connecting.await {
+                        let _ = tx.send((Role::Client, conn)).await;
+                    }
+                });
+            }
+            Err(e) => tracing::debug!(%remote, "punch dial not started: {e}"),
+        }
     }
 
     /// The underlying endpoint, kept alive for the connection's lifetime.

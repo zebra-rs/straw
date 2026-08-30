@@ -154,14 +154,24 @@ async fn run() -> Result<(), ProxyError> {
             ports = format!("{}-{}", config.udp_bind_port_lo, config.udp_bind_port_hi),
             "CONNECT-UDP bind mode enabled"
         );
-        UdpBindState::enabled(
+        let mut state = UdpBindState::enabled(
             allocator,
             DestinationPolicy::new(config.udp_bind_allow_dest.clone(), Vec::new()),
             RateLimits {
                 packets_per_sec: config.udp_bind_max_pps,
                 bytes_per_sec: config.udp_bind_max_bps,
             },
-        )
+        );
+        if config.udp_bind_observe {
+            match straw::udp_bind::observe::PunchObserver::spawn() {
+                Ok(obs) => {
+                    state.set_observer(obs);
+                    tracing::info!("relay-assisted punch observer enabled (CAP_NET_RAW)");
+                }
+                Err(e) => tracing::warn!("punch observer disabled: {e}"),
+            }
+        }
+        state
     } else {
         straw::udp_bind::UdpBindState::disabled()
     });
