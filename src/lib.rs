@@ -16,6 +16,7 @@ pub mod p2p;
 pub mod server;
 pub mod session;
 pub mod tls;
+pub mod udp_bind;
 pub mod uri_template;
 
 /// Install the ring crypto provider as the rustls process default.

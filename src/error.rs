@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use thiserror::Error;
 
 /// Errors during capsule/VarInt decoding.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("unexpected end of buffer")]
     Underflow,
