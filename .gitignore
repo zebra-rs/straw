@@ -7,3 +7,6 @@
 /bdd/.allure/
 /bdd/.stage/
 /bdd/.stage.tmp/
+
+# benchmark artifacts
+/bench/results/

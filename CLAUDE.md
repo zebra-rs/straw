@@ -93,6 +93,15 @@ DNS-resolved before the reply (502 on failure), and `{ipproto}` narrows every
 range with ICMP still allowed (RFC 9484 §4.6). A scoped session's egress
 policy doubles as its ingress filter, so it only hears from within its scope.
 
+## Benchmarks
+
+`sudo bench/iperf-baseline.sh [secs]` measures raw-veth vs through-tunnel
+iperf3 throughput across three namespaces; numbers and analysis live in
+`bench/BASELINE.md` (baseline: ~4–5 Gbit/s TCP through the tunnel, CPU-bound,
+parallel streams don't help). `vendor/quinn-proto` is 0.11.17 with a one-line
+fix for an upstream datagram-accounting bug that panicked the tunnel under
+sustained datagram overload — drop it when a fixed 0.11.x releases.
+
 ## Key RFCs
 
 | RFC  | Role |
