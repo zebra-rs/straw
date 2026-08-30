@@ -142,6 +142,12 @@ pub struct ProxyConfig {
     /// network. Comma-separated CIDRs.
     #[arg(long, value_delimiter = ',')]
     pub udp_bind_allow_dest: Vec<IpNet>,
+
+    /// Relay-assisted hole punching: observe forwarded punch packets (needs
+    /// CAP_NET_RAW) and signal each peer the other's peer-facing source, so
+    /// symmetric NATs can be traversed when the relay is on the path (§12).
+    #[arg(long)]
+    pub udp_bind_observe: bool,
 }
 
 impl Default for ProxyConfig {
@@ -177,6 +183,7 @@ impl Default for ProxyConfig {
             udp_bind_max_pps: 0,
             udp_bind_max_bps: 0,
             udp_bind_allow_dest: Vec::new(),
+            udp_bind_observe: false,
         }
     }
 }
@@ -344,6 +351,7 @@ fn overlay_cli(config: &mut ProxyConfig, cli: ProxyConfig, matches: &clap::ArgMa
         udp_bind_max_pps,
         udp_bind_max_bps,
         udp_bind_allow_dest,
+        udp_bind_observe,
     );
 }
 

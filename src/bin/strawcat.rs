@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use straw::client::{ClientAuth, TlsMode};
 use straw::error::ProxyError;
@@ -123,7 +123,8 @@ async fn run() -> Result<(), ProxyError> {
 
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let identity = Arc::new(load_identity(&args.identity)?);
-    let listener = peer::listen(relay_access(&args)?, &identity, None).await?;
+    let sink = peer_reflexive_sink(&args);
+    let listener = peer::listen(relay_access(&args)?, &identity, None, sink.clone()).await?;
     let reflexive = listener.reflexive;
     let relay_paddr = listener.paddr;
     let punch_endpoint = listener.punch_endpoint.clone();
@@ -158,7 +159,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
         punch_endpoint,
         reflexive,
         relay_paddr,
-        punch_config(&args)?,
+        punch_config(&args, sink)?,
     );
     let best = best_path(&session, args.punch_wait).await;
     // The connecting peer opens the stream; accept it on the chosen path.
@@ -175,7 +176,8 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     if token.is_expired(now()) {
         return Err(ProxyError::InvalidRequest("token has expired".into()));
     }
-    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token).await?;
+    let sink = peer_reflexive_sink(&args);
+    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token, sink.clone()).await?;
     eprintln!("connected to peer {} via relay", hex(&token.peer_pin()));
     let session = Session::start(
         peer_conn.conn,
@@ -185,7 +187,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         peer_conn.punch_endpoint,
         peer_conn.reflexive,
         peer_conn.relay_paddr,
-        punch_config(&args)?,
+        punch_config(&args, sink)?,
     );
     let best = best_path(&session, args.punch_wait).await;
     let (send, recv) = best
@@ -236,19 +238,26 @@ async fn pipe_stdio(
 
 /// Build the strategy config: predict/birthday need relay access to open
 /// auxiliary bind sessions; relay-assisted wires its signal list in `connect`/
-/// `listen` (see [`peer_reflexive_pump`]). Basic needs neither.
-fn punch_config(args: &RelayArgs) -> Result<PunchConfig, ProxyError> {
+/// `listen` where the bind session is opened. Basic needs neither.
+fn punch_config(
+    args: &RelayArgs,
+    peer_reflexive: Option<Arc<Mutex<Vec<std::net::SocketAddr>>>>,
+) -> Result<PunchConfig, ProxyError> {
     let relay_access = match args.punch_strategy {
-        PunchStrategy::Predict | PunchStrategy::Birthday => {
-            Some(Arc::new(relay_access(args)?))
-        }
+        PunchStrategy::Predict | PunchStrategy::Birthday => Some(Arc::new(relay_access(args)?)),
         _ => None,
     };
     Ok(PunchConfig {
         strategy: args.punch_strategy,
         relay_access,
-        peer_reflexive: None,
+        peer_reflexive,
     })
+}
+
+/// The shared list the relay-assisted strategy reads and the bind session's
+/// capsule reader fills. Only needed for that strategy.
+fn peer_reflexive_sink(args: &RelayArgs) -> Option<Arc<Mutex<Vec<std::net::SocketAddr>>>> {
+    (args.punch_strategy == PunchStrategy::RelayAssisted).then(|| Arc::new(Mutex::new(Vec::new())))
 }
 
 fn relay_access(args: &RelayArgs) -> Result<RelayAccess, ProxyError> {

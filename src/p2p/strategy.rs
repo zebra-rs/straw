@@ -56,7 +56,9 @@ impl FromStr for PunchStrategy {
             "basic" => Ok(PunchStrategy::Basic),
             "predict" => Ok(PunchStrategy::Predict),
             "birthday" => Ok(PunchStrategy::Birthday),
-            "relay-assisted" | "relay_assisted" | "relayassisted" => Ok(PunchStrategy::RelayAssisted),
+            "relay-assisted" | "relay_assisted" | "relayassisted" => {
+                Ok(PunchStrategy::RelayAssisted)
+            }
             other => Err(format!(
                 "unknown punch strategy {other:?} (basic|predict|birthday|relay-assisted)"
             )),

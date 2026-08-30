@@ -166,9 +166,36 @@ crosses the double NAT both ways:
   conntrack PAT will not preserve a port across destinations even for a fixed
   source port; NETMAP, being stateless, bypasses it.
 
-So real cone NATs (most home routers) punch with the outer-socket reuse alone;
-a genuinely symmetric NAT still needs port prediction or a STUN probe toward
-the peer.
+So real cone NATs (most home routers) punch with the outer-socket reuse alone.
+
+**Symmetric-NAT strategies are selectable** with `strawcat --punch-strategy`
+(`p2p::strategy::PunchStrategy`, threaded through `Session::start`'s
+`PunchConfig` into `holepunch::coordinate`, which dispatches):
+- `basic` (default) — outer-socket reuse; cone NATs.
+- `predict` — sample the NAT by opening a few back-to-back aux bind sessions,
+  classify the allocation (`classify`), and for a *sequential* allocator
+  advertise a predicted peer-facing port range. Sequential-symmetric NATs only;
+  a random allocator falls through to the relay. Pure logic is unit-tested.
+- `birthday` — open several punch sockets and dial a scan window around every
+  peer candidate (`scan_around`), first mutually-open pair wins. A fixed-dial
+  birthday attack; feasible only for a narrow external-port range with enough
+  sockets, so best-effort.
+- `relay-assisted` — needs `--udp-bind-observe` on the relay (`CAP_NET_RAW`).
+  An on-path `AF_PACKET` observer (`udp_bind::observe`) reads each peer's
+  *peer-facing* source off the forwarded punch packets and signals it to the
+  other peer as a PEER_REFLEXIVE capsule (0x15), which dials it.
+
+**Honest result: none of these traverse the netns MASQUERADE** — it is the
+worst case (address-AND-port-dependent filtering *and* random per-destination
+allocation). predict detects "random" and relays; birthday's window is far too
+wide; relay-assisted observes and signals correctly (verified) but the sources
+are a *moving target* — each new dial makes a new mapping, and Linux's strict
+5-tuple reply filtering drops the response, so it never converges. This is the
+textbook reason symmetric↔symmetric is the unsolved case and the relay carries
+it. Each strategy targets an *easier* symmetric class (sequential allocation /
+narrow port range / address-dependent filtering) that a real router may have.
+Harness: `STRATEGY=<name>` (relay-assisted also sets `--udp-bind-observe`);
+the punch stays best-effort in `symmetric` mode and asserted only in `cone`.
 
 The standards-codepoint swap (§9) is still future work; everything provisional
 (bind capsule types 0x11–0x13, token format) is isolated for that swap. See

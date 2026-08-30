@@ -211,7 +211,10 @@ fn classify(ports: &[u16]) -> Mapping {
     if ports.len() < 2 {
         return Mapping::Random;
     }
-    let diffs: Vec<i64> = ports.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
+    let diffs: Vec<i64> = ports
+        .windows(2)
+        .map(|w| w[1] as i64 - w[0] as i64)
+        .collect();
     let first = diffs[0];
     if diffs.iter().all(|&d| d == first) && first.abs() <= MAX_STRIDE {
         Mapping::Sequential { stride: first }
@@ -227,9 +230,7 @@ fn predict_range(ip: IpAddr, last_port: u16, stride: i64, span: u16) -> Vec<Sock
     let base = last_port as i64 + stride;
     let lo = (base - span as i64).max(1);
     let hi = (base + span as i64).min(u16::MAX as i64);
-    (lo..=hi)
-        .map(|p| SocketAddr::new(ip, p as u16))
-        .collect()
+    (lo..=hi).map(|p| SocketAddr::new(ip, p as u16)).collect()
 }
 
 /// Sample the NAT by opening `n` bind sessions back-to-back and reading each
@@ -322,14 +323,212 @@ async fn strategy_predict(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError>
     })
 }
 
-async fn strategy_birthday(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError> {
-    tracing::warn!("birthday strategy not yet implemented; using basic");
-    strategy_basic(inputs).await
+/// How many extra punch sockets the birthday attack opens.
+const BIRTHDAY_SOCKETS: usize = 8;
+/// Scan ±this many ports around each advertised candidate.
+const BIRTHDAY_SCAN: u16 = 4;
+
+/// Expand each address to a ±`span` window of nearby ports, de-duplicated.
+fn scan_around(addrs: &[SocketAddr], span: u16) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for a in addrs {
+        let base = a.port() as i64;
+        for p in (base - span as i64).max(1)..=(base + span as i64).min(u16::MAX as i64) {
+            let addr = SocketAddr::new(a.ip(), p as u16);
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
 }
 
+/// The birthday-paradox attack on a random-allocating symmetric NAT: open
+/// several punch sockets (each a bind session with its own reflexive), advertise
+/// them all, and punch every (local socket × peer candidate) pair at once. Each
+/// dial is a *fixed* target, so a pair that mutually opens stays open (unlike
+/// relay-assisted's moving target). The hit probability follows the birthday
+/// bound over the NAT's external-port range — feasible only for a narrow range
+/// with enough sockets, so it is best-effort. On a cone NAT the outer socket's
+/// reflexive already connects.
+async fn strategy_birthday(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError> {
+    let PunchInputs {
+        inner,
+        initiator,
+        identity,
+        peer_pin,
+        punch_endpoint,
+        reflexive,
+        relay,
+        relay_access,
+        ..
+    } = inputs;
+
+    // The outer socket is always one puncher; add auxiliary sockets.
+    punch_endpoint.set_server_config(Some(punch::build_server_config(identity, peer_pin)?));
+    let mut endpoints: Vec<quinn::Endpoint> = vec![punch_endpoint.clone()];
+    let mut local_reflexives: Vec<SocketAddr> = reflexive.into_iter().collect();
+    let mut _aux_clients: Vec<crate::client::BindClient> = Vec::new();
+
+    if let Some(ra) = relay_access.as_ref() {
+        for _ in 0..BIRTHDAY_SOCKETS {
+            match crate::client::BindClient::connect(
+                ra.addr,
+                &ra.server_name,
+                ra.tls.clone(),
+                ra.auth.clone(),
+            )
+            .await
+            {
+                Ok(bc) => {
+                    let ep = bc.endpoint();
+                    ep.set_server_config(Some(punch::build_server_config(identity, peer_pin)?));
+                    if let Some(obs) = bc.observed_addr {
+                        local_reflexives.push(obs);
+                    }
+                    endpoints.push(ep);
+                    _aux_clients.push(bc); // keep the bind session alive
+                }
+                Err(e) => tracing::debug!("birthday: aux session failed: {e}"),
+            }
+        }
+    }
+
+    // Advertise every socket's reflexive so the peer dials them all.
+    let host = host_candidate(&Puncher::on_endpoint(
+        punch_endpoint.clone(),
+        identity,
+        peer_pin,
+    )?)?;
+    let mut local = gather(&Sources {
+        host,
+        reflexive: local_reflexives.first().copied(),
+        relay,
+    });
+    for (i, addr) in local_reflexives.iter().enumerate().skip(1) {
+        local.push(Candidate {
+            seq: local.len() as u32,
+            addr: *addr,
+            kind: CandidateKind::Reflexive,
+        });
+        let _ = i;
+    }
+    tracing::debug!(sockets = endpoints.len(), "birthday: local candidates");
+    let remote = exchange_candidates(inner, &local, initiator).await?;
+    // Scan a window around each advertised candidate: a symmetric NAT's
+    // peer-facing port is not the advertised (relay-facing) one, so guess a
+    // spread of nearby ports — this is the birthday guesswork.
+    let targets = scan_around(&punch_targets(&remote), BIRTHDAY_SCAN);
+    if targets.is_empty() {
+        return Err(ProxyError::Quic(
+            "peer offered no punchable candidates".into(),
+        ));
+    }
+
+    // Race a puncher on every socket toward every target; first success wins.
+    let mut set = tokio::task::JoinSet::new();
+    let my_pin = identity.pin();
+    for ep in &endpoints {
+        let puncher = Puncher::on_endpoint(ep.clone(), identity, peer_pin)?;
+        let targets = targets.clone();
+        set.spawn(async move {
+            puncher
+                .punch(my_pin, peer_pin, &targets, PUNCH_TIMEOUT)
+                .await
+                .map(|conn| (conn, puncher))
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Ok((conn, puncher))) = joined {
+            set.abort_all();
+            tracing::info!(remote = %conn.remote_address(), "direct path established (birthday)");
+            return Ok(Direct {
+                conn,
+                _endpoint: puncher.endpoint().clone(),
+            });
+        }
+    }
+    Err(ProxyError::Quic("birthday punch found no pair".into()))
+}
+
+/// Dial the peer's advertised candidates first — those punch packets, routed
+/// through the relay, let the on-path observer read our peer-facing source and
+/// signal it to the peer. As the relay signals the *peer's* real peer-facing
+/// sources (via PEER_REFLEXIVE, collected into `peer_reflexive`), dial those
+/// too. This traverses symmetric NATs when the relay is on the path (design
+/// §12); it needs `--udp-bind-observe` on the relay to do anything extra.
 async fn strategy_relay_assisted(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError> {
-    tracing::warn!("relay-assisted strategy not yet implemented; using basic");
-    strategy_basic(inputs).await
+    let PunchInputs {
+        inner,
+        initiator,
+        identity,
+        peer_pin,
+        punch_endpoint,
+        reflexive,
+        relay,
+        peer_reflexive,
+        ..
+    } = inputs;
+
+    punch_endpoint.set_server_config(Some(punch::build_server_config(identity, peer_pin)?));
+    let puncher = Puncher::on_endpoint(punch_endpoint.clone(), identity, peer_pin)?;
+    let host = host_candidate(&puncher)?;
+
+    let local = gather(&Sources {
+        host,
+        reflexive,
+        relay,
+    });
+    let remote = exchange_candidates(inner, &local, initiator).await?;
+    let advertised = punch_targets(&remote);
+    tracing::debug!(?advertised, "relay-assisted: bootstrap targets");
+    if advertised.is_empty() {
+        return Err(ProxyError::Quic(
+            "peer offered no punchable candidates".into(),
+        ));
+    }
+
+    let (targets_tx, targets_rx) = tokio::sync::mpsc::unbounded_channel::<SocketAddr>();
+    // Bootstrap: dial the advertised (relay-facing) candidates so our punch
+    // packets reach the relay's path and the observer sees our real source.
+    for t in &advertised {
+        let _ = targets_tx.send(*t);
+    }
+
+    // Feed the peer's relay-observed peer-facing sources as they arrive.
+    let poller = peer_reflexive.map(|shared| {
+        let tx = targets_tx.clone();
+        tokio::spawn(async move {
+            let mut sent = 0usize;
+            loop {
+                {
+                    let v = shared.lock().unwrap();
+                    while sent < v.len() {
+                        tracing::debug!(target = %v[sent], "relay-assisted: dial signalled peer-reflexive");
+                        if tx.send(v[sent]).is_err() {
+                            return;
+                        }
+                        sent += 1;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        })
+    });
+    drop(targets_tx);
+
+    let outcome = puncher
+        .punch_dynamic(identity.pin(), peer_pin, targets_rx, PUNCH_TIMEOUT)
+        .await;
+    if let Some(p) = poller {
+        p.abort();
+    }
+    let conn = outcome?;
+    tracing::info!(remote = %conn.remote_address(), "direct path established (relay-assisted)");
+    Ok(Direct {
+        conn,
+        _endpoint: puncher.endpoint().clone(),
+    })
 }
 
 #[cfg(test)]
@@ -338,14 +537,33 @@ mod tests {
 
     #[test]
     fn classify_reads_sequential_and_random() {
-        assert_eq!(classify(&[40000, 40001, 40002]), Mapping::Sequential { stride: 1 });
-        assert_eq!(classify(&[40000, 40002, 40004]), Mapping::Sequential { stride: 2 });
-        assert_eq!(classify(&[500, 500, 500]), Mapping::Sequential { stride: 0 });
+        assert_eq!(
+            classify(&[40000, 40001, 40002]),
+            Mapping::Sequential { stride: 1 }
+        );
+        assert_eq!(
+            classify(&[40000, 40002, 40004]),
+            Mapping::Sequential { stride: 2 }
+        );
+        assert_eq!(
+            classify(&[500, 500, 500]),
+            Mapping::Sequential { stride: 0 }
+        );
         assert_eq!(classify(&[40000, 51000, 33000]), Mapping::Random);
         // A single sample cannot establish a pattern.
         assert_eq!(classify(&[40000]), Mapping::Random);
         // A large but constant stride is not a useful prediction.
         assert_eq!(classify(&[100, 200, 300]), Mapping::Random);
+    }
+
+    #[test]
+    fn scan_around_windows_and_dedups() {
+        let a: SocketAddr = "192.0.2.2:100".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:102".parse().unwrap();
+        let out = scan_around(&[a, b], 2);
+        // 98..=102 (from a) ∪ 100..=104 (from b) = 98..=104, deduped.
+        let ports: Vec<u16> = out.iter().map(|s| s.port()).collect();
+        assert_eq!(ports, vec![98, 99, 100, 101, 102, 103, 104]);
     }
 
     #[test]

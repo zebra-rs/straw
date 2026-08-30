@@ -11,7 +11,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -50,9 +50,7 @@ pub enum TlsMode {
 /// (predict/birthday NAT sampling).
 impl Clone for TlsMode {
     fn clone(&self) -> Self {
-        use rustls::pki_types::{
-            PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
-        };
+        use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
         match self {
             TlsMode::Insecure => TlsMode::Insecure,
             TlsMode::Ca(c) => TlsMode::Ca(c.clone()),
@@ -766,16 +764,22 @@ impl BindClient {
         self._endpoint.clone()
     }
 
-    pub fn into_relay_socket(self) -> Arc<crate::p2p::relay_socket::RelaySocket> {
+    pub fn into_relay_socket(
+        self,
+        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
+    ) -> Arc<crate::p2p::relay_socket::RelaySocket> {
+        use crate::capsule::Capsule;
         use crate::capsule::codec::read_varint;
-        use crate::udp_bind::context::decode_uncompressed_body;
+        use crate::udp_bind::context::{
+            CAPSULE_PEER_REFLEXIVE, decode_peer_reflexive, decode_uncompressed_body,
+        };
         use bytes::Buf as _;
 
         let BindClient {
             _endpoint,
             _send_request,
             conn,
-            stream,
+            mut stream,
             qsid,
             uncompressed,
             public_addr,
@@ -785,25 +789,49 @@ impl BindClient {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let conn_rx = conn.clone();
         let recv = tokio::spawn(async move {
-            // Hold the session's resources open for the socket's lifetime.
-            let _stream = stream;
+            // Hold the session's resources open for the socket's lifetime and
+            // serve two streams: inner-QUIC datagrams (to the relay socket) and
+            // control capsules (relay-assisted PEER_REFLEXIVE signals).
             let _endpoint = _endpoint;
             let _send_request = _send_request;
+            let mut capsules = crate::capsule::CapsuleBuffer::new();
             loop {
-                let wire = match conn_rx.read_datagram().await {
-                    Ok(w) => w,
-                    Err(_) => return,
-                };
-                let mut cursor = wire.clone();
-                let Ok(got) = read_varint(&mut cursor) else {
-                    continue;
-                };
-                if got != qsid {
-                    continue;
-                }
-                let body = wire.slice(wire.len() - cursor.remaining()..);
-                if let Ok((_, remote, payload)) = decode_uncompressed_body(body) {
-                    let _ = tx.try_send((remote, payload));
+                tokio::select! {
+                    dg = conn_rx.read_datagram() => {
+                        let Ok(wire) = dg else { return };
+                        let mut cursor = wire.clone();
+                        let Ok(got) = read_varint(&mut cursor) else { continue };
+                        if got != qsid {
+                            continue;
+                        }
+                        let body = wire.slice(wire.len() - cursor.remaining()..);
+                        if let Ok((_, remote, payload)) = decode_uncompressed_body(body) {
+                            let _ = tx.try_send((remote, payload));
+                        }
+                    }
+                    data = stream.recv_data() => {
+                        match data {
+                            Ok(Some(chunk)) => {
+                                capsules.push(chunk);
+                                while let Ok(Some(Capsule::Unknown { type_id, data })) =
+                                    capsules.next_capsule()
+                                {
+                                    if type_id == CAPSULE_PEER_REFLEXIVE
+                                        && let Ok(addr) = decode_peer_reflexive(data)
+                                        && let Some(sink) = &peer_reflexive_sink
+                                    {
+                                        tracing::debug!(%addr, "bind: PEER_REFLEXIVE from relay");
+                                        let mut v = sink.lock().unwrap();
+                                        if !v.contains(&addr) {
+                                            v.push(addr);
+                                        }
+                                    }
+                                }
+                            }
+                            // Stream closed or errored: the session is over.
+                            _ => return,
+                        }
+                    }
                 }
             }
         });
