@@ -127,11 +127,14 @@ impl ForwardingEngine {
     /// either hairpins to another session or hands the packet to the TUN
     /// device. Drops that a router would report earn an ICMP error back to
     /// the sender (§7.2).
+    ///
+    /// Takes `Bytes` so the common case (a uniquely owned datagram payload)
+    /// mutates TTL in place without copying (Step 32).
     pub fn forward_from_client(
         &self,
         from: SessionId,
         assigned: &[AssignedAddress],
-        packet: Vec<u8>,
+        packet: Bytes,
     ) -> Result<Forwarded, ForwardingError> {
         Metrics::add(&self.metrics.bytes_from_client_total, packet.len() as u64);
 
@@ -157,8 +160,14 @@ impl ForwardingEngine {
         &self,
         from: SessionId,
         assigned: &[AssignedAddress],
-        mut packet: Vec<u8>,
+        packet: Bytes,
     ) -> Result<Forwarded, ForwardingError> {
+        // Zero-copy when we hold the sole reference to the buffer; only a
+        // shared buffer (e.g. quinn batching) costs a copy.
+        let mut packet = packet
+            .try_into_mut()
+            .unwrap_or_else(|shared| bytes::BytesMut::from(&shared[..]));
+
         // Malformed and spoofed packets are dropped silently: no ICMP for
         // senders we cannot trust (BCP 38).
         let info = packet::parse_packet(&packet)?;
@@ -197,8 +206,14 @@ impl ForwardingEngine {
         }
 
         // Hairpin: destination is another tunnel client (or the sender
-        // itself), so the packet never touches the TUN device.
+        // itself), so the packet never touches the TUN device. The
+        // receiver's scope applies on ingress too: a flow-scoped session
+        // (RFC 9484 §8.3) only accepts packets from within its scope.
         if let Some(target) = self.route_table.lookup(info.dst, info.protocol) {
+            if !self.session_accepts(target, &info) {
+                self.send_icmp_error(from, IcmpErrorKind::AdminProhibited, &packet);
+                return Err(ForwardingError::NotAllowed(info.dst));
+            }
             self.deliver_to_session(target, Bytes::from(packet))?;
             return Ok(Forwarded::Hairpin(target));
         }
@@ -232,6 +247,15 @@ impl ForwardingEngine {
         }
     }
 
+    /// Whether packets from `info.src` fall inside the receiving session's
+    /// advertised scope (ICMP is exempt on the protocol dimension).
+    fn session_accepts(&self, target: SessionId, info: &packet::PacketInfo) -> bool {
+        self.policies
+            .get(&target)
+            .map(|p| p.allows(&info.src, info.protocol))
+            .unwrap_or(false)
+    }
+
     /// Process a packet arriving from the network (TUN device) and dispatch
     /// it to the owning session.
     pub fn dispatch_from_network(&self, mut packet: Vec<u8>) -> Result<SessionId, ForwardingError> {
@@ -243,6 +267,11 @@ impl ForwardingEngine {
             .route_table
             .lookup(info.dst, info.protocol)
             .ok_or(ForwardingError::NoRoute)?;
+        // Ingress scope: flow-scoped sessions only accept traffic from
+        // their target (dropped silently for network-originated packets).
+        if !self.session_accepts(target, &info) {
+            return Err(ForwardingError::NotAllowed(info.src));
+        }
         packet::decrement_ttl(&mut packet)?;
         self.deliver_to_session(target, Bytes::from(packet))?;
         Ok(target)
@@ -342,7 +371,7 @@ mod tests {
 
         let ping = build_ipv4_icmp_echo(addr_a, addr_b, false, 1, 1, b"hi", 64);
         let result = engine
-            .forward_from_client(a, &assigned(addr_a), ping)
+            .forward_from_client(a, &assigned(addr_a), ping.into())
             .unwrap();
         assert_eq!(result, Forwarded::Hairpin(b));
 
@@ -372,7 +401,7 @@ mod tests {
             64,
         );
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), spoofed)
+            .forward_from_client(a, &assigned(addr_a), spoofed.into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::SourceAddressViolation(_)));
         // No ICMP for spoofers (BCP 38): nothing lands in A's queue.
@@ -389,7 +418,7 @@ mod tests {
 
         let pkt = build_ipv4_icmp_echo(addr_a, "192.0.2.1".parse().unwrap(), false, 1, 1, b"", 64);
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), pkt)
+            .forward_from_client(a, &assigned(addr_a), pkt.into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::NoRoute));
 
@@ -425,7 +454,7 @@ mod tests {
             64,
         );
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), pkt)
+            .forward_from_client(a, &assigned(addr_a), pkt.into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::NotAllowed(_)));
 
@@ -445,7 +474,7 @@ mod tests {
 
         let pkt = build_ipv4_icmp_echo(addr_a, addr_a, false, 1, 1, b"", 1);
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), pkt)
+            .forward_from_client(a, &assigned(addr_a), pkt.into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::TtlExpired));
 
@@ -473,22 +502,101 @@ mod tests {
         let ping = || build_ipv4_icmp_echo(addr_a, addr_a, false, 1, 1, b"x", 64);
         assert!(
             engine
-                .forward_from_client(a, &assigned(addr_a), ping())
+                .forward_from_client(a, &assigned(addr_a), ping().into())
                 .is_ok()
         );
         assert!(
             engine
-                .forward_from_client(a, &assigned(addr_a), ping())
+                .forward_from_client(a, &assigned(addr_a), ping().into())
                 .is_ok()
         );
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), ping())
+            .forward_from_client(a, &assigned(addr_a), ping().into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::RateLimited));
         // Two delivered, nothing else (silent drop: no ICMP either).
         assert!(rx_a.recv().await.is_some());
         assert!(rx_a.recv().await.is_some());
         assert!(rx_a.try_recv().is_err());
+    }
+
+    /// Rewrite an ICMP echo into the given IP protocol (fixing the header
+    /// checksum) to fake other transports in tests.
+    fn with_proto(mut pkt: Vec<u8>, proto: u8) -> Vec<u8> {
+        pkt[9] = proto;
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let cs = packet::ipv4_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&cs.to_be_bytes());
+        pkt
+    }
+
+    #[tokio::test]
+    async fn flow_scoped_session_filters_ingress() {
+        let (engine, table) = engine_no_tun(1400);
+        let a = SessionId(0); // full tunnel
+        let b = SessionId(4); // flow tunnel scoped to {A's address, UDP}
+        let c = SessionId(8); // full tunnel
+        let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
+        let addr_b: Ipv4Addr = "10.100.0.3".parse().unwrap();
+        let addr_c: Ipv4Addr = "10.100.0.4".parse().unwrap();
+
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let (tx_c, mut rx_c) = mpsc::channel(8);
+        engine.register_session(a, tx_a, allow_all_policy());
+        engine.register_session(
+            b,
+            tx_b,
+            EgressPolicy::new(Arc::new(vec![IpAddressRange {
+                ip_version: 4,
+                start_ip: addr_a.into(),
+                end_ip: addr_a.into(),
+                ip_protocol: 17, // UDP only
+            }])),
+        );
+        engine.register_session(c, tx_c, allow_all_policy());
+        table.insert_client_addr(addr_a.into(), a);
+        table.insert_client_addr(addr_b.into(), b);
+        table.insert_client_addr(addr_c.into(), c);
+
+        // In-scope sender + protocol: delivered.
+        let udp_from_a = with_proto(
+            build_ipv4_icmp_echo(addr_a, addr_b, false, 1, 1, b"udpish", 64),
+            17,
+        );
+        assert_eq!(
+            engine
+                .forward_from_client(a, &assigned(addr_a), udp_from_a.into())
+                .unwrap(),
+            Forwarded::Hairpin(b)
+        );
+        assert!(rx_b.recv().await.is_some());
+
+        // Out-of-scope sender: dropped, sender told it is prohibited.
+        let udp_from_c = with_proto(
+            build_ipv4_icmp_echo(addr_c, addr_b, false, 1, 1, b"udpish", 64),
+            17,
+        );
+        let err = engine
+            .forward_from_client(c, &assigned(addr_c), udp_from_c.into())
+            .unwrap_err();
+        assert!(matches!(err, ForwardingError::NotAllowed(_)));
+        let icmp_reply = rx_c.recv().await.unwrap();
+        assert_eq!(icmp_reply[20], 3);
+        assert_eq!(icmp_reply[21], 13, "administratively prohibited");
+        assert!(rx_b.try_recv().is_err(), "nothing leaked to B");
+
+        // ICMP from the in-scope peer passes despite the UDP-only scope
+        // (RFC 9484: ICMP always allowed on the protocol dimension).
+        let icmp_from_a = build_ipv4_icmp_echo(addr_a, addr_b, false, 1, 2, b"ping", 64);
+        assert_eq!(
+            engine
+                .forward_from_client(a, &assigned(addr_a), icmp_from_a.into())
+                .unwrap(),
+            Forwarded::Hairpin(b)
+        );
+        assert!(rx_b.recv().await.is_some());
     }
 
     #[tokio::test]
@@ -525,7 +633,7 @@ mod tests {
             64,
         );
         let err = engine
-            .forward_from_client(a, &assigned(addr_a), big)
+            .forward_from_client(a, &assigned(addr_a), big.into())
             .unwrap_err();
         assert!(matches!(err, ForwardingError::MtuExceeded));
 

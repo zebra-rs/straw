@@ -101,13 +101,17 @@ impl IpAddressRange {
 
     /// Whether a packet to `addr` with IP protocol `proto` falls inside
     /// this range (RFC 9484 §4.7.3 matching semantics).
+    ///
+    /// Per §4.6/§4.7.3, "ICMP traffic is always allowed, regardless of the
+    /// value of this field" — the exemption applies to the protocol
+    /// dimension only; the address must still match.
     pub fn contains(&self, addr: &IpAddr, proto: u8) -> bool {
-        let version_matches = match addr {
-            IpAddr::V4(_) => self.ip_version == 4,
-            IpAddr::V6(_) => self.ip_version == 6,
+        let (version_matches, icmp_proto) = match addr {
+            IpAddr::V4(_) => (self.ip_version == 4, 1),
+            IpAddr::V6(_) => (self.ip_version == 6, 58),
         };
         version_matches
-            && (self.ip_protocol == 0 || self.ip_protocol == proto)
+            && (self.ip_protocol == 0 || self.ip_protocol == proto || proto == icmp_proto)
             && (ip_key(&self.start_ip)..=ip_key(&self.end_ip)).contains(&ip_key(addr))
     }
 }
@@ -399,6 +403,14 @@ mod tests {
         };
         assert!(udp_only.contains(&"192.168.1.7".parse().unwrap(), 17));
         assert!(!udp_only.contains(&"192.168.1.7".parse().unwrap(), 6));
+        // RFC 9484: ICMP is always allowed regardless of the protocol
+        // scope — but only for in-range addresses.
+        assert!(udp_only.contains(&"192.168.1.7".parse().unwrap(), 1));
+        assert!(!udp_only.contains(&"192.168.2.7".parse().unwrap(), 1));
+
+        let v6_udp = IpAddressRange::from_net("fd00::/64".parse().unwrap(), 17);
+        assert!(v6_udp.contains(&"fd00::7".parse().unwrap(), 58), "ICMPv6");
+        assert!(!v6_udp.contains(&"fd00::7".parse().unwrap(), 6));
     }
 
     #[test]

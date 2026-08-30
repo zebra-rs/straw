@@ -716,3 +716,249 @@ async fn graceful_shutdown_keeps_existing_tunnels_until_drained() {
     }
     assert!(server.ctx.sessions.is_empty(), "sessions drained");
 }
+
+// ---------------- Phase 5 ----------------
+
+/// Rewrite an ICMP echo into another IP protocol (fixing the checksum) to
+/// fake other transports.
+fn with_proto(mut pkt: Vec<u8>, proto: u8) -> Vec<u8> {
+    pkt[9] = proto;
+    pkt[10] = 0;
+    pkt[11] = 0;
+    let cs = straw::forwarding::packet::ipv4_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&cs.to_be_bytes());
+    pkt
+}
+
+#[tokio::test]
+async fn flow_scoped_tunnel_end_to_end() {
+    let server = TestServer::start().await;
+
+    // Alice: plain full tunnel; gets the first pool address (.2).
+    let mut alice = server.client().await;
+    alice.wait_for_assignment().await.unwrap();
+    let alice_addr = alice.ipv4_address().unwrap();
+    assert_eq!(alice_addr, Ipv4Addr::new(10, 100, 0, 2));
+
+    // Bob: IP flow tunnel scoped to {Alice's address, ICMP only}.
+    let mut bob = TunnelClient::connect_scoped(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+        Some("10.100.0.2"),
+        Some(1),
+    )
+    .await
+    .expect("scoped tunnel accepted");
+    bob.wait_for_assignment().await.unwrap();
+    let bob_addr = bob.ipv4_address().unwrap();
+
+    // The advertisement is exactly the scope, not the full tunnel.
+    assert_eq!(bob.routes.len(), 1);
+    let r = &bob.routes[0];
+    assert_eq!(r.start_ip, std::net::IpAddr::from(alice_addr));
+    assert_eq!(r.end_ip, std::net::IpAddr::from(alice_addr));
+    assert_eq!(r.ip_protocol, 1);
+
+    // In scope: Bob pings Alice through the flow tunnel.
+    let echo = build_ipv4_icmp_echo(bob_addr, alice_addr, false, 31, 1, b"scoped", 64);
+    bob.send_packet(echo).unwrap();
+    let at_alice = tokio::time::timeout(Duration::from_secs(5), alice.recv_packet())
+        .await
+        .expect("scoped packet reaches alice")
+        .unwrap();
+    assert_eq!(&at_alice[28..], b"scoped");
+
+    // Alice replies; the reply is from the scope target, so Bob gets it.
+    let reply = build_ipv4_icmp_echo(alice_addr, bob_addr, true, 31, 1, b"pong", 64);
+    alice.send_packet(reply).unwrap();
+    let at_bob = tokio::time::timeout(Duration::from_secs(5), bob.recv_packet())
+        .await
+        .expect("reply reaches bob")
+        .unwrap();
+    assert_eq!(&at_bob[28..], b"pong");
+
+    // Out of scope: any other destination is administratively prohibited.
+    let stray = build_ipv4_icmp_echo(
+        bob_addr,
+        "192.0.2.7".parse().unwrap(),
+        false,
+        31,
+        2,
+        b"",
+        64,
+    );
+    bob.send_packet(stray).unwrap();
+    let icmp_reply = tokio::time::timeout(Duration::from_secs(5), bob.recv_packet())
+        .await
+        .expect("prohibition ICMP")
+        .unwrap();
+    assert_eq!(icmp_reply[20], 3);
+    assert_eq!(icmp_reply[21], 13, "administratively prohibited");
+
+    alice.close().await;
+    bob.close().await;
+}
+
+#[tokio::test]
+async fn scoped_ingress_blocks_third_parties_but_not_icmp() {
+    let server = TestServer::start().await;
+
+    let mut alice = server.client().await; // .2 — the scope target
+    alice.wait_for_assignment().await.unwrap();
+    let alice_addr = alice.ipv4_address().unwrap();
+
+    // Bob: scoped to {Alice, UDP}.
+    let mut bob = TunnelClient::connect_scoped(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+        Some("10.100.0.2"),
+        Some(17),
+    )
+    .await
+    .unwrap();
+    bob.wait_for_assignment().await.unwrap();
+    let bob_addr = bob.ipv4_address().unwrap();
+
+    let mut carol = server.client().await; // full tunnel, third party
+    carol.wait_for_assignment().await.unwrap();
+    let carol_addr = carol.ipv4_address().unwrap();
+
+    // Carol -> Bob is outside Bob's scope: prohibited (Carol is told).
+    let udp = with_proto(
+        build_ipv4_icmp_echo(carol_addr, bob_addr, false, 1, 1, b"nope", 64),
+        17,
+    );
+    carol.send_packet(udp).unwrap();
+    let icmp_reply = tokio::time::timeout(Duration::from_secs(5), carol.recv_packet())
+        .await
+        .expect("prohibition ICMP for carol")
+        .unwrap();
+    assert_eq!(icmp_reply[21], 13);
+
+    // Alice -> Bob as ICMP passes despite the UDP-only scope (RFC 9484:
+    // ICMP is always allowed on the protocol dimension).
+    let ping = build_ipv4_icmp_echo(alice_addr, bob_addr, false, 2, 1, b"icmp ok", 64);
+    alice.send_packet(ping).unwrap();
+    let at_bob = tokio::time::timeout(Duration::from_secs(5), bob.recv_packet())
+        .await
+        .expect("ICMP reaches scoped tunnel")
+        .unwrap();
+    assert_eq!(&at_bob[28..], b"icmp ok");
+
+    alice.close().await;
+    bob.close().await;
+    carol.close().await;
+}
+
+#[tokio::test]
+async fn multiple_scoped_tunnels_on_one_connection() {
+    let server = TestServer::start().await;
+
+    // Primary tunnel: full scope, stream 0.
+    let mut client = server.client().await;
+    client.wait_for_assignment().await.unwrap();
+    let primary_addr = client.ipv4_address().unwrap();
+
+    // Second tunnel on the same QUIC connection: scoped to a UDP flow.
+    let mut flow = client
+        .open_tunnel(ClientAuth::None, Some("192.0.2.9"), Some(17))
+        .await
+        .expect("second tunnel on the same connection");
+    flow.wait_for_assignment().await.unwrap();
+    let flow_addr = flow.ipv4_address().unwrap();
+    assert_ne!(primary_addr, flow_addr, "each session gets its own address");
+    assert_eq!(flow.routes.len(), 1);
+    assert_eq!(flow.routes[0].ip_protocol, 17);
+    assert_eq!(server.ctx.sessions.len(), 2, "two sessions, one connection");
+
+    // Primary tunnel data plane still works (QSID 0).
+    let echo = build_ipv4_icmp_echo(primary_addr, primary_addr, false, 5, 1, b"primary", 64);
+    client.send_packet(echo).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .expect("primary hairpin")
+        .unwrap();
+    assert_eq!(&reply[28..], b"primary");
+
+    // Flow tunnel: in-scope UDP has no route (no TUN), so the proxy answers
+    // with Destination Unreachable — delivered on the *flow* tunnel's
+    // Quarter Stream ID, proving per-stream datagram demux both ways.
+    let udp = with_proto(
+        build_ipv4_icmp_echo(
+            flow_addr,
+            "192.0.2.9".parse().unwrap(),
+            false,
+            5,
+            2,
+            b"",
+            64,
+        ),
+        17,
+    );
+    flow.send_packet(udp).unwrap();
+    let icmp_reply = tokio::time::timeout(Duration::from_secs(5), flow.recv_packet())
+        .await
+        .expect("unreachable ICMP on the flow tunnel")
+        .unwrap();
+    assert_eq!(icmp_reply[20], 3, "Destination Unreachable");
+    assert_eq!(icmp_reply[21], 0, "net unreachable");
+
+    // Closing the flow tunnel leaves the primary session alive.
+    flow.close().await;
+    for _ in 0..50 {
+        if server.ctx.sessions.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(server.ctx.sessions.len(), 1);
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn hostname_target_is_resolved_before_reply() {
+    let server = TestServer::start().await;
+
+    // "localhost" resolves; the advertisement carries the resolved address.
+    let mut client = TunnelClient::connect_scoped(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+        Some("localhost"),
+        None,
+    )
+    .await
+    .expect("hostname-scoped tunnel accepted");
+    client.wait_for_assignment().await.unwrap();
+    assert!(
+        client
+            .routes
+            .iter()
+            .any(|r| r.start_ip == "127.0.0.1".parse::<std::net::IpAddr>().unwrap()),
+        "resolved A record advertised, got {:?}",
+        client.routes
+    );
+    client.close().await;
+
+    // An unresolvable name is rejected with 502 before the tunnel opens.
+    let denied = TunnelClient::connect_scoped(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+        Some("does-not-exist.invalid"),
+        None,
+    )
+    .await;
+    match denied {
+        Err(straw::error::ProxyError::Http(msg)) => assert!(msg.contains("502"), "{msg}"),
+        Err(e) => panic!("expected 502, got {e}"),
+        Ok(_) => panic!("expected rejection for unresolvable target"),
+    }
+}

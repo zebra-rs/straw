@@ -208,7 +208,7 @@ async fn run_datagram_demux(conn: quinn::Connection, conn_seq: u64, ctx: Arc<Pro
         };
         match ctx
             .engine
-            .forward_from_client(session_id, &assigned, datagram.payload.to_vec())
+            .forward_from_client(session_id, &assigned, datagram.payload)
         {
             Ok(_) => ctx.sessions.touch(session_id),
             Err(e) => tracing::trace!(session = %session_id, "packet dropped: {e}"),

@@ -1,8 +1,13 @@
 //! CONNECT-IP client: connects to a straw proxy, obtains an address
 //! assignment, and exchanges IP packets over HTTP Datagrams.
 //!
+//! One [`TunnelClient`] owns a QUIC connection and its primary [`Tunnel`];
+//! additional flow-scoped tunnels (RFC 9484 §8.3) can be opened on the same
+//! connection with [`TunnelClient::open_tunnel`]. A per-connection demux
+//! task routes incoming datagrams to the right tunnel by Quarter Stream ID.
+//!
 //! Used by the `test_client` binary and the integration tests; a future
-//! `strawcat` peer builds on the same type.
+//! `strawcat` peer builds on the same types.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -10,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use http::{Method, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -52,16 +58,19 @@ pub enum ClientAuth {
 }
 
 type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type DatagramDemux = Arc<DashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>;
 
-/// An established CONNECT-IP tunnel.
-pub struct TunnelClient {
-    // Held so the sockets outlive the tunnel.
-    _endpoint: quinn::Endpoint,
-    // Held because h3 closes the connection when the last SendRequest drops.
-    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    conn: quinn::Connection,
+/// Depth of each tunnel's inbound packet queue.
+const TUNNEL_QUEUE_DEPTH: usize = 256;
+
+/// One established CONNECT-IP tunnel (a single request stream).
+pub struct Tunnel {
     stream: ClientStream,
+    conn: quinn::Connection,
     qsid: u64,
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    demux: DatagramDemux,
     capsules: CapsuleBuffer,
     /// Complete current assignment set (full-state per RFC 9484 §4.7.1).
     pub assigned: Vec<AssignedAddress>,
@@ -69,74 +78,35 @@ pub struct TunnelClient {
     pub routes: Vec<IpAddressRange>,
 }
 
-impl TunnelClient {
-    /// Connect and send the Extended CONNECT request; returns once the
-    /// proxy accepts the tunnel (200).
-    pub async fn connect(
-        server_addr: SocketAddr,
-        server_name: &str,
-        tls_mode: TlsMode,
+impl Tunnel {
+    async fn establish(
+        send_request: &mut SendRequest,
+        conn: &quinn::Connection,
+        demux: &DatagramDemux,
+        authority: &str,
+        auth: &ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
     ) -> Result<Self, ProxyError> {
-        Self::connect_with(server_addr, server_name, tls_mode, ClientAuth::None).await
-    }
-
-    /// [`TunnelClient::connect`] with request credentials.
-    pub async fn connect_with(
-        server_addr: SocketAddr,
-        server_name: &str,
-        tls_mode: TlsMode,
-        auth: ClientAuth,
-    ) -> Result<Self, ProxyError> {
-        let tls_config = match tls_mode {
-            TlsMode::Insecure => tls::build_client_tls_config_insecure()?,
-            TlsMode::Ca(cert) => tls::build_client_tls_config_with_ca(cert)?,
-            TlsMode::Mtls {
-                ca,
-                cert_chain,
-                key,
-            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
-        };
-        let quic_tls =
-            QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
-
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs(15)));
-        client_config.transport_config(Arc::new(transport));
-
-        let bind: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-        let mut endpoint = quinn::Endpoint::client(bind)?;
-        endpoint.set_default_client_config(client_config);
-
-        let conn = endpoint.connect(server_addr, server_name)?.await?;
-
-        // Wrap for HTTP/3, keeping the raw handle for DATAGRAM I/O.
-        let h3_conn = h3_quinn::Connection::new(conn.clone());
-        let (mut driver, mut send_request) = h3::client::builder()
-            .enable_datagram(true)
-            .enable_extended_connect(true)
-            .build::<_, _, Bytes>(h3_conn)
-            .await?;
-
-        // The driver processes control-stream traffic for the connection.
-        tokio::spawn(async move {
-            let err = driver.wait_idle().await;
-            tracing::debug!("h3 driver finished: {err}");
-        });
-
         let Ok(protocol) =
             h3::ext::Protocol::from_str(crate::session::handler::CONNECT_IP_PROTOCOL)
         else {
             unreachable!("connect-ip is a valid protocol token");
         };
-        let authority = format!("{server_name}:{}", server_addr.port());
+
+        let target_segment = match target {
+            Some(t) => encode_template_value(t),
+            None => "*".to_string(),
+        };
+        let ipproto_segment = match ipproto {
+            Some(p) => p.to_string(),
+            None => "*".to_string(),
+        };
+        let path = format!("/.well-known/masque/ip/{target_segment}/{ipproto_segment}/");
+
         let mut builder = Request::builder()
             .method(Method::CONNECT)
-            .uri(format!("https://{authority}/.well-known/masque/ip/*/*/"))
+            .uri(format!("https://{authority}{path}"))
             .header("capsule-protocol", "?1")
             .extension(protocol);
         match auth {
@@ -165,12 +135,15 @@ impl TunnelClient {
         }
 
         let qsid = quarter_stream_id(stream.id().into_inner());
+        let (tx, rx) = tokio::sync::mpsc::channel(TUNNEL_QUEUE_DEPTH);
+        demux.insert(qsid, tx);
+
         Ok(Self {
-            _endpoint: endpoint,
-            _send_request: send_request,
-            conn,
             stream,
+            conn: conn.clone(),
             qsid,
+            rx,
+            demux: demux.clone(),
             capsules: CapsuleBuffer::new(),
             assigned: Vec::new(),
             routes: Vec::new(),
@@ -186,7 +159,7 @@ impl TunnelClient {
         Ok(())
     }
 
-    /// Receive stream data and fold every complete capsule into the client
+    /// Receive stream data and fold every complete capsule into the tunnel
     /// state. Returns the capsules processed.
     pub async fn process_next_capsules(&mut self) -> Result<Vec<Capsule>, ProxyError> {
         let mut seen = Vec::new();
@@ -281,27 +254,201 @@ impl TunnelClient {
     }
 
     /// Receive the next IP packet addressed to this tunnel.
-    pub async fn recv_packet(&self) -> Result<Bytes, ProxyError> {
-        loop {
-            let wire = self.conn.read_datagram().await?;
-            match decode_quic_datagram(wire) {
-                Ok((qsid, datagram))
-                    if qsid == self.qsid && datagram.context_id == CONTEXT_ID_IP_PACKET =>
-                {
-                    return Ok(datagram.payload);
-                }
-                Ok(_) => continue, // other stream or unknown context: skip
-                Err(e) => {
-                    tracing::trace!("malformed datagram dropped: {e}");
-                    continue;
-                }
-            }
-        }
+    pub async fn recv_packet(&mut self) -> Result<Bytes, ProxyError> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| ProxyError::Http("connection closed".into()))
     }
 
-    /// Close the tunnel stream and the QUIC connection.
+    /// Close this tunnel's request stream (the connection stays up).
     pub async fn close(mut self) {
+        self.demux.remove(&self.qsid);
         let _ = self.stream.finish().await;
-        self.conn.close(0u32.into(), b"done");
+    }
+}
+
+/// Percent-encode a `{target}` template value: prefix slashes and IPv6
+/// colons must be escaped (RFC 9484 §4.6).
+fn encode_template_value(value: &str) -> String {
+    value.replace('/', "%2F").replace(':', "%3A")
+}
+
+/// A QUIC connection to a straw proxy with its primary tunnel.
+///
+/// Derefs to [`Tunnel`], so the primary tunnel's methods and state are
+/// available directly on the client.
+pub struct TunnelClient {
+    // Held so the sockets outlive the tunnels.
+    _endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    // Also held because h3 closes the connection when the last one drops.
+    send_request: SendRequest,
+    demux: DatagramDemux,
+    authority: String,
+    tunnel: Tunnel,
+}
+
+impl std::ops::Deref for TunnelClient {
+    type Target = Tunnel;
+    fn deref(&self) -> &Tunnel {
+        &self.tunnel
+    }
+}
+
+impl std::ops::DerefMut for TunnelClient {
+    fn deref_mut(&mut self) -> &mut Tunnel {
+        &mut self.tunnel
+    }
+}
+
+impl TunnelClient {
+    /// Connect and establish an unscoped tunnel; returns once the proxy
+    /// accepts it (200).
+    pub async fn connect(
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls_mode: TlsMode,
+    ) -> Result<Self, ProxyError> {
+        Self::connect_scoped(
+            server_addr,
+            server_name,
+            tls_mode,
+            ClientAuth::None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`TunnelClient::connect`] with request credentials.
+    pub async fn connect_with(
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls_mode: TlsMode,
+        auth: ClientAuth,
+    ) -> Result<Self, ProxyError> {
+        Self::connect_scoped(server_addr, server_name, tls_mode, auth, None, None).await
+    }
+
+    /// Connect with an IP flow scope (RFC 9484 §8.3): `target` is a
+    /// hostname, IP, or prefix (`"192.0.2.0/24"`), `ipproto` an IP protocol
+    /// number; `None` means the `*` wildcard.
+    pub async fn connect_scoped(
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls_mode: TlsMode,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
+        let tls_config = match tls_mode {
+            TlsMode::Insecure => tls::build_client_tls_config_insecure()?,
+            TlsMode::Ca(cert) => tls::build_client_tls_config_with_ca(cert)?,
+            TlsMode::Mtls {
+                ca,
+                cert_chain,
+                key,
+            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
+        };
+        let quic_tls =
+            QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(15)));
+        client_config.transport_config(Arc::new(transport));
+
+        let bind: SocketAddr = if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)?;
+        endpoint.set_default_client_config(client_config);
+
+        let conn = endpoint.connect(server_addr, server_name)?.await?;
+
+        // Wrap for HTTP/3, keeping the raw handle for DATAGRAM I/O.
+        let h3_conn = h3_quinn::Connection::new(conn.clone());
+        let (mut driver, mut send_request) = h3::client::builder()
+            .enable_datagram(true)
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_conn)
+            .await?;
+
+        // The driver processes control-stream traffic for the connection.
+        tokio::spawn(async move {
+            let err = driver.wait_idle().await;
+            tracing::debug!("h3 driver finished: {err}");
+        });
+
+        // Demux inbound datagrams to tunnels by Quarter Stream ID; ends
+        // when the connection closes.
+        let demux: DatagramDemux = Arc::new(DashMap::new());
+        let demux_conn = conn.clone();
+        let demux_map = demux.clone();
+        tokio::spawn(async move {
+            while let Ok(wire) = demux_conn.read_datagram().await {
+                match decode_quic_datagram(wire) {
+                    Ok((qsid, datagram)) if datagram.context_id == CONTEXT_ID_IP_PACKET => {
+                        if let Some(tx) = demux_map.get(&qsid) {
+                            // Datagram semantics: drop on backpressure.
+                            let _ = tx.try_send(datagram.payload);
+                        }
+                    }
+                    Ok(_) => {} // unknown context: silently dropped
+                    Err(e) => tracing::trace!("malformed datagram dropped: {e}"),
+                }
+            }
+        });
+
+        let authority = format!("{server_name}:{}", server_addr.port());
+        let tunnel = Tunnel::establish(
+            &mut send_request,
+            &conn,
+            &demux,
+            &authority,
+            &auth,
+            target,
+            ipproto,
+        )
+        .await?;
+
+        Ok(Self {
+            _endpoint: endpoint,
+            conn,
+            send_request,
+            demux,
+            authority,
+            tunnel,
+        })
+    }
+
+    /// Open an additional tunnel on this connection with its own scope
+    /// (multiple concurrent sessions per client, RFC 9484 §8.3).
+    pub async fn open_tunnel(
+        &mut self,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Tunnel, ProxyError> {
+        Tunnel::establish(
+            &mut self.send_request,
+            &self.conn,
+            &self.demux,
+            &self.authority.clone(),
+            &auth,
+            target,
+            ipproto,
+        )
+        .await
+    }
+
+    /// Close the primary tunnel and the QUIC connection.
+    pub async fn close(self) {
+        let TunnelClient { conn, tunnel, .. } = self;
+        tunnel.close().await;
+        conn.close(0u32.into(), b"done");
     }
 }

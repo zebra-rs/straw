@@ -63,15 +63,19 @@ impl RouteTable {
     }
 
     /// Find the session that should receive a packet for `dst` / `proto`.
+    ///
+    /// Protocol-scoped routes still match ICMP (RFC 9484 §4.7.3: "ICMP
+    /// traffic is always allowed, regardless of the value of this field").
     pub fn lookup(&self, dst: IpAddr, proto: u8) -> Option<SessionId> {
         if let Some(session) = self.client_addrs.get(&dst) {
             return Some(*session);
         }
+        let icmp_proto = if dst.is_ipv4() { 1 } else { 58 };
         let routes = self.routes.read().unwrap();
         routes
             .iter()
             .filter(|r| r.prefix.contains(&dst))
-            .filter(|r| r.ip_protocol == 0 || r.ip_protocol == proto)
+            .filter(|r| r.ip_protocol == 0 || r.ip_protocol == proto || proto == icmp_proto)
             .max_by_key(|r| r.prefix.prefix_len())
             .map(|r| r.session_id)
     }
@@ -183,6 +187,8 @@ mod tests {
 
         assert_eq!(table.lookup(ip("203.0.113.9"), 17), Some(SessionId(8)));
         assert_eq!(table.lookup(ip("203.0.113.9"), 6), None);
+        // ICMP always routes despite the protocol scope (RFC 9484 §4.7.3).
+        assert_eq!(table.lookup(ip("203.0.113.9"), 1), Some(SessionId(8)));
     }
 
     #[test]

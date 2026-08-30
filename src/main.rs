@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use straw::address_pool::AddressPool;
 use straw::config::ProxyConfig;
 use straw::error::ProxyError;
@@ -34,7 +33,8 @@ async fn run() -> Result<(), ProxyError> {
         .init();
     straw::init_crypto();
 
-    let config = ProxyConfig::parse();
+    // Defaults < --config file < CLI flags (Step 31).
+    let config = ProxyConfig::resolve()?;
     config.validate()?;
 
     // TLS: configured cert or a fresh self-signed one for development.

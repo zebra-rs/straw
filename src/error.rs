@@ -88,6 +88,9 @@ pub enum ProxyError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("DNS resolution failed: {0}")]
+    DnsFailure(String),
+
     #[error("address pool exhausted")]
     PoolExhausted,
 }

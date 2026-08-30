@@ -13,7 +13,8 @@ use rustls::pki_types::CertificateDer;
 use crate::error::ProxyError;
 
 /// How clients must authenticate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     /// No authentication (development only).
     #[default]

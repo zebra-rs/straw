@@ -80,12 +80,31 @@ pub async fn handle_connect_ip_stream(
         }
     };
 
+    // 3. Resolve the advertised routes for this scope. Hostname targets
+    // MUST be resolved before replying to the request (RFC 9484 §4.1).
+    let routes = match resolve_advertised_routes(&ctx, &scope).await {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::info!("route resolution failed: {e}");
+            let status = match &e {
+                ProxyError::DnsFailure(_) => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            stream
+                .send_response(Response::builder().status(status).body(()).unwrap())
+                .await?;
+            stream.finish().await?;
+            return Err(e);
+        }
+    };
+
     let stream_id = stream.id().into_inner();
     let session_id = SessionId::compose(conn_seq, stream_id);
     let qsid = quarter_stream_id(stream_id);
 
-    // 3. Create the session (enforces the session limit).
-    let session = TunnelSession::new(session_id, scope, auth_ctx);
+    // 4. Create the session (enforces the session limit).
+    let mut session = TunnelSession::new(session_id, scope, auth_ctx);
+    session.advertised_routes = routes.clone();
     if let Err(e) = ctx.sessions.insert(session) {
         stream
             .send_response(
@@ -100,7 +119,7 @@ pub async fn handle_connect_ip_stream(
     }
 
     // From here on, all exits must run teardown.
-    let result = run_tunnel(&mut stream, quinn_conn, session_id, qsid, &ctx).await;
+    let result = run_tunnel(&mut stream, quinn_conn, session_id, qsid, routes, &ctx).await;
 
     ctx.pool.release(session_id);
     ctx.engine.route_table().remove_session(session_id);
@@ -146,9 +165,10 @@ async fn run_tunnel(
     quinn_conn: quinn::Connection,
     session_id: SessionId,
     qsid: u64,
+    routes: Vec<IpAddressRange>,
     ctx: &Arc<ProxyContext>,
 ) -> Result<(), ProxyError> {
-    // 3. Accept the tunnel.
+    // 5. Accept the tunnel.
     stream
         .send_response(
             Response::builder()
@@ -159,7 +179,7 @@ async fn run_tunnel(
         )
         .await?;
 
-    // 4. Allocate addresses (unprompted assignment) and advertise routes.
+    // 6. Allocate addresses (unprompted assignment) and advertise routes.
     let mut assigned: Vec<AssignedAddress> = Vec::new();
     if let Some(a) = ctx.pool.allocate_v4(session_id) {
         assigned.push(a);
@@ -171,7 +191,6 @@ async fn run_tunnel(
         return Err(ProxyError::PoolExhausted);
     }
 
-    let routes = advertised_routes(ctx);
     send_capsule(
         stream,
         &Capsule::AddressAssign(AddressAssign {
@@ -349,27 +368,79 @@ pub fn full_tunnel_routes(include_v6: bool) -> Vec<IpAddressRange> {
     routes
 }
 
-/// The routes this proxy advertises (and enforces) for a session:
-/// full-tunnel by default, the configured prefixes in split-tunnel mode.
-/// The client address pool is always included so tunnel clients can reach
-/// each other and the gateway; overlaps are merged into a valid capsule.
-fn advertised_routes(ctx: &Arc<ProxyContext>) -> Vec<IpAddressRange> {
-    let mut ranges: Vec<IpAddressRange> = ctx
-        .pool
-        .pool_nets()
-        .into_iter()
-        .map(|net| IpAddressRange::from_net(net, 0))
-        .collect();
+/// The routes this proxy advertises (and enforces) for a session.
+///
+/// Unscoped requests get full-tunnel routes (or the configured split-tunnel
+/// prefixes) plus the client address pool, so tunnel clients can reach each
+/// other and the gateway. Scoped requests (RFC 9484 §8.3 IP flow
+/// forwarding) get exactly the target: a prefix directly, or the resolved
+/// addresses of a hostname — resolution happens here, before the reply, as
+/// §4.1 requires. `{ipproto}` narrows every range (ICMP stays allowed via
+/// the matching rules). Overlaps are merged into a valid capsule.
+async fn resolve_advertised_routes(
+    ctx: &Arc<ProxyContext>,
+    scope: &crate::uri_template::RequestScope,
+) -> Result<Vec<IpAddressRange>, ProxyError> {
+    use crate::uri_template::Target;
 
-    if ctx.config.split_routes.is_empty() {
-        ranges.extend(full_tunnel_routes(ctx.config.ipv6_pool.is_some()));
-    } else {
-        ranges.extend(
-            ctx.config
-                .split_routes
-                .iter()
-                .map(|net| IpAddressRange::from_net(*net, 0)),
-        );
-    }
-    merge_ranges(ranges)
+    let proto = scope.ip_proto.unwrap_or(0);
+    let ranges = match &scope.target {
+        None => {
+            let mut ranges: Vec<IpAddressRange> = ctx
+                .pool
+                .pool_nets()
+                .into_iter()
+                .map(|net| IpAddressRange::from_net(net, proto))
+                .collect();
+            if ctx.config.split_routes.is_empty() {
+                ranges.extend(
+                    full_tunnel_routes(ctx.config.ipv6_pool.is_some())
+                        .into_iter()
+                        .map(|mut r| {
+                            r.ip_protocol = proto;
+                            r
+                        }),
+                );
+            } else {
+                ranges.extend(
+                    ctx.config
+                        .split_routes
+                        .iter()
+                        .map(|net| IpAddressRange::from_net(*net, proto)),
+                );
+            }
+            ranges
+        }
+        Some(Target::Prefix(ip, prefix_len)) => {
+            let net = ipnet::IpNet::new(*ip, *prefix_len)
+                .map_err(|e| ProxyError::InvalidRequest(format!("invalid target prefix: {e}")))?
+                .trunc();
+            vec![IpAddressRange::from_net(net, proto)]
+        }
+        Some(Target::Hostname(host)) => {
+            // RFC 9484 §4.1: MUST resolve before replying to the request.
+            let addrs = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| ProxyError::DnsFailure(format!("{host}: {e}")))?;
+            // §4.7.3: only advertise families we also assign addresses for.
+            let has_v6 = ctx.config.ipv6_pool.is_some();
+            let ranges: Vec<IpAddressRange> = addrs
+                .map(|sa| sa.ip())
+                .filter(|ip| ip.is_ipv4() || has_v6)
+                .map(|ip| IpAddressRange {
+                    ip_version: if ip.is_ipv4() { 4 } else { 6 },
+                    start_ip: ip,
+                    end_ip: ip,
+                    ip_protocol: proto,
+                })
+                .collect();
+            if ranges.is_empty() {
+                return Err(ProxyError::DnsFailure(format!(
+                    "{host}: no usable addresses"
+                )));
+            }
+            ranges
+        }
+    };
+    Ok(merge_ranges(ranges))
 }
