@@ -64,6 +64,21 @@ impl IpProxyingDatagram {
     }
 }
 
+/// Bytes of framing a QUIC DATAGRAM adds around an IP packet on `qsid`:
+/// the Quarter Stream ID and the context ID (RFC 9297 §2.1, RFC 9484 §6).
+pub fn datagram_overhead(qsid: u64) -> usize {
+    // Both lengths are bounded, so the fallbacks are the widest encoding
+    // rather than a real possibility.
+    varint_len(qsid).unwrap_or(8) + varint_len(CONTEXT_ID_IP_PACKET).unwrap_or(8)
+}
+
+/// Largest IP packet that fits in a QUIC DATAGRAM of `max_datagram_size`
+/// bytes on `qsid` — the usable tunnel MTU (RFC 9484 §7.2). `None` when the
+/// datagram cannot even hold the framing.
+pub fn max_ip_packet_size(max_datagram_size: usize, qsid: u64) -> Option<usize> {
+    max_datagram_size.checked_sub(datagram_overhead(qsid))
+}
+
 /// Compute the Quarter Stream ID for a request stream ID (RFC 9297 §2.1).
 pub fn quarter_stream_id(stream_id: u64) -> u64 {
     debug_assert_eq!(
@@ -137,6 +152,24 @@ mod tests {
     fn decode_truncated_fails() {
         let result = decode_quic_datagram(Bytes::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn overhead_and_usable_size_track_the_varint_widths() {
+        // qsid 0 and context 0 are one byte each.
+        assert_eq!(datagram_overhead(0), 2);
+        assert_eq!(max_ip_packet_size(1200, 0), Some(1198));
+        // A qsid past 63 needs two bytes, past 16383 needs four.
+        assert_eq!(datagram_overhead(64), 3);
+        assert_eq!(datagram_overhead(16384), 5);
+        assert_eq!(max_ip_packet_size(1200, 16384), Some(1195));
+    }
+
+    #[test]
+    fn usable_size_is_none_when_framing_does_not_fit() {
+        assert_eq!(max_ip_packet_size(1, 0), None);
+        // Exactly the framing leaves room for a zero-length packet.
+        assert_eq!(max_ip_packet_size(2, 0), Some(0));
     }
 
     #[test]

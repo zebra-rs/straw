@@ -1,0 +1,44 @@
+# straw proxy configuration (see design §10). Every key is optional; a flag
+# given on the command line overrides the same setting here.
+#
+#   straw --config /etc/straw/straw.toml
+
+[server]
+listen_addr = "0.0.0.0:4433"
+tls_cert = "/etc/straw/cert.pem"
+tls_key = "/etc/straw/key.pem"
+shutdown_grace_sec = 5
+
+[quic]
+max_idle_timeout_ms = 30000
+
+[tunnel]
+enabled = true
+device_name = "straw0"
+mtu = 1400            # must be >= 1280 to carry IPv6
+
+[address_pool]
+ipv4_range = "10.100.0.0/24"
+# ipv6_range = "fd00:6d61:7371::/64"
+
+[routing]
+# Full tunnel unless split_routes is set.
+# split_routes = ["192.168.0.0/16", "10.0.0.0/8"]
+accept_client_routes = false
+# Masquerade tunnel traffic out this interface (needs tunnel.enabled).
+nat_interface = "eth0"
+
+[auth]
+mode = "none"         # none | bearer | basic | mtls
+# bearer_tokens = ["..."]
+# basic_credentials = ["user:password"]
+# client_ca = "/etc/straw/client-ca.pem"
+
+[limits]
+max_sessions = 1000
+session_idle_timeout_sec = 300
+max_packet_rate = 0   # packets/sec per session; 0 = unlimited
+max_byte_rate = 0
+
+[metrics]
+# listen = "127.0.0.1:9090"

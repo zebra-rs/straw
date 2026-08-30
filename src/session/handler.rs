@@ -2,6 +2,7 @@
 //! processing, and the client-bound half of the data plane (design §9).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use http::{Method, Request, Response, StatusCode};
@@ -24,6 +25,9 @@ pub const CONNECT_IP_PROTOCOL: &str = "connect-ip";
 
 /// Depth of the per-session client-bound packet queue.
 const SESSION_QUEUE_DEPTH: usize = 256;
+
+/// How often the forwarding loop re-reads the QUIC path MTU.
+const MTU_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
 type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
@@ -214,10 +218,14 @@ async fn run_tunnel(
             .route_table()
             .insert_client_addr(a.ip_address, session_id);
     }
+    // Live tunnel MTU: the smaller of the configured MTU and what one QUIC
+    // DATAGRAM carries on this path, refreshed as discovery ramps (§7.2).
+    let mtu = Arc::new(AtomicUsize::new(effective_mtu(&quinn_conn, qsid, ctx)));
     ctx.engine.register_session(
         session_id,
         client_tx,
         EgressPolicy::new(std::sync::Arc::new(routes.clone())),
+        mtu.clone(),
     );
     ctx.sessions.set_assigned(session_id, assigned.clone());
 
@@ -230,8 +238,18 @@ async fn run_tunnel(
 
     // 6. Forwarding loop: capsules on the stream, packets to the client.
     let mut capsules = CapsuleBuffer::new();
+    let mut mtu_refresh = tokio::time::interval(MTU_REFRESH);
+    mtu_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // quinn raises the path MTU as discovery probes; follow it or
+            // the tunnel stays pinned to the initial estimate.
+            _ = mtu_refresh.tick() => {
+                let updated = effective_mtu(&quinn_conn, qsid, ctx);
+                if mtu.swap(updated, Ordering::Relaxed) != updated {
+                    tracing::debug!(session = %session_id, mtu = updated, "tunnel MTU updated");
+                }
+            }
             // Capsule stream from the client.
             data = stream.recv_data() => {
                 match data {
@@ -250,7 +268,7 @@ async fn run_tunnel(
             // Packets routed toward this client (hairpin or TUN ingress).
             packet = client_rx.recv() => {
                 let Some(packet) = packet else { return Ok(()) };
-                send_packet_datagram(&quinn_conn, qsid, packet);
+                send_packet_datagram(&quinn_conn, qsid, packet, &ctx.metrics);
             }
         }
     }
@@ -258,16 +276,34 @@ async fn run_tunnel(
 
 /// Send one IP packet to the client as an HTTP Datagram. Datagrams are
 /// best-effort: failures other than connection loss just drop the packet.
-fn send_packet_datagram(conn: &quinn::Connection, qsid: u64, packet: Bytes) {
+/// The tunnel MTU for a session: the configured value capped by what one
+/// QUIC DATAGRAM can carry on this connection (RFC 9484 §7.2). quinn's path
+/// MTU only grows after discovery, so sampling here is a safe lower bound
+/// the forwarding loop refreshes.
+fn effective_mtu(conn: &quinn::Connection, qsid: u64, ctx: &Arc<ProxyContext>) -> usize {
+    let configured = ctx.config.mtu as usize;
+    conn.max_datagram_size()
+        .and_then(|max| crate::datagram::max_ip_packet_size(max, qsid))
+        .map(|capacity| capacity.min(configured))
+        .unwrap_or(configured)
+}
+
+fn send_packet_datagram(
+    conn: &quinn::Connection,
+    qsid: u64,
+    packet: Bytes,
+    metrics: &crate::metrics::Metrics,
+) {
     let datagram = IpProxyingDatagram::ip_packet(packet);
     let wire = encode_quic_datagram(qsid, &datagram);
     if let Some(max) = conn.max_datagram_size()
         && wire.len() > max
     {
-        tracing::trace!(
+        crate::metrics::Metrics::incr(&metrics.packets_mtu_dropped_total);
+        tracing::debug!(
             len = wire.len(),
             max,
-            "dropping packet exceeding datagram size"
+            "dropping packet exceeding datagram size; tunnel MTU is stale"
         );
         return;
     }

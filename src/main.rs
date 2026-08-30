@@ -71,10 +71,12 @@ async fn run() -> Result<(), ProxyError> {
     let mut tun_ingress = None;
     let tun_tx = if config.tun {
         let (gateway, prefix) = pool.ipv4_gateway();
+        let ipv6 = pool.ipv6_gateway();
         let channels = spawn_tun(&TunConfig {
             name: config.tun_name.clone(),
             mtu: config.mtu,
             ipv4: Some((gateway, prefix)),
+            ipv6,
         })?;
         tracing::info!(name = %config.tun_name, %gateway, "TUN device up");
         tun_ingress = Some(channels.from_net);

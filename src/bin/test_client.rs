@@ -49,6 +49,15 @@ struct Args {
     /// Number of echo requests to send.
     #[arg(long, default_value_t = 4)]
     count: u16,
+
+    /// Request a tunnel scoped to this target: an IP, a prefix (a.b.c.d/n)
+    /// or a hostname the proxy resolves (RFC 9484 §4.6).
+    #[arg(long)]
+    scope_target: Option<String>,
+
+    /// Request a tunnel scoped to this IP protocol number (6 = TCP, 17 = UDP).
+    #[arg(long)]
+    scope_proto: Option<u8>,
 }
 
 #[tokio::main]
@@ -93,8 +102,15 @@ async fn run() -> Result<(), ProxyError> {
         Some(token) => ClientAuth::Bearer(token.clone()),
         None => ClientAuth::None,
     };
-    let mut client =
-        TunnelClient::connect_with(args.server_addr, &args.server_name, tls_mode, auth).await?;
+    let mut client = TunnelClient::connect_scoped(
+        args.server_addr,
+        &args.server_name,
+        tls_mode,
+        auth,
+        args.scope_target.as_deref(),
+        args.scope_proto,
+    )
+    .await?;
     println!("tunnel accepted (200, capsule-protocol)");
 
     client.wait_for_assignment().await?;
@@ -136,26 +152,85 @@ async fn run() -> Result<(), ProxyError> {
         let started = Instant::now();
         client.send_packet(echo)?;
 
-        match tokio::time::timeout(Duration::from_secs(2), client.recv_packet()).await {
-            Ok(Ok(reply)) => {
-                let rtt = started.elapsed();
-                let info = parse_packet(&reply)?;
-                let ttl = reply[8];
-                received += 1;
-                println!(
-                    "{} bytes from {}: icmp_seq={seq} ttl={ttl} time={:.2?}",
-                    reply.len(),
-                    info.src,
-                    rtt
-                );
+        // Count only a genuine echo back (a real reply, or the sender's own
+        // request looped by a hairpin) — never an ICMP error, so a scope or
+        // TTL rejection is reported but fails the run.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, client.recv_packet()).await {
+                Ok(Ok(reply)) => {
+                    let info = parse_packet(&reply)?;
+                    if is_echo(&reply, &info) {
+                        received += 1;
+                        println!(
+                            "{} bytes from {}: icmp_seq={seq} ttl={} time={:.2?}",
+                            reply.len(),
+                            info.src,
+                            reply[8],
+                            started.elapsed()
+                        );
+                        break;
+                    }
+                    println!(
+                        "icmp_seq={seq}: {} bytes from {}, {}",
+                        reply.len(),
+                        info.src,
+                        describe_icmp(&reply, &info)
+                    );
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    println!("icmp_seq={seq} timed out");
+                    break;
+                }
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => println!("icmp_seq={seq} timed out"),
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     println!("{received}/{} packets received", args.count);
     client.close().await;
+    if received < args.count {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// An ICMP echo — request (v4 type 8 / v6 128) or reply (0 / 129) — as
+/// opposed to an ICMP error. A round trip surfaces one of these: a real
+/// responder answers with a reply, a hairpin to the sender's own address
+/// loops the request straight back. An error is deliberately not one, so
+/// scope and TTL rejections are reported but never counted as delivered.
+fn is_echo(packet: &[u8], info: &straw::forwarding::packet::PacketInfo) -> bool {
+    match (info.protocol, packet.first().map(|b| b >> 4)) {
+        (1, Some(4)) => {
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            matches!(packet.get(ihl), Some(0) | Some(8))
+        }
+        (58, Some(6)) => matches!(packet.get(40), Some(128) | Some(129)),
+        _ => false,
+    }
+}
+
+fn describe_icmp(packet: &[u8], info: &straw::forwarding::packet::PacketInfo) -> String {
+    let (ty, code) = match (info.protocol, packet.first().map(|b| b >> 4)) {
+        (1, Some(4)) => {
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            (packet.get(ihl).copied(), packet.get(ihl + 1).copied())
+        }
+        (58, Some(6)) => (packet.get(40).copied(), packet.get(41).copied()),
+        _ => return format!("protocol {}", info.protocol),
+    };
+    match (info.protocol, ty, code) {
+        (1, Some(3), Some(13)) | (58, Some(1), Some(1)) => {
+            "destination administratively prohibited".into()
+        }
+        (1, Some(3), Some(4)) => "fragmentation needed".into(),
+        (1, Some(3), _) | (58, Some(1), _) => "destination unreachable".into(),
+        (58, Some(2), _) => "packet too big".into(),
+        (1, Some(11), _) | (58, Some(3), _) => "time exceeded".into(),
+        (_, Some(t), Some(c)) => format!("icmp type {t} code {c}"),
+        _ => "truncated icmp".into(),
+    }
 }

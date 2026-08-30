@@ -26,7 +26,7 @@ use crate::capsule::{
 };
 use crate::datagram::{
     CONTEXT_ID_IP_PACKET, IpProxyingDatagram, decode_quic_datagram, encode_quic_datagram,
-    quarter_stream_id,
+    max_ip_packet_size, quarter_stream_id,
 };
 use crate::error::ProxyError;
 use crate::tls;
@@ -64,12 +64,43 @@ type DatagramDemux = Arc<DashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>;
 /// Depth of each tunnel's inbound packet queue.
 const TUNNEL_QUEUE_DEPTH: usize = 256;
 
+/// A cloneable send-only handle for a tunnel's datagrams (see
+/// [`Tunnel::sender`]).
+#[derive(Debug, Clone)]
+pub struct PacketSender {
+    conn: quinn::Connection,
+    qsid: u64,
+}
+
+impl PacketSender {
+    /// Send one IP packet through the tunnel (context ID 0).
+    pub fn send_packet(&self, packet: impl Into<Bytes>) -> Result<(), ProxyError> {
+        let datagram = IpProxyingDatagram::ip_packet(packet.into());
+        let wire = encode_quic_datagram(self.qsid, &datagram);
+        if let Some(max) = self.conn.max_datagram_size()
+            && wire.len() > max
+        {
+            return Err(ProxyError::Forwarding(
+                crate::error::ForwardingError::MtuExceeded,
+            ));
+        }
+        self.conn.send_datagram(wire)?;
+        Ok(())
+    }
+
+    /// Usable tunnel MTU (largest IP packet in one datagram), or `None`
+    /// before datagrams are available.
+    pub fn max_packet_size(&self) -> Option<usize> {
+        max_ip_packet_size(self.conn.max_datagram_size()?, self.qsid)
+    }
+}
+
 /// One established CONNECT-IP tunnel (a single request stream).
 pub struct Tunnel {
     stream: ClientStream,
     conn: quinn::Connection,
     qsid: u64,
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    rx: Option<tokio::sync::mpsc::Receiver<Bytes>>,
     demux: DatagramDemux,
     capsules: CapsuleBuffer,
     /// Complete current assignment set (full-state per RFC 9484 §4.7.1).
@@ -142,7 +173,7 @@ impl Tunnel {
             stream,
             conn: conn.clone(),
             qsid,
-            rx,
+            rx: Some(rx),
             demux: demux.clone(),
             capsules: CapsuleBuffer::new(),
             assigned: Vec::new(),
@@ -256,9 +287,34 @@ impl Tunnel {
     /// Receive the next IP packet addressed to this tunnel.
     pub async fn recv_packet(&mut self) -> Result<Bytes, ProxyError> {
         self.rx
+            .as_mut()
+            .ok_or_else(|| ProxyError::Http("packet receiver was taken".into()))?
             .recv()
             .await
             .ok_or_else(|| ProxyError::Http("connection closed".into()))
+    }
+
+    /// Take the inbound-packet receiver, so a dedicated downlink task can
+    /// own it while this tunnel keeps handling capsules (`strawc` runs the
+    /// two concurrently). After this, [`recv_packet`] errors.
+    pub fn take_packet_rx(&mut self) -> Option<tokio::sync::mpsc::Receiver<Bytes>> {
+        self.rx.take()
+    }
+
+    /// A cheap, cloneable handle for sending packets on this tunnel from
+    /// another task. `quinn::Connection` is `Arc`-backed, so cloning is free.
+    pub fn sender(&self) -> PacketSender {
+        PacketSender {
+            conn: self.conn.clone(),
+            qsid: self.qsid,
+        }
+    }
+
+    /// Largest IP packet that currently fits in one QUIC DATAGRAM — the
+    /// usable tunnel MTU (RFC 9484 §7.2), or `None` before the peer enables
+    /// datagrams. Tracks quinn's path MTU, which only grows after discovery.
+    pub fn max_packet_size(&self) -> Option<usize> {
+        max_ip_packet_size(self.conn.max_datagram_size()?, self.qsid)
     }
 
     /// Close this tunnel's request stream (the connection stays up).

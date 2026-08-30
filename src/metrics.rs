@@ -19,6 +19,7 @@ pub struct Metrics {
     pub packets_to_client_total: AtomicU64,
     pub packets_dropped_total: AtomicU64,
     pub packets_rate_limited_total: AtomicU64,
+    pub packets_mtu_dropped_total: AtomicU64,
     pub icmp_errors_sent_total: AtomicU64,
     pub bytes_from_client_total: AtomicU64,
     pub bytes_to_client_total: AtomicU64,
@@ -75,6 +76,11 @@ impl Metrics {
             "packets_rate_limited_total",
             "Packets dropped by per-session rate limits",
             self.packets_rate_limited_total.load(Ordering::Relaxed),
+        );
+        counter(
+            "packets_mtu_dropped_total",
+            "Packets dropped for exceeding the tunnel MTU",
+            self.packets_mtu_dropped_total.load(Ordering::Relaxed),
         );
         counter(
             "icmp_errors_sent_total",
