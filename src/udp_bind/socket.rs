@@ -76,9 +76,9 @@ impl DestinationPolicy {
     }
 
     /// Allow any (nonzero-port) destination, loopback included — only to
-    /// reach a loopback echo server in tests.
-    #[cfg(test)]
-    fn allow_all_for_test() -> Self {
+    /// reach a loopback echo server in tests (unit and integration).
+    #[doc(hidden)]
+    pub fn allow_all_for_test() -> Self {
         Self {
             denied: Arc::new(Vec::new()),
             allow_all: true,

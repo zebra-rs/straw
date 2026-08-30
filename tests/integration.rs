@@ -9,7 +9,7 @@ use std::time::Duration;
 use rustls::pki_types::CertificateDer;
 use straw::address_pool::AddressPool;
 use straw::capsule::{IpAddressRange, RequestedAddress};
-use straw::client::{ClientAuth, TlsMode, TunnelClient};
+use straw::client::{BindClient, ClientAuth, TlsMode, TunnelClient};
 use straw::config::ProxyConfig;
 use straw::forwarding::ForwardingEngine;
 use straw::forwarding::icmp::IcmpSource;
@@ -97,6 +97,29 @@ impl TestServer {
         let endpoint = build_endpoint(&config, tls_config).unwrap();
         let addr = endpoint.local_addr().unwrap();
 
+        // Bind mode, built from the (customized) config exactly as main.rs
+        // does, so a test enables it by setting config.udp_bind in `customize`.
+        let udp_bind = Arc::new(if config.udp_bind {
+            use straw::forwarding::limiter::RateLimits;
+            use straw::udp_bind::UdpBindState;
+            use straw::udp_bind::alloc::PortAllocator;
+            use straw::udp_bind::socket::DestinationPolicy;
+            let allocator = PortAllocator::new(
+                config.udp_bind_public_ips.clone(),
+                config.udp_bind_port_lo,
+                config.udp_bind_port_hi,
+            )
+            .unwrap();
+            // Tests reach a loopback echo, so permit any destination.
+            UdpBindState::enabled(
+                allocator,
+                DestinationPolicy::allow_all_for_test(),
+                RateLimits::default(),
+            )
+        } else {
+            straw::udp_bind::UdpBindState::disabled()
+        });
+
         let ctx = Arc::new(ProxyContext {
             config,
             sessions,
@@ -104,6 +127,7 @@ impl TestServer {
             engine,
             auth,
             metrics,
+            udp_bind,
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(run_server(endpoint.clone(), ctx.clone(), shutdown_rx));
@@ -960,5 +984,76 @@ async fn hostname_target_is_resolved_before_reply() {
         Err(straw::error::ProxyError::Http(msg)) => assert!(msg.contains("502"), "{msg}"),
         Err(e) => panic!("expected 502, got {e}"),
         Ok(_) => panic!("expected rejection for unresolvable target"),
+    }
+}
+
+// ── CONNECT-UDP bind (P2P relay, design §3.1, §7) ──────────────────────
+
+fn enable_bind(c: &mut ProxyConfig) {
+    c.udp_bind = true;
+    c.udp_bind_public_ips = vec!["127.0.0.1".parse().unwrap()];
+    // A wide range so the ephemeral allocation always succeeds on a busy host.
+    c.udp_bind_port_lo = 20000;
+    c.udp_bind_port_hi = 60999;
+}
+
+#[tokio::test]
+async fn bind_session_relays_udp_both_ways() {
+    use tokio::net::UdpSocket;
+
+    // A loopback echo server standing in for an Internet remote.
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], from).await;
+        }
+    });
+
+    let server = TestServer::start_with(enable_bind).await;
+    let client = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .expect("bind session opens");
+    // The relay handed back a public address in the configured range.
+    assert!(client.public_addr.ip().is_loopback());
+    assert!((20000..=60999).contains(&client.public_addr.port()));
+
+    client.send_to(echo_addr, b"p2p-ping").unwrap();
+    let (from, payload) = tokio::time::timeout(Duration::from_secs(2), client.recv_from())
+        .await
+        .expect("echo within 2s")
+        .expect("a datagram");
+    assert_eq!(from, echo_addr, "reply carries the echo server's address");
+    assert_eq!(&payload[..], b"p2p-ping");
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn connect_udp_is_refused_when_bind_disabled() {
+    // Default server has bind mode off: the request is rejected, not served.
+    let server = TestServer::start().await;
+    let result = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await;
+    match result {
+        Err(straw::error::ProxyError::Http(msg)) => {
+            assert!(
+                msg.contains("501"),
+                "expected 501 Not Implemented, got {msg}"
+            )
+        }
+        Ok(_) => panic!("expected a 501 rejection, bind succeeded"),
+        Err(e) => panic!("expected a 501 rejection, got {e}"),
     }
 }

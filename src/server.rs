@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::watch;
 
@@ -27,6 +27,8 @@ pub struct ProxyContext {
     pub engine: Arc<ForwardingEngine>,
     pub auth: Authenticator,
     pub metrics: Arc<Metrics>,
+    /// CONNECT-UDP bind state (the P2P relay); disabled unless configured.
+    pub udp_bind: Arc<crate::udp_bind::UdpBindState>,
 }
 
 /// Build the QUIC server endpoint (TLS, ALPN h3, DATAGRAM support).
@@ -158,11 +160,27 @@ async fn handle_connection(
                         }
                     };
                     tracing::debug!(method = %req.method(), uri = %req.uri(), "request");
-                    if let Err(e) = crate::session::handler::handle_connect_ip_stream(
-                        req, stream, quinn_conn, conn_seq, ctx,
-                    )
-                    .await
-                    {
+                    let protocol = req
+                        .extensions()
+                        .get::<h3::ext::Protocol>()
+                        .map(|p| p.as_str().to_owned());
+                    let result = match protocol.as_deref() {
+                        Some(crate::udp_bind::handler::CONNECT_UDP_PROTOCOL) => {
+                            crate::udp_bind::handler::handle_connect_udp_bind_stream(
+                                req, stream, quinn_conn, conn_seq, ctx,
+                            )
+                            .await
+                        }
+                        // connect-ip and everything else the IP handler
+                        // validates and rejects as before.
+                        _ => {
+                            crate::session::handler::handle_connect_ip_stream(
+                                req, stream, quinn_conn, conn_seq, ctx,
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::debug!("session ended with error: {e}");
                     }
                 });
@@ -190,6 +208,25 @@ async fn run_datagram_demux(conn: quinn::Connection, conn_seq: u64, ctx: Arc<Pro
                 return;
             }
         };
+        // Peek the Quarter Stream ID to route the datagram: a bind session
+        // carries compression-context framing (not the IP context), so its
+        // datagrams go to that session's bound socket, not the engine.
+        let mut cursor = wire.clone();
+        let qsid = match crate::capsule::codec::read_varint(&mut cursor) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::trace!("malformed datagram dropped: {e}");
+                continue;
+            }
+        };
+        let session_id = SessionId::compose(conn_seq, qsid * 4);
+        if let Some(sink) = ctx.udp_bind.sink(session_id) {
+            // Everything after the qsid is the HTTP Datagram body the bind
+            // socket decodes; drop on backpressure (datagram semantics).
+            let body = wire.slice(wire.len() - cursor.remaining()..);
+            let _ = sink.try_send(body);
+            continue;
+        }
         let (qsid, datagram) = match crate::datagram::decode_quic_datagram(wire) {
             Ok(d) => d,
             Err(e) => {

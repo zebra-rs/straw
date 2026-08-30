@@ -137,6 +137,35 @@ async fn run() -> Result<(), ProxyError> {
         "straw proxy listening"
     );
 
+    // CONNECT-UDP bind state (the P2P relay); disabled unless configured.
+    let udp_bind = Arc::new(if config.udp_bind {
+        use straw::forwarding::limiter::RateLimits;
+        use straw::udp_bind::UdpBindState;
+        use straw::udp_bind::alloc::PortAllocator;
+        use straw::udp_bind::socket::DestinationPolicy;
+        let allocator = PortAllocator::new(
+            config.udp_bind_public_ips.clone(),
+            config.udp_bind_port_lo,
+            config.udp_bind_port_hi,
+        )
+        .map_err(ProxyError::Config)?;
+        tracing::info!(
+            ips = ?config.udp_bind_public_ips,
+            ports = format!("{}-{}", config.udp_bind_port_lo, config.udp_bind_port_hi),
+            "CONNECT-UDP bind mode enabled"
+        );
+        UdpBindState::enabled(
+            allocator,
+            DestinationPolicy::default(),
+            RateLimits {
+                packets_per_sec: config.udp_bind_max_pps,
+                bytes_per_sec: config.udp_bind_max_bps,
+            },
+        )
+    } else {
+        straw::udp_bind::UdpBindState::disabled()
+    });
+
     let grace = Duration::from_secs(config.shutdown_grace_sec);
     let metrics_listen = config.metrics_listen;
     let ctx = Arc::new(ProxyContext {
@@ -146,6 +175,7 @@ async fn run() -> Result<(), ProxyError> {
         engine,
         auth,
         metrics,
+        udp_bind,
     });
 
     // Metrics endpoint (Step 28).

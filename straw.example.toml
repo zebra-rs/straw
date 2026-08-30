@@ -42,3 +42,15 @@ max_byte_rate = 0
 
 [metrics]
 # listen = "127.0.0.1:9090"
+
+# CONNECT-UDP bind mode: the P2P relay / TURN-equivalent (design §7). Off by
+# default — it makes straw an authenticated UDP relay, so [auth].mode must
+# not be "none". Loopback, RFC 1918, link-local, ULA and multicast are always
+# denied as egress destinations.
+[udp_bind]
+enabled = false
+public_ips = ["192.0.2.45"]   # allocation pool for bind-session (IP,port)
+port_lo = 32768
+port_hi = 60999
+max_pps = 0                   # per-session egress packet cap; 0 = unlimited
+max_bps = 0                   # per-session egress byte cap; 0 = unlimited

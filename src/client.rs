@@ -518,3 +518,203 @@ impl TunnelClient {
         conn.close(0u32.into(), b"done");
     }
 }
+
+/// A minimal CONNECT-UDP bind client (design §3.1): opens a bind session at a
+/// straw relay, registers the uncompressed context, and exchanges UDP
+/// payloads (addressed per datagram) with arbitrary remotes.
+///
+/// This is the client half the P2P peer (`strawcat`) will build on; for now
+/// it exists to drive the relay's bind handler end to end. One bind session
+/// per connection, datagrams read straight off the connection.
+pub struct BindClient {
+    _endpoint: quinn::Endpoint,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    conn: quinn::Connection,
+    stream: ClientStream,
+    qsid: u64,
+    contexts: crate::udp_bind::context::ContextTable,
+    uncompressed: u64,
+    /// The relay-allocated public address, from `proxy-public-address`.
+    pub public_addr: std::net::SocketAddr,
+}
+
+impl BindClient {
+    /// Open a bind session and register the uncompressed context (id 2).
+    pub async fn connect(
+        server_addr: SocketAddr,
+        server_name: &str,
+        tls_mode: TlsMode,
+        auth: ClientAuth,
+    ) -> Result<Self, ProxyError> {
+        use crate::udp_bind::context::{
+            Binding, CAPSULE_COMPRESSION_ACK, CompressionAssign, FIRST_UNCOMPRESSED_CONTEXT,
+            decode_context_capsule,
+        };
+
+        let tls_config = match tls_mode {
+            TlsMode::Insecure => tls::build_client_tls_config_insecure()?,
+            TlsMode::Ca(cert) => tls::build_client_tls_config_with_ca(cert)?,
+            TlsMode::Mtls {
+                ca,
+                cert_chain,
+                key,
+            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
+        };
+        let quic_tls =
+            QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_secs(15)));
+        client_config.transport_config(Arc::new(transport));
+        let bind: SocketAddr = if server_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)?;
+        endpoint.set_default_client_config(client_config);
+        let conn = endpoint.connect(server_addr, server_name)?.await?;
+
+        let h3_conn = h3_quinn::Connection::new(conn.clone());
+        let (mut driver, mut send_request) = h3::client::builder()
+            .enable_datagram(true)
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_conn)
+            .await?;
+        tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+        });
+
+        let Ok(protocol) =
+            h3::ext::Protocol::from_str(crate::udp_bind::handler::CONNECT_UDP_PROTOCOL)
+        else {
+            unreachable!("connect-udp is a valid protocol token");
+        };
+        let authority = format!("{server_name}:{}", server_addr.port());
+        let mut builder = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!(
+                "https://{authority}/.well-known/masque/udp/%2A/%2A/"
+            ))
+            .header("capsule-protocol", "?1")
+            .header("connect-udp-bind", "?1")
+            .extension(protocol);
+        builder = apply_auth(builder, &auth);
+        let request = builder
+            .body(())
+            .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?;
+
+        let mut stream = send_request.send_request(request).await?;
+        let response = stream.recv_response().await?;
+        if response.status() != StatusCode::OK {
+            return Err(ProxyError::Http(format!(
+                "relay rejected bind: {}",
+                response.status()
+            )));
+        }
+        let public_addr = response
+            .headers()
+            .get("proxy-public-address")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().trim_matches('"'))
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| ProxyError::Http("relay omitted proxy-public-address".into()))?;
+
+        let qsid = quarter_stream_id(stream.id().into_inner());
+        let mut contexts = crate::udp_bind::context::ContextTable::new();
+        let uncompressed = FIRST_UNCOMPRESSED_CONTEXT;
+        let assign = CompressionAssign {
+            context_id: uncompressed,
+            binding: Binding::Uncompressed,
+        };
+        contexts.register(assign.clone()).expect("fresh context");
+        let mut buf = BytesMut::new();
+        assign.encode(&mut buf);
+        stream.send_data(buf.freeze()).await?;
+
+        // Wait for the relay's COMPRESSION_ACK before using the context.
+        let mut capsules = CapsuleBuffer::new();
+        'ack: loop {
+            let Some(chunk) = stream.recv_data().await? else {
+                return Err(ProxyError::Http("relay closed before ACK".into()));
+            };
+            capsules.push(chunk);
+            while let Some(capsule) = capsules.next_capsule()? {
+                if let Capsule::Unknown { type_id, data } = capsule
+                    && type_id == CAPSULE_COMPRESSION_ACK
+                    && decode_context_capsule(data)? == uncompressed
+                {
+                    contexts.ack(uncompressed).expect("acked our context");
+                    break 'ack;
+                }
+            }
+        }
+
+        Ok(Self {
+            _endpoint: endpoint,
+            _send_request: send_request,
+            conn,
+            stream,
+            qsid,
+            contexts,
+            uncompressed,
+            public_addr,
+        })
+    }
+
+    /// Send a UDP payload to `remote` through the relay.
+    pub fn send_to(&self, remote: SocketAddr, payload: &[u8]) -> Result<(), ProxyError> {
+        let body = self
+            .contexts
+            .encode_datagram(self.uncompressed, remote, payload)
+            .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?;
+        let mut wire = BytesMut::with_capacity(8 + body.len());
+        crate::capsule::codec::write_varint(&mut wire, self.qsid).unwrap();
+        wire.extend_from_slice(&body);
+        self.conn.send_datagram(wire.freeze())?;
+        Ok(())
+    }
+
+    /// Receive the next UDP payload and its source, from the relay.
+    pub async fn recv_from(&self) -> Result<(SocketAddr, Bytes), ProxyError> {
+        use bytes::Buf as _;
+        loop {
+            let wire = self.conn.read_datagram().await?;
+            let mut cursor = wire.clone();
+            let qsid = crate::capsule::codec::read_varint(&mut cursor)?;
+            if qsid != self.qsid {
+                continue;
+            }
+            let body = wire.slice(wire.len() - cursor.remaining()..);
+            match self.contexts.decode_datagram(body) {
+                Ok(dg) => return Ok((dg.remote, dg.payload)),
+                Err(e) => {
+                    tracing::trace!("bind client dropped datagram: {e}");
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Close the bind session and connection.
+    pub async fn close(mut self) {
+        let _ = self.stream.finish().await;
+        self.conn.close(0u32.into(), b"done");
+    }
+}
+
+/// Apply request credentials to an Extended CONNECT builder.
+fn apply_auth(builder: http::request::Builder, auth: &ClientAuth) -> http::request::Builder {
+    match auth {
+        ClientAuth::None => builder,
+        ClientAuth::Bearer(token) => {
+            builder.header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+        }
+        ClientAuth::Basic { user, password } => {
+            use base64::Engine as _;
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            builder.header(http::header::AUTHORIZATION, format!("Basic {encoded}"))
+        }
+    }
+}
