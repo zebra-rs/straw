@@ -164,16 +164,9 @@ async fn run() -> Result<(), ProxyError> {
             }
         }
     });
-    let to_net = channels.to_net;
-    let mut packet_rx = client
-        .take_packet_rx()
-        .expect("the primary tunnel's receiver is available exactly once");
-    let downlink = tokio::spawn(async move {
-        while let Some(packet) = packet_rx.recv().await {
-            // Datagram semantics: drop rather than block when congested.
-            let _ = to_net.try_send(packet);
-        }
-    });
+    // Downlink: the connection's demux task feeds the TUN writer directly —
+    // no intermediate queue or task (Step 32).
+    client.set_packet_sink(channels.to_net.clone());
 
     // Track the path MTU upward (unless pinned) and widen the device.
     let mut mtu_poll = tokio::time::interval(MTU_POLL);
@@ -222,7 +215,6 @@ async fn run() -> Result<(), ProxyError> {
     }
 
     uplink.abort();
-    downlink.abort();
     drop(guard);
     client.close().await;
     Ok(())

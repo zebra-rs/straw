@@ -34,12 +34,17 @@ pub struct TunChannels {
     /// Packets bound for the network (engine → device).
     pub to_net: mpsc::Sender<Bytes>,
     /// Packets arriving from the network (device → engine).
-    pub from_net: mpsc::Receiver<Vec<u8>>,
+    pub from_net: mpsc::Receiver<Bytes>,
 }
 
 /// Depth of the device channels; beyond this, datagrams are dropped.
 #[cfg(target_os = "linux")]
 const CHANNEL_DEPTH: usize = 1024;
+
+/// Largest single packet accepted from the device, independent of the
+/// configured MTU so raising the device MTU at runtime cannot truncate.
+#[cfg(target_os = "linux")]
+const MAX_PACKET: usize = 65_536;
 
 /// Read buffer size, independent of the configured MTU.
 ///
@@ -48,7 +53,7 @@ const CHANNEL_DEPTH: usize = 1024;
 /// and a truncated IP packet is indistinguishable from a malformed one
 /// downstream. One 64 KiB buffer per device costs nothing next to that.
 #[cfg(target_os = "linux")]
-const READ_BUFFER: usize = 65_536;
+const READ_BUFFER: usize = 4 * MAX_PACKET;
 
 /// Create the TUN device and spawn its read/write pump tasks.
 #[cfg(target_os = "linux")]
@@ -77,7 +82,7 @@ pub fn spawn_tun(cfg: &TunConfig) -> Result<TunChannels, ProxyError> {
     }
 
     let (to_net_tx, mut to_net_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
-    let (from_net_tx, from_net_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+    let (from_net_tx, from_net_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
 
     // Engine → network.
     let writer = device.clone();
@@ -93,12 +98,23 @@ pub fn spawn_tun(cfg: &TunConfig) -> Result<TunChannels, ProxyError> {
     // Network → engine.
     let reader = device;
     tokio::spawn(async move {
-        let mut buf = vec![0u8; READ_BUFFER];
+        // One large buffer, split per packet: `split_to(n).freeze()` hands
+        // the packet out as `Bytes` without a copy, and a fresh chunk is
+        // allocated only when the current one runs low — amortizing what
+        // used to be a `to_vec()` allocation per packet (Step 32).
+        use bytes::BytesMut;
+        let mut buf = BytesMut::with_capacity(READ_BUFFER);
         loop {
+            if buf.capacity() < MAX_PACKET {
+                buf = BytesMut::with_capacity(READ_BUFFER);
+            }
+            buf.resize(MAX_PACKET, 0);
             match reader.recv(&mut buf).await {
                 Ok(n) if n > 0 => {
                     // Datagram semantics: drop when the engine is congested.
-                    let _ = from_net_tx.try_send(buf[..n].to_vec());
+                    let packet = buf.split_to(n).freeze();
+                    buf.clear();
+                    let _ = from_net_tx.try_send(packet);
                 }
                 Ok(_) => continue,
                 Err(e) => {

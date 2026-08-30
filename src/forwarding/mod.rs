@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 use crate::capsule::{AssignedAddress, IpAddressRange};
+use crate::datagram::{IpProxyingDatagram, encode_quic_datagram};
 use crate::error::ForwardingError;
 use crate::metrics::Metrics;
 use crate::session::SessionId;
@@ -29,6 +30,21 @@ use crate::session::SessionId;
 use self::icmp::{IcmpErrorKind, IcmpSource, build_icmp_error};
 use self::limiter::{RateLimits, SessionLimiter};
 use self::router::RouteTable;
+
+/// Where packets bound for a session's client are delivered.
+///
+/// The hot path writes straight into the QUIC connection: `send_datagram`
+/// is synchronous and lock-cheap, so hairpin and TUN-ingress packets skip
+/// the per-session queue and the handler-task wakeup they used to cost
+/// (Step 32). The channel variant remains for tests, which want to inspect
+/// delivered packets.
+#[derive(Debug, Clone)]
+pub enum SessionSink {
+    /// Deliver into a channel (tests, inspection).
+    Channel(mpsc::Sender<Bytes>),
+    /// Encode as an HTTP Datagram and send on the session's connection.
+    Datagram { conn: quinn::Connection, qsid: u64 },
+}
 
 /// Where a client packet ended up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +78,11 @@ impl EgressPolicy {
 pub struct ForwardingEngine {
     route_table: Arc<RouteTable>,
     /// Per-session sinks delivering packets toward that session's client.
-    session_sinks: DashMap<SessionId, mpsc::Sender<Bytes>>,
+    session_sinks: DashMap<SessionId, SessionSink>,
+    /// Per-session teardown signals: `unregister_session` fires them so the
+    /// session handler (idle reaper path) wakes and runs its teardown, a job
+    /// the dropped per-session channel used to do.
+    session_notify: DashMap<SessionId, Arc<tokio::sync::Notify>>,
     /// Per-session egress policies (the advertised routes).
     policies: DashMap<SessionId, EgressPolicy>,
     /// Per-session token buckets; absent when limits are unlimited.
@@ -96,6 +116,7 @@ impl ForwardingEngine {
         Self {
             route_table,
             session_sinks: DashMap::new(),
+            session_notify: DashMap::new(),
             policies: DashMap::new(),
             limiters: DashMap::new(),
             session_mtus: DashMap::new(),
@@ -116,16 +137,19 @@ impl ForwardingEngine {
     pub fn register_session(
         &self,
         id: SessionId,
-        sink: mpsc::Sender<Bytes>,
+        sink: SessionSink,
         policy: EgressPolicy,
         mtu: Arc<AtomicUsize>,
-    ) {
+    ) -> Arc<tokio::sync::Notify> {
         self.session_sinks.insert(id, sink);
         self.policies.insert(id, policy);
         self.session_mtus.insert(id, mtu);
         if !self.limits.is_unlimited() {
             self.limiters.insert(id, SessionLimiter::new(self.limits));
         }
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.session_notify.insert(id, notify.clone());
+        notify
     }
 
     /// Remove a session's sink, policy and limiter (teardown).
@@ -134,6 +158,9 @@ impl ForwardingEngine {
         self.policies.remove(&id);
         self.session_mtus.remove(&id);
         self.limiters.remove(&id);
+        if let Some((_, notify)) = self.session_notify.remove(&id) {
+            notify.notify_waiters();
+        }
     }
 
     /// The current tunnel MTU toward `id`, or the configured MTU for a
@@ -295,7 +322,12 @@ impl ForwardingEngine {
 
     /// Process a packet arriving from the network (TUN device) and dispatch
     /// it to the owning session.
-    pub fn dispatch_from_network(&self, mut packet: Vec<u8>) -> Result<SessionId, ForwardingError> {
+    pub fn dispatch_from_network(&self, packet: Bytes) -> Result<SessionId, ForwardingError> {
+        // Zero-copy when the buffer is uniquely owned, mirroring the
+        // client→network path (Step 32).
+        let mut packet = packet
+            .try_into_mut()
+            .unwrap_or_else(|shared| bytes::BytesMut::from(&shared[..]));
         let info = packet::parse_packet(&packet)?;
         let target = self
             .route_table
@@ -326,10 +358,28 @@ impl ForwardingEngine {
             .get(&id)
             .ok_or(ForwardingError::NoRoute)?;
         let len = packet.len() as u64;
-        // Datagram semantics: drop on backpressure instead of blocking the
-        // whole data plane.
-        sink.try_send(packet)
-            .map_err(|_| ForwardingError::Congested)?;
+        match sink.value() {
+            // Datagram semantics: drop on backpressure instead of blocking
+            // the whole data plane.
+            SessionSink::Channel(tx) => {
+                tx.try_send(packet)
+                    .map_err(|_| ForwardingError::Congested)?;
+            }
+            // Direct egress: encode and hand to QUIC right here. The engine
+            // checked the packet against the session MTU, so an oversize
+            // datagram means the path narrowed under us — count it.
+            SessionSink::Datagram { conn, qsid } => {
+                let wire = encode_quic_datagram(*qsid, &IpProxyingDatagram::ip_packet(packet));
+                if let Some(max) = conn.max_datagram_size()
+                    && wire.len() > max
+                {
+                    Metrics::incr(&self.metrics.packets_mtu_dropped_total);
+                    return Err(ForwardingError::MtuExceeded);
+                }
+                conn.send_datagram(wire)
+                    .map_err(|_| ForwardingError::Congested)?;
+            }
+        }
         Metrics::incr(&self.metrics.packets_to_client_total);
         Metrics::add(&self.metrics.bytes_to_client_total, len);
         Ok(())
@@ -337,7 +387,7 @@ impl ForwardingEngine {
 
     /// Drive TUN → sessions: read packets from the TUN ingress channel and
     /// dispatch until the channel closes.
-    pub async fn run_network_ingress(self: Arc<Self>, mut rx: mpsc::Receiver<Vec<u8>>) {
+    pub async fn run_network_ingress(self: Arc<Self>, mut rx: mpsc::Receiver<Bytes>) {
         while let Some(packet) = rx.recv().await {
             match self.dispatch_from_network(packet) {
                 Ok(session) => tracing::trace!(%session, "network packet dispatched"),
@@ -411,8 +461,18 @@ mod tests {
 
         let (tx_a, _rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
-        engine.register_session(b, tx_b, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
+        engine.register_session(
+            b,
+            SessionSink::Channel(tx_b),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
         table.insert_client_addr(addr_b.into(), b);
 
@@ -434,7 +494,12 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
 
         // Session A claims a source address it was never assigned.
@@ -461,7 +526,12 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
 
         let pkt = build_ipv4_icmp_echo(addr_a, "192.0.2.1".parse().unwrap(), false, 1, 1, b"", 64);
         let err = engine
@@ -489,7 +559,7 @@ mod tests {
             "192.0.2.0/24".parse().unwrap(),
             0,
         )]));
-        engine.register_session(a, tx_a, policy, unlimited_mtu());
+        engine.register_session(a, SessionSink::Channel(tx_a), policy, unlimited_mtu());
 
         let pkt = build_ipv4_icmp_echo(
             addr_a,
@@ -516,7 +586,12 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
 
         let pkt = build_ipv4_icmp_echo(addr_a, addr_a, false, 1, 1, b"", 1);
@@ -543,7 +618,12 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
 
         let ping = || build_ipv4_icmp_echo(addr_a, addr_a, false, 1, 1, b"x", 64);
@@ -591,10 +671,15 @@ mod tests {
         let (tx_a, _rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
         let (tx_c, mut rx_c) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         engine.register_session(
             b,
-            tx_b,
+            SessionSink::Channel(tx_b),
             EgressPolicy::new(Arc::new(vec![IpAddressRange {
                 ip_version: 4,
                 start_ip: addr_a.into(),
@@ -603,7 +688,12 @@ mod tests {
             }])),
             unlimited_mtu(),
         );
-        engine.register_session(c, tx_c, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            c,
+            SessionSink::Channel(tx_c),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
         table.insert_client_addr(addr_b.into(), b);
         table.insert_client_addr(addr_c.into(), c);
@@ -653,12 +743,17 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
         table.insert_client_addr(addr_a.into(), a);
 
         let inbound =
             build_ipv4_icmp_echo("192.0.2.1".parse().unwrap(), addr_a, true, 1, 1, b"", 64);
-        let session = engine.dispatch_from_network(inbound).unwrap();
+        let session = engine.dispatch_from_network(inbound.into()).unwrap();
         assert_eq!(session, a);
         assert!(rx_a.recv().await.is_some());
     }
@@ -669,7 +764,12 @@ mod tests {
         let a = SessionId(0);
         let addr_a: Ipv4Addr = "10.100.0.2".parse().unwrap();
         let (tx_a, mut rx_a) = mpsc::channel(8);
-        engine.register_session(a, tx_a, allow_all_policy(), unlimited_mtu());
+        engine.register_session(
+            a,
+            SessionSink::Channel(tx_a),
+            allow_all_policy(),
+            unlimited_mtu(),
+        );
 
         let big = build_ipv4_icmp_echo(
             addr_a,

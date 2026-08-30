@@ -53,10 +53,32 @@ double-subtract; no 0.11.x release carries the fix, so `vendor/quinn-proto`
 is 0.11.17 with the one-line patch (see `[patch.crates-io]`). With the patch
 the same sweep runs to completion with zero panics.
 
-## Optimization targets (Step 32), in measured order
+## After Step 32 (direct egress + amortized allocation)
 
-1. Batched TUN + UDP I/O (recvmmsg/sendmmsg, quinn-udp already does GSO/GRO
-   on the QUIC side) — per-packet syscalls dominate at ~350 kpps.
-2. Fewer per-packet hops: TUN reader → engine → session channel → datagram
-   send is 3 queue crossings per packet each way.
-3. Then re-measure before anything fancier (io_uring, DSCP copy).
+Step 32 removed the per-session queue and handler-task wakeup on the
+client-bound path — the engine now encodes and calls `send_datagram`
+directly (`SessionSink::Datagram`), with a `Notify` replacing the dropped
+channel as the reaper's teardown wake — plus: strawc's downlink demux feeds
+the TUN writer channel directly (one task and one hop fewer), the TUN read
+pump amortizes its per-packet allocation (`BytesMut` chunk + `split_to`),
+and network→client TTL decrement is zero-copy like the other direction.
+
+Re-measured (two runs, same host and method):
+
+| case | before | after |
+|---|---|---|
+| tunnel TCP, uplink | 4.23 Gbit/s | 4.18–4.27 Gbit/s (unchanged) |
+| tunnel TCP, downlink | 5.25 Gbit/s | **5.69–5.70 Gbit/s (+8–9%)** |
+| tunnel TCP, downlink ×4 | 5.16 Gbit/s | 5.52–5.57 Gbit/s |
+| tunnel UDP @ 4G loss | 0.44% | 0.40% |
+
+The gain lands exactly where the hops were removed (downlink); the uplink
+path kept its single TUN-reader→sender hop and is bound by QUIC crypto and
+per-datagram sends, as the baseline predicted.
+
+## Remaining optimization targets, in measured order
+
+1. TUN offload (IFF_VNET_HDR + TSO/GSO): a single read/write moves a
+   64 KB aggregate instead of one MTU packet — the standard next step
+   (wireguard-go, tailscale) and the only way past per-packet TUN syscalls.
+2. Then re-measure before anything fancier (io_uring, DSCP copy).
