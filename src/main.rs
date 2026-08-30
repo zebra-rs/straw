@@ -89,7 +89,7 @@ async fn run() -> Result<(), ProxyError> {
                 if let Some(engine) = ingress_engine.get()
                     && let Err(e) = engine.dispatch_from_network(packet)
                 {
-                    tracing::trace!("network packet dropped: {e}");
+                    tracing::debug!("network packet dropped: {e}");
                 }
             },
         )?;

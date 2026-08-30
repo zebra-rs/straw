@@ -23,11 +23,21 @@ use futures::stream::{self, StreamExt};
 #[derive(Debug, Default, CucumberWorld)]
 pub struct World {
     feature_tag: String,
-    /// Byte length of `logs/<scoped>.log` when this run started the daemon.
-    /// Daemon logs append across runs, so the log-content steps only look
-    /// past this offset — a line from an earlier run must never satisfy an
-    /// assertion about the daemon started now.
-    log_offsets: HashMap<String, u64>,
+}
+
+/// Byte length of each `logs/<scoped>_<role>.log` when this process last
+/// started that daemon. Daemon logs append across runs, so the log-content
+/// steps only look past this offset — a line from an earlier run must never
+/// satisfy an assertion about the daemon started now.
+///
+/// Process-global, NOT in `World`: cucumber builds a fresh `World` per
+/// scenario, and daemons start in an earlier scenario than the assertions
+/// about their logs. Keeping the offsets in `World` silently reset them to
+/// 0 between scenarios, so `should eventually contain` matched stale lines
+/// from previous runs — a converge gate that never gated anything.
+fn log_offsets() -> &'static Mutex<HashMap<String, u64>> {
+    static OFFSETS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    OFFSETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl World {
@@ -60,12 +70,20 @@ impl World {
 
     fn mark_log_start(&mut self, log_file: &str) {
         let len = fs::metadata(log_file).map(|m| m.len()).unwrap_or(0);
-        self.log_offsets.insert(log_file.to_string(), len);
+        log_offsets()
+            .lock()
+            .unwrap()
+            .insert(log_file.to_string(), len);
     }
 
     fn log_since_start(&self, log_file: &str) -> String {
         let content = fs::read_to_string(log_file).unwrap_or_default();
-        let offset = self.log_offsets.get(log_file).copied().unwrap_or(0) as usize;
+        let offset = log_offsets()
+            .lock()
+            .unwrap()
+            .get(log_file)
+            .copied()
+            .unwrap_or(0) as usize;
         content.get(offset..).unwrap_or("").to_string()
     }
 

@@ -375,10 +375,16 @@ impl ForwardingEngine {
                     && wire.len() > max
                 {
                     Metrics::incr(&self.metrics.packets_mtu_dropped_total);
+                    tracing::debug!(
+                        session = %id, len = wire.len(), max,
+                        "datagram exceeds the connection's datagram size"
+                    );
                     return Err(ForwardingError::MtuExceeded);
                 }
-                conn.send_datagram(wire)
-                    .map_err(|_| ForwardingError::Congested)?;
+                conn.send_datagram(wire).map_err(|e| {
+                    tracing::debug!(session = %id, "send_datagram failed: {e}");
+                    ForwardingError::Congested
+                })?;
             }
         }
         Metrics::incr(&self.metrics.packets_to_client_total);

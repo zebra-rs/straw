@@ -148,7 +148,7 @@ async fn run() -> Result<(), ProxyError> {
         },
         move |packet| {
             if let Err(e) = uplink_sender.send_packet(packet) {
-                tracing::trace!("packet not sent: {e}");
+                tracing::debug!("packet not sent: {e}");
             }
         },
     )?;
