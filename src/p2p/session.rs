@@ -23,7 +23,6 @@ use tokio::sync::watch;
 
 use std::sync::Arc as StdArc;
 
-use crate::error::ProxyError;
 use crate::p2p::holepunch::{self, Direct};
 use crate::p2p::identity::{Identity, SpkiPin};
 

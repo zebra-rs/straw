@@ -1300,6 +1300,66 @@ async fn strawcat_peers_pipe_over_a_token() {
 }
 
 #[tokio::test]
+async fn relay_path_carries_a_large_transfer() {
+    // Regression for the inner-QUIC MTU trap: every inner packet is re-wrapped
+    // as one outer QUIC DATAGRAM, so the inner MTU must stay within the outer
+    // datagram. quinn's path-MTU discovery would otherwise probe the inner
+    // connection past that ceiling; those oversize packets fail send_datagram
+    // and the connection stalls after the handshake. A small payload never
+    // trips it — only a transfer large enough to send full-size packets does.
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
+        .await
+        .expect("issuer listens");
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "relay-bearer".into(),
+        issuer.pin(),
+        vec![listener.paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_conn = peer::connect(relay_access(&relay), &holder, &token)
+        .await
+        .expect("holder connects");
+    let issuer_conn = accept.await.unwrap().expect("issuer accepts");
+
+    // 256 KiB, larger than any single inner packet, so full-size packets flow.
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let issuer_echo = tokio::spawn(async move {
+        let (mut esend, mut erecv) = issuer_conn.accept_bi().await.unwrap();
+        let got = erecv.read_to_end(1024 * 1024).await.unwrap();
+        esend.write_all(&got).await.unwrap();
+        esend.finish().unwrap();
+        // Keep the connection alive until the holder has read the echo.
+        issuer_conn.closed().await;
+        got
+    });
+
+    let round_trip = tokio::time::timeout(Duration::from_secs(15), async move {
+        let (mut send, mut recv) = holder_conn.conn.open_bi().await.unwrap();
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        recv.read_to_end(1024 * 1024).await.unwrap()
+    })
+    .await
+    .expect("large transfer completes over the relay within 15s");
+
+    assert_eq!(round_trip.len(), expected.len(), "echo is the full length");
+    assert_eq!(round_trip, expected, "256 KiB round-trips byte-for-byte");
+    let received = issuer_echo.await.unwrap();
+    assert_eq!(received, expected, "issuer received the whole payload");
+}
+
+#[tokio::test]
 async fn bind_session_reports_the_reflexive_candidate() {
     // The relay reports the peer's outer source as OBSERVED_ADDRESS; the
     // BindClient captures it as its reflexive candidate (design §5.1).

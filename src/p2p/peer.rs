@@ -60,6 +60,22 @@ pub struct PeerConnection {
     _endpoint: quinn::Endpoint,
 }
 
+/// Transport config for inner QUIC that runs *inside* the relay's bind
+/// datagrams. Each inner packet is re-encapsulated as one outer QUIC DATAGRAM,
+/// so the inner MTU must never exceed what a single outer datagram carries.
+/// quinn's own path-MTU discovery would probe upward (e.g. to ~1420) and those
+/// oversize packets fail `send_datagram`, stalling the connection after the
+/// handshake. Pin the inner MTU at quinn's 1200-byte floor and disable
+/// discovery so inner packets always fit; a keepalive holds the idle pipe open.
+fn relay_transport() -> std::sync::Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    t.mtu_discovery_config(None);
+    t.initial_mtu(1200);
+    t.min_mtu(1200);
+    t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    std::sync::Arc::new(t)
+}
+
 /// Open a bind session and stand up the inner *server* endpoint over it.
 /// `expected_peer` pins the connecting holder's key when known out of band,
 /// else `None` accepts it on first use (design §3.2).
@@ -72,9 +88,10 @@ pub async fn listen(
     let paddr = bind.public_addr;
     let reflexive = bind.observed_addr;
     let (server_tls, _verifier) = inner_tls::server_config(identity, expected_peer)?;
-    let quic = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut quic = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
+    quic.transport_config(relay_transport());
     let endpoint = inner_endpoint(bind.into_relay_socket(), Some(quic))
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     Ok(Listener {
@@ -102,9 +119,10 @@ pub async fn connect(
     let reflexive = bind.observed_addr;
     let relay_paddr = bind.public_addr;
     let (client_tls, _verifier) = inner_tls::client_config(identity, Some(token.peer_pin()))?;
-    let quic = quinn::ClientConfig::new(Arc::new(
+    let mut quic = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
+    quic.transport_config(relay_transport());
     let endpoint = inner_endpoint(bind.into_relay_socket(), None)
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     let conn = endpoint

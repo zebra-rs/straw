@@ -28,7 +28,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::forwarding::limiter::SessionLimiter;
-use crate::udp_bind::context::{Binding, ContextTable};
+use crate::udp_bind::context::ContextTable;
 
 /// Largest UDP payload the relay will move in either direction.
 const MAX_UDP_PAYLOAD: usize = 65_535;
@@ -246,7 +246,7 @@ fn encapsulate(table: &ContextTable, remote: SocketAddr, payload: &[u8]) -> Opti
 mod tests {
     use super::*;
     use crate::forwarding::limiter::RateLimits;
-    use crate::udp_bind::context::{CompressionAssign, FIRST_UNCOMPRESSED_CONTEXT};
+    use crate::udp_bind::context::{Binding, CompressionAssign, FIRST_UNCOMPRESSED_CONTEXT};
 
     fn unlimited() -> Arc<SessionLimiter> {
         Arc::new(SessionLimiter::new(RateLimits::default()))
