@@ -30,8 +30,9 @@ use crate::error::ProxyError;
 use crate::p2p::identity::{Identity, SpkiPin, pin_of_spki, pins_match};
 
 /// ALPN for the raw-QUIC inner protocol (design §2.1): stdio/port-forward
-/// pipes over native QUIC streams.
-pub const ALPN_STRAWCAT: &[u8] = b"strawcat/1";
+/// pipes over native QUIC streams. Defined in the codepoint registry
+/// (`crate::codepoints`) and re-exported here for the v2 swap (§9).
+pub use crate::codepoints::ALPN_STRAWCAT;
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())

@@ -58,6 +58,10 @@ pub struct Candidate {
 
 /// A control message on inner stream 0 (design §5.2). A tagged CBOR enum so
 /// the three message types share one framed stream.
+///
+/// This is the v1 encoding; v2 swaps to draft-seemann-quic-nat-traversal QUIC
+/// frames (`crate::codepoints::NAT_TRAVERSAL_FRAME_BASE`) once quinn exposes an
+/// extension-frame API (design §9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
     /// Offer a candidate (mirrors the draft's ADD_ADDRESS).

@@ -26,22 +26,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::capsule::codec::{read_varint, varint_len, write_varint};
 use crate::error::DecodeError;
 
-/// Provisional capsule type: register a compression context.
-pub const CAPSULE_COMPRESSION_ASSIGN: u64 = 0x11;
-/// Provisional capsule type: acknowledge a registered context.
-pub const CAPSULE_COMPRESSION_ACK: u64 = 0x12;
-/// Provisional capsule type: retire a context.
-pub const CAPSULE_COMPRESSION_CLOSE: u64 = 0x13;
-/// Provisional vendor capsule type: the relay's view of the peer's outer
-/// source address — the peer's server-reflexive candidate for hole punching
-/// (design §5.1). Replaced by draft-ietf-quic-address-discovery once quinn
-/// supports OBSERVED_ADDRESS frames (§9).
-pub const CAPSULE_OBSERVED_ADDRESS: u64 = 0x14;
-
-/// Vendor capsule: a *peer-facing* source the on-path relay observed for the
-/// other peer (relay-assisted symmetric-NAT traversal, design §12). Same
-/// address body as OBSERVED_ADDRESS. Provisional codepoint (§9).
-pub const CAPSULE_PEER_REFLEXIVE: u64 = 0x15;
+// The provisional capsule codepoints live in the single registry
+// (`crate::codepoints`), re-exported here so `context::CAPSULE_*` keeps
+// resolving and the v2 standards swap (design §9) is a one-file edit.
+pub use crate::codepoints::{
+    CAPSULE_COMPRESSION_ACK, CAPSULE_COMPRESSION_ASSIGN, CAPSULE_COMPRESSION_CLOSE,
+    CAPSULE_OBSERVED_ADDRESS, CAPSULE_PEER_REFLEXIVE,
+};
 
 /// The first client-allocated (even) context id (design §3.1).
 pub const FIRST_UNCOMPRESSED_CONTEXT: u64 = 2;
