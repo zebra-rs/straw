@@ -30,6 +30,8 @@ pub const CONNECT_UDP_PROTOCOL: &str = "connect-udp";
 
 const UDP_PATH_PREFIX: &str = "/.well-known/masque/udp/";
 const SESSION_QUEUE_DEPTH: usize = 256;
+/// How many allocated ports to try binding before giving up.
+const BIND_ATTEMPTS: usize = 16;
 
 type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
@@ -67,32 +69,41 @@ pub async fn handle_connect_udp_bind_stream(
         return Err(e);
     }
 
-    // 3. Allocate a public tuple and bind a socket to it.
+    // 3. Allocate a public tuple and bind a socket to it. A configured
+    // port can be transiently taken (another process, or another relay on
+    // the same host in tests), so skip a port whose bind fails and try the
+    // next rather than failing the request.
     let allocator = ctx
         .udp_bind
         .allocator()
         .expect("allocator present when enabled")
         .clone();
-    let Some(public_addr) = allocator.allocate() else {
-        respond(&mut stream, StatusCode::SERVICE_UNAVAILABLE).await?;
-        return Err(ProxyError::Config("no free bind address".into()));
-    };
     let contexts = Arc::new(Mutex::new(ContextTable::new()));
-    let limiter = Arc::new(SessionLimiter::new(ctx.udp_bind.egress_limits()));
-    let bind = match BindSocket::bind(
-        public_addr,
-        contexts.clone(),
-        ctx.udp_bind.policy().clone(),
-        limiter,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            allocator.release(public_addr);
-            respond(&mut stream, StatusCode::INTERNAL_SERVER_ERROR).await?;
-            return Err(ProxyError::Io(e));
+    let (public_addr, bind) = 'bind: {
+        for _ in 0..BIND_ATTEMPTS {
+            let Some(addr) = allocator.allocate() else {
+                respond(&mut stream, StatusCode::SERVICE_UNAVAILABLE).await?;
+                return Err(ProxyError::Config("no free bind address".into()));
+            };
+            match BindSocket::bind(
+                addr,
+                contexts.clone(),
+                ctx.udp_bind.policy().clone(),
+                Arc::new(SessionLimiter::new(ctx.udp_bind.egress_limits())),
+            )
+            .await
+            {
+                Ok(b) => break 'bind (addr, b),
+                Err(e) => {
+                    tracing::debug!(%addr, "bind failed, trying another port: {e}");
+                    allocator.release(addr);
+                }
+            }
         }
+        respond(&mut stream, StatusCode::SERVICE_UNAVAILABLE).await?;
+        return Err(ProxyError::Config(
+            "could not bind any allocated port".into(),
+        ));
     };
     let bound_addr = bind.public_addr();
 
