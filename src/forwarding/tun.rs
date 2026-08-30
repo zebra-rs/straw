@@ -7,7 +7,7 @@
 //!
 //! Linux-first (design §8.3); macOS utun support is planned later.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -22,6 +22,11 @@ pub struct TunConfig {
     /// Address + prefix length to configure on the device (the proxy-side
     /// gateway for the client pool), e.g. 10.100.0.1/24.
     pub ipv4: Option<(Ipv4Addr, u8)>,
+    /// IPv6 gateway address + prefix length, e.g. fd00:6d61:7371::1/64.
+    /// Applied with `ip(8)`: the `tun` crate configures IPv4 only, and
+    /// without this the kernel has no route to the v6 pool, so assigned v6
+    /// addresses are unreachable from the network.
+    pub ipv6: Option<(Ipv6Addr, u8)>,
 }
 
 /// Channel endpoints connecting the forwarding engine to the TUN device.
@@ -35,6 +40,15 @@ pub struct TunChannels {
 /// Depth of the device channels; beyond this, datagrams are dropped.
 #[cfg(target_os = "linux")]
 const CHANNEL_DEPTH: usize = 1024;
+
+/// Read buffer size, independent of the configured MTU.
+///
+/// A buffer sized from `cfg.mtu` silently truncates once the device MTU is
+/// raised at runtime (which `strawc` does as QUIC path-MTU discovery ramps),
+/// and a truncated IP packet is indistinguishable from a malformed one
+/// downstream. One 64 KiB buffer per device costs nothing next to that.
+#[cfg(target_os = "linux")]
+const READ_BUFFER: usize = 65_536;
 
 /// Create the TUN device and spawn its read/write pump tasks.
 #[cfg(target_os = "linux")]
@@ -52,6 +66,16 @@ pub fn spawn_tun(cfg: &TunConfig) -> Result<TunChannels, ProxyError> {
             .map_err(|e| ProxyError::Config(format!("failed to create TUN device: {e}")))?,
     );
 
+    // IPv6 has to go on after creation, via ip(8).
+    if let Some((addr, prefix)) = cfg.ipv6 {
+        crate::iface::ip(&crate::iface::addr_args(
+            "add",
+            &cfg.name,
+            std::net::IpAddr::V6(addr),
+            prefix,
+        ))?;
+    }
+
     let (to_net_tx, mut to_net_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);
     let (from_net_tx, from_net_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
 
@@ -68,9 +92,8 @@ pub fn spawn_tun(cfg: &TunConfig) -> Result<TunChannels, ProxyError> {
 
     // Network → engine.
     let reader = device;
-    let mtu = cfg.mtu as usize;
     tokio::spawn(async move {
-        let mut buf = vec![0u8; mtu];
+        let mut buf = vec![0u8; READ_BUFFER];
         loop {
             match reader.recv(&mut buf).await {
                 Ok(n) if n > 0 => {

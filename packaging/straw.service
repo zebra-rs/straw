@@ -1,0 +1,42 @@
+[Unit]
+Description=straw — RFC 9484 CONNECT-IP proxy (IP over MASQUE)
+Documentation=https://www.rfc-editor.org/rfc/rfc9484.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/straw \
+    --listen 0.0.0.0:4433 \
+    --cert /etc/straw/cert.pem --key /etc/straw/key.pem \
+    --tun --nat-interface eth0 \
+    --ipv6-pool fd00:6d61:7371::/64
+Restart=on-failure
+RestartSec=2
+
+# straw needs CAP_NET_ADMIN for the TUN device, and it shells out to ip(8),
+# iptables(8) and sysctl(8). Those inherit only *ambient* capabilities, so
+# AmbientCapabilities is required — CapabilityBoundingSet alone would leave
+# the child processes unprivileged and NAT setup would fail.
+User=straw
+Group=straw
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# ProtectKernelTunables is deliberately absent: with --nat-interface the
+# proxy sets net.ipv4.ip_forward and net.ipv6.conf.all.forwarding.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/straw
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

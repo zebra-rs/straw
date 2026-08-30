@@ -10,6 +10,7 @@ pub mod config;
 pub mod datagram;
 pub mod error;
 pub mod forwarding;
+pub mod iface;
 pub mod metrics;
 pub mod server;
 pub mod session;

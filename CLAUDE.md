@@ -16,9 +16,15 @@ cargo test             # Run all tests
 cargo test <test_name> # Run a single test
 cargo clippy           # Lint
 cargo fmt              # Format code
+
+make -C bdd            # End-to-end BDD suite (needs passwordless sudo)
+make -C bdd tunnel_basic     # One feature, by its tag
+BDD_KEEP=1 make -C bdd tunnel_mtu   # …leaving namespaces and daemons up
 ```
 
-Uses Rust edition 2024 (requires nightly or recent stable toolchain).
+Uses Rust edition 2024 (requires nightly or recent stable toolchain). A plain
+`cargo test` covers the `straw` package; the `bdd` workspace member's cucumber
+test needs root and is run through its Makefile.
 
 ## Architecture
 
@@ -32,12 +38,60 @@ Planned module structure (from design doc):
 - **forwarding/** — IP packet validation, TTL decrement, TUN device I/O, route table (longest-prefix match)
 - **address_pool** — IPv4/IPv6 address allocation per session
 - **uri_template** — URI template parsing for `{target}` and `{ipproto}`
+- **client** — `TunnelClient`/`Tunnel` (per-connection datagram demux, scoped
+  and multi-tunnel connects) plus `PacketSender`, a cloneable send handle
+- **iface** — client-side kernel config: applies ADDRESS_ASSIGN/
+  ROUTE_ADVERTISEMENT via `ip(8)`, reverts on drop
+
+Binaries: `straw` (proxy), `strawc` (client daemon: TUN device + kernel
+routes, the actual VPN client), `test_client` (synthetic-packet harness;
+exits non-zero unless every echo got a genuine echo back, so BDD can assert
+on it).
 
 Key design decisions:
 - quinn + h3 stack (pure Rust, async tokio-native) over quiche
 - DashMap for concurrent session table
 - etherparse for IP packet parsing
 - TUN device for kernel-level packet I/O
+
+## BDD suite (`bdd/`)
+
+Cucumber scenarios in `bdd/tests/features/*.feature` run the real binaries in
+Linux network namespaces (ported from the zebra-rs BDD framework). Each
+feature scopes its namespaces, veths and pid files by its first tag
+(`@tunnel_basic` → `tunnel_basic_client`, …) so features run concurrently;
+`make -C bdd` runs them 4-way. `make -C bdd stage` copies this worktree's
+binaries into `bdd/.stage/bin` and the harness prepends that to PATH, so a run
+never tests a stale build. Steps live in `bdd/tests/cucumber.rs`; an unmatched
+step fails the scenario rather than being skipped.
+
+## Privileges
+
+Neither `straw` nor `strawc` needs root — both need **ambient**
+`CAP_NET_ADMIN` (they shell out to `ip`/`iptables`/`sysctl`, which inherit
+only ambient capabilities). `packaging/*.service` set it. Do not add
+`ProtectKernelTunables=yes`: the proxy writes `net.ipv4.ip_forward` under NAT.
+
+## Tunnel MTU
+
+The per-session MTU is the smaller of `--mtu` and what one QUIC DATAGRAM
+carries, held as a live `AtomicUsize` the session handler refreshes — quinn's
+path MTU starts low and rises, so a value frozen at setup blackholes full-size
+packets. `strawc` widens its TUN device the same way. Oversize packets from
+the network are dropped and counted in `straw_packets_mtu_dropped_total`, not
+answered by ICMP (the only source address available there is the proxy's own
+tunnel address, a martian to the sender); PMTUD toward the network is the
+kernel's job via the device MTU. Hairpin between two clients does earn an ICMP
+Packet Too Big, since both ends are inside the tunnel.
+
+## Configuration and flow scoping
+
+`straw --config file.toml` layers a TOML file (keys per `straw.example.toml`)
+under the CLI; a flag wins only when actually given (clap `ValueSource`).
+A `{target}` prefix is advertised (and enforced) directly, a hostname is
+DNS-resolved before the reply (502 on failure), and `{ipproto}` narrows every
+range with ICMP still allowed (RFC 9484 §4.6). A scoped session's egress
+policy doubles as its ingress filter, so it only hears from within its scope.
 
 ## Key RFCs
 

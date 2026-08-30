@@ -1,0 +1,38 @@
+[Unit]
+Description=strawc — CONNECT-IP client daemon (straw VPN client)
+Documentation=https://www.rfc-editor.org/rfc/rfc9484.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/strawc \
+    --server-addr proxy.example.net:4433 \
+    --server-name proxy.example.net \
+    --ca-cert /etc/straw/proxy-ca.pem
+Restart=on-failure
+RestartSec=2
+
+# CAP_NET_ADMIN for the TUN device, ambient because strawc runs ip(8) to
+# apply the proxy's ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT to the kernel and
+# to widen the device as the QUIC path MTU rises.
+User=strawc
+Group=strawc
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/straw
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

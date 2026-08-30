@@ -1,1 +1,9 @@
 /target
+
+# bdd (make -C bdd …)
+/bdd/logs/
+/bdd/allure-results/
+/bdd/allure-report/
+/bdd/.allure/
+/bdd/.stage/
+/bdd/.stage.tmp/

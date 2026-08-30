@@ -1,3 +1,6 @@
+[workspace]
+members = ["bdd"]
+
 [package]
 name = "straw"
 version = "0.1.0"
