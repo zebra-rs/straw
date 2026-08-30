@@ -50,6 +50,30 @@ pub struct TokenV2 {
 }
 
 impl TokenV2 {
+    /// Mint a token advertising `paddr` and `identity_pin`, valid for `ttl`
+    /// seconds from `now` (design §3.2). `relay`, `rpin` and `auth` let the
+    /// holder reach and pin the relay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        relay: String,
+        rpin: SpkiPin,
+        auth: String,
+        identity_pin: SpkiPin,
+        paddr: Vec<String>,
+        now_unix_secs: u64,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            v: TOKEN_VERSION,
+            relay,
+            rpin: rpin.to_vec(),
+            auth,
+            ppin: identity_pin.to_vec(),
+            paddr,
+            exp: now_unix_secs + ttl_secs,
+        }
+    }
+
     /// Encode to the `sc2_<base64url(CBOR)>` textual form.
     pub fn encode(&self) -> String {
         let mut cbor = Vec::new();

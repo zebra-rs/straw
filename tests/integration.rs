@@ -20,7 +20,9 @@ use straw::forwarding::router::RouteTable;
 use straw::metrics::Metrics;
 use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
+use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::relay_socket::inner_endpoint;
+use straw::p2p::token::TokenV2;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
 use straw::session::auth::Authenticator;
@@ -1240,4 +1242,57 @@ async fn inner_quic_rejects_a_wrong_server_pin() {
     )
     .await;
     assert!(result.is_err(), "handshake must fail on a pin mismatch");
+}
+
+fn relay_access(server: &TestServer) -> RelayAccess {
+    RelayAccess {
+        addr: server.addr,
+        server_name: "localhost".into(),
+        tls: TlsMode::Ca(server.cert.clone()),
+        auth: ClientAuth::None,
+    }
+}
+
+#[tokio::test]
+async fn strawcat_peers_pipe_over_a_token() {
+    // The issuer listens and mints a token; the holder decodes it and dials
+    // back through the relay; a bidi stream carries data both ways.
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
+        .await
+        .expect("issuer listens");
+
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "relay-bearer".into(),
+        issuer.pin(),
+        vec![listener.paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+    let wire = token.encode();
+    let decoded = TokenV2::decode(&wire).expect("token round-trips");
+
+    // Listener accept and holder connect must run concurrently to handshake.
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_conn = peer::connect(relay_access(&relay), &holder, &decoded)
+        .await
+        .expect("holder connects");
+    let issuer_conn = accept.await.unwrap().expect("issuer accepts");
+
+    // Holder opens a strawcat/1 stream; issuer echoes.
+    let (mut send, mut recv) = holder_conn.conn.open_bi().await.unwrap();
+    send.write_all(b"strawcat-hello").await.unwrap();
+    send.finish().unwrap();
+    let (mut esend, mut erecv) = issuer_conn.accept_bi().await.unwrap();
+    let got = erecv.read_to_end(64).await.unwrap();
+    assert_eq!(&got[..], b"strawcat-hello");
+    esend.write_all(&got).await.unwrap();
+    esend.finish().unwrap();
+    let echoed = recv.read_to_end(64).await.unwrap();
+    assert_eq!(&echoed[..], b"strawcat-hello");
 }

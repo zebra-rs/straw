@@ -156,7 +156,7 @@ async fn run() -> Result<(), ProxyError> {
         );
         UdpBindState::enabled(
             allocator,
-            DestinationPolicy::default(),
+            DestinationPolicy::new(config.udp_bind_allow_dest.clone(), Vec::new()),
             RateLimits {
                 packets_per_sec: config.udp_bind_max_pps,
                 bytes_per_sec: config.udp_bind_max_bps,

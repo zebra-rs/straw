@@ -54,3 +54,6 @@ port_lo = 32768
 port_hi = 60999
 max_pps = 0                   # per-session egress packet cap; 0 = unlimited
 max_bps = 0                   # per-session egress byte cap; 0 = unlimited
+# Destinations permitted despite the built-in local-range denial (e.g. to
+# relay within a private network). Empty = public destinations only.
+# allow_dest = ["10.0.0.0/8"]

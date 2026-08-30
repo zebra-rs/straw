@@ -36,22 +36,17 @@ const MAX_UDP_PAYLOAD: usize = 65_535;
 /// Which destinations a bind session may send to (design §10.1). Denying
 /// private and local ranges is the amplification/SSRF guard; an operator
 /// can widen it, never silently narrow past these.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DestinationPolicy {
     /// Extra CIDRs to deny beyond the always-denied local ranges.
     denied: Arc<Vec<ipnet::IpNet>>,
+    /// Prefixes explicitly permitted by the operator, overriding the
+    /// built-in local-range denial (design §10.1, "unless explicitly
+    /// configured"). Needed to relay within a private network or on one host.
+    allowed: Arc<Vec<ipnet::IpNet>>,
     /// Test-only escape hatch to reach a loopback echo server; never set in
-    /// production, where local ranges are always denied (design §10.1).
+    /// production.
     allow_all: bool,
-}
-
-impl Default for DestinationPolicy {
-    fn default() -> Self {
-        Self {
-            denied: Arc::new(Vec::new()),
-            allow_all: false,
-        }
-    }
 }
 
 impl DestinationPolicy {
@@ -59,20 +54,38 @@ impl DestinationPolicy {
     pub fn with_denied(denied: Vec<ipnet::IpNet>) -> Self {
         Self {
             denied: Arc::new(denied),
+            ..Default::default()
+        }
+    }
+
+    /// Operator config: permit `allowed` prefixes (overriding local-range
+    /// denial) and additionally deny `denied`.
+    pub fn new(allowed: Vec<ipnet::IpNet>, denied: Vec<ipnet::IpNet>) -> Self {
+        Self {
+            denied: Arc::new(denied),
+            allowed: Arc::new(allowed),
             allow_all: false,
         }
     }
 
     /// Whether the relay may forward to `addr`.
     pub fn allows(&self, addr: &SocketAddr) -> bool {
-        if self.allow_all {
-            return addr.port() != 0;
-        }
-        let ip = addr.ip();
-        if addr.port() == 0 || is_local(&ip) {
+        if addr.port() == 0 {
             return false;
         }
-        !self.denied.iter().any(|net| net.contains(&ip))
+        if self.allow_all {
+            return true;
+        }
+        let ip = addr.ip();
+        // An explicit allow beats the local-range denial, but a configured
+        // deny still wins over an allow (deny is the safer default).
+        if self.denied.iter().any(|net| net.contains(&ip)) {
+            return false;
+        }
+        if self.allowed.iter().any(|net| net.contains(&ip)) {
+            return true;
+        }
+        !is_local(&ip)
     }
 
     /// Allow any (nonzero-port) destination, loopback included — only to
@@ -80,8 +93,8 @@ impl DestinationPolicy {
     #[doc(hidden)]
     pub fn allow_all_for_test() -> Self {
         Self {
-            denied: Arc::new(Vec::new()),
             allow_all: true,
+            ..Default::default()
         }
     }
 }
@@ -262,6 +275,25 @@ mod tests {
                 "{denied} should be denied"
             );
         }
+    }
+
+    #[test]
+    fn policy_allowlist_overrides_local_denial() {
+        // Permit loopback explicitly (single-host relay), still deny the rest.
+        let p = DestinationPolicy::new(vec!["127.0.0.0/8".parse().unwrap()], vec![]);
+        assert!(p.allows(&"127.0.0.1:9000".parse().unwrap()));
+        assert!(
+            !p.allows(&"10.0.0.1:9000".parse().unwrap()),
+            "other locals stay denied"
+        );
+        assert!(p.allows(&"198.51.100.1:9000".parse().unwrap()));
+        // A deny beats an allow.
+        let d = DestinationPolicy::new(
+            vec!["10.0.0.0/8".parse().unwrap()],
+            vec!["10.6.6.0/24".parse().unwrap()],
+        );
+        assert!(d.allows(&"10.1.2.3:80".parse().unwrap()));
+        assert!(!d.allows(&"10.6.6.6:80".parse().unwrap()));
     }
 
     #[test]

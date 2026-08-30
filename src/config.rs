@@ -136,6 +136,12 @@ pub struct ProxyConfig {
     /// Per-bind-session egress byte rate cap (bytes/sec); 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     pub udp_bind_max_bps: u64,
+
+    /// Destination prefixes bind mode may forward to despite the built-in
+    /// local-range denial (design §10.1) — e.g. to relay within a private
+    /// network. Comma-separated CIDRs.
+    #[arg(long, value_delimiter = ',')]
+    pub udp_bind_allow_dest: Vec<IpNet>,
 }
 
 impl Default for ProxyConfig {
@@ -170,6 +176,7 @@ impl Default for ProxyConfig {
             udp_bind_port_hi: 60999,
             udp_bind_max_pps: 0,
             udp_bind_max_bps: 0,
+            udp_bind_allow_dest: Vec::new(),
         }
     }
 }
@@ -330,6 +337,13 @@ fn overlay_cli(config: &mut ProxyConfig, cli: ProxyConfig, matches: &clap::ArgMa
         metrics_listen,
         nat_interface,
         shutdown_grace_sec,
+        udp_bind,
+        udp_bind_public_ips,
+        udp_bind_port_lo,
+        udp_bind_port_hi,
+        udp_bind_max_pps,
+        udp_bind_max_bps,
+        udp_bind_allow_dest,
     );
 }
 
@@ -420,6 +434,7 @@ struct UdpBindSection {
     port_hi: Option<u16>,
     max_pps: Option<u64>,
     max_bps: Option<u64>,
+    allow_dest: Option<Vec<IpNet>>,
 }
 
 impl FileConfig {
@@ -519,6 +534,9 @@ impl FileConfig {
             }
             if let Some(v) = u.max_bps {
                 config.udp_bind_max_bps = v;
+            }
+            if let Some(v) = u.allow_dest {
+                config.udp_bind_allow_dest = v;
             }
         }
         if let Some(metrics) = self.metrics
@@ -645,6 +663,31 @@ mod tests {
         let resolved = ProxyConfig::resolve_from(["straw", "--listen", "127.0.0.1:9999"]).unwrap();
         assert_eq!(resolved.listen, "127.0.0.1:9999".parse().unwrap());
         assert_eq!(resolved.mtu, ProxyConfig::default().mtu);
+    }
+
+    #[test]
+    fn cli_flags_reach_the_resolved_config() {
+        // Regression: every CLI flag must be listed in overlay!(), or it
+        // silently stays at its default (this bit udp_bind).
+        let cfg = ProxyConfig::resolve_from([
+            "straw",
+            "--udp-bind",
+            "--udp-bind-public-ips",
+            "127.0.0.1,192.0.2.5",
+            "--udp-bind-port-lo",
+            "21000",
+            "--udp-bind-allow-dest",
+            "127.0.0.0/8",
+            "--auth-mode",
+            "bearer",
+            "--auth-token",
+            "x",
+        ])
+        .unwrap();
+        assert!(cfg.udp_bind);
+        assert_eq!(cfg.udp_bind_public_ips.len(), 2);
+        assert_eq!(cfg.udp_bind_port_lo, 21000);
+        assert_eq!(cfg.udp_bind_allow_dest.len(), 1);
     }
 
     #[test]
