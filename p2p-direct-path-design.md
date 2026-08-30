@@ -133,6 +133,15 @@ Token v2 {
 
 ## 4. Phase B — End-to-End QUIC Through the Relay
 
+> **Status:** transport landed — `src/p2p/relay_socket.rs` runs an inner QUIC
+> endpoint over a bind session (`RelaySocket: quinn::AsyncUdpSocket` via
+> `Endpoint::new_with_abstract_socket`); an integration test handshakes a
+> peer↔peer connection and round-trips a stream through the relay. Inner TLS
+> is self-signed/insecure for now; RFC 7250 SPKI-pinned mTLS (the identity
+> layer, §3.2/§8) is the next step. On a constrained real path the outer
+> `initial_mtu` may need raising so the first inner Initial (≥1200 B) fits the
+> outer datagram (the §12 MTU-squeeze risk); loopback is unaffected.
+
 The dialing peer (token holder) sends the inner QUIC Initial as a proxied datagram on the uncompressed context, addressed to the issuer's `paddr`. The issuer receives it with the dialer's *relay-allocated* source tuple attached, and replies the same way. From the inner QUIC stack's point of view, the relay path is just a UDP path with ~40–60 bytes less MTU.
 
 - **TLS:** mTLS with RFC 7250 raw public keys (preferred; smallest) or self-signed certs; each side verifies the other's SPKI SHA-256 against the pin. No CA, no hostname.
