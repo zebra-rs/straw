@@ -25,3 +25,9 @@ pub mod uri_template;
 pub fn init_crypto() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
+
+/// Install the crypto provider for tests that build TLS configs in-process.
+#[doc(hidden)]
+pub fn _init_crypto_for_test() {
+    init_crypto();
+}

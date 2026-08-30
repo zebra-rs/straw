@@ -18,6 +18,7 @@ use straw::forwarding::limiter::RateLimits;
 use straw::forwarding::packet::{build_ipv4_icmp_echo, build_ipv6_icmpv6_echo, parse_packet};
 use straw::forwarding::router::RouteTable;
 use straw::metrics::Metrics;
+use straw::p2p::holepunch;
 use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
 use straw::p2p::peer::{self, RelayAccess};
@@ -1317,4 +1318,74 @@ async fn bind_session_reports_the_reflexive_candidate() {
     // sees exactly that source.
     assert!(observed.ip().is_loopback());
     assert_ne!(observed.port(), 0);
+}
+
+#[tokio::test]
+async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
+    // Full P2 flow: two peers meet through the relay (Phase B), exchange
+    // candidates, and hole-punch to a direct connection that bypasses the
+    // relay. On loopback there is no NAT, so the "host" candidate (the punch
+    // socket) is directly reachable — this proves exchange + simultaneous
+    // open + pin end to end.
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    // Establish the inner relay connection (Phase B), capturing each side's
+    // reflexive address and the relay paddr for candidate gathering.
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
+        .await
+        .unwrap();
+    let issuer_paddr = listener.paddr;
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "auth".into(),
+        issuer.pin(),
+        vec![issuer_paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
+        .await
+        .unwrap();
+    let issuer_conn = accept.await.unwrap().unwrap();
+
+    // Punch. The inner client (holder) is the initiator.
+    let issuer_id = issuer;
+    let holder_id = holder;
+    let (issuer_direct, holder_direct) = tokio::join!(
+        holepunch::coordinate(
+            &issuer_conn,
+            false,
+            &issuer_id,
+            Some(holder_id.pin()),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            issuer_paddr,
+        ),
+        holepunch::coordinate(
+            &holder_side.conn,
+            true,
+            &holder_id,
+            Some(issuer_id.pin()),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            issuer_paddr,
+        ),
+    );
+    let issuer_direct = issuer_direct.expect("issuer gets a direct path");
+    let holder_direct = holder_direct.expect("holder gets a direct path");
+
+    // The direct connection is NOT the relay path: its peer address is the
+    // other peer's punch socket (loopback), not a relay-allocated port.
+    assert!(issuer_direct.conn.remote_address().ip().is_loopback());
+
+    // And it carries data.
+    let (mut s, _r) = holder_direct.conn.open_bi().await.unwrap();
+    s.write_all(b"direct!").await.unwrap();
+    s.finish().unwrap();
+    let (_s2, mut r2) = issuer_direct.conn.accept_bi().await.unwrap();
+    assert_eq!(&r2.read_to_end(16).await.unwrap()[..], b"direct!");
 }
