@@ -14,5 +14,6 @@
 //! layers (design §3–6) build on the two modules here.
 
 pub mod identity;
+pub mod inner_tls;
 pub mod relay_socket;
 pub mod token;

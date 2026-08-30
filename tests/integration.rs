@@ -18,6 +18,8 @@ use straw::forwarding::limiter::RateLimits;
 use straw::forwarding::packet::{build_ipv4_icmp_echo, build_ipv6_icmpv6_echo, parse_packet};
 use straw::forwarding::router::RouteTable;
 use straw::metrics::Metrics;
+use straw::p2p::identity::Identity;
+use straw::p2p::inner_tls;
 use straw::p2p::relay_socket::inner_endpoint;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
@@ -1135,4 +1137,107 @@ async fn inner_quic_connects_peer_to_peer_through_the_relay() {
 
     conn_a.close(0u32.into(), b"done");
     let _ = accept.await;
+}
+
+/// Two bind sessions on one relay, an inner endpoint each, dialing B at its
+/// paddr with the given inner TLS. Returns (A's connection, B's accepted
+/// connection) or the dial error.
+async fn dial_inner(
+    server: &TestServer,
+    client_cfg: quinn::ClientConfig,
+    server_cfg: quinn::ServerConfig,
+) -> Result<(quinn::Connection, quinn::Connection), quinn::ConnectionError> {
+    let a = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .unwrap();
+    let b = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .unwrap();
+    let b_pub = b.public_addr;
+    let ep_b = inner_endpoint(b.into_relay_socket(), Some(server_cfg)).unwrap();
+    let ep_a = inner_endpoint(a.into_relay_socket(), None).unwrap();
+    let accept = tokio::spawn(async move {
+        let incoming = ep_b.accept().await.expect("incoming");
+        incoming.await
+    });
+    let conn_a = ep_a.connect_with(client_cfg, b_pub, "peer").unwrap().await;
+    // Keep endpoint A alive until we have the result.
+    let _keep = ep_a;
+    match conn_a {
+        Ok(a) => Ok((a, accept.await.unwrap().expect("B accepts"))),
+        Err(e) => Err(e),
+    }
+}
+
+fn quic_client(c: rustls::ClientConfig) -> quinn::ClientConfig {
+    quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(c).unwrap()))
+}
+fn quic_server(c: rustls::ServerConfig) -> quinn::ServerConfig {
+    quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(c).unwrap()))
+}
+
+#[tokio::test]
+async fn inner_quic_mutual_raw_public_key_pinning() {
+    // A pins B by B's identity (as a token's ppin would); B accepts A on
+    // first use. Both directions authenticate by raw public key (RFC 7250).
+    let server = TestServer::start_with(enable_bind).await;
+    let id_a = Identity::generate().unwrap();
+    let id_b = Identity::generate().unwrap();
+
+    let (client_rustls, a_verifier) = inner_tls::client_config(&id_a, Some(id_b.pin())).unwrap();
+    let (server_rustls, b_verifier) = inner_tls::server_config(&id_b, None).unwrap();
+
+    let (conn_a, conn_b) = dial_inner(
+        &server,
+        quic_client(client_rustls),
+        quic_server(server_rustls),
+    )
+    .await
+    .expect("pinned inner handshake succeeds");
+
+    // The pins each side observed match the real identities.
+    assert_eq!(a_verifier.learned_pin(), Some(id_b.pin()), "A saw B's key");
+    assert_eq!(
+        b_verifier.learned_pin(),
+        Some(id_a.pin()),
+        "B learned A's key (TOFU)"
+    );
+    assert_eq!(conn_a.peer_identity().is_some(), true);
+
+    // The pipe carries a stream.
+    let (mut send, _recv) = conn_a.open_bi().await.unwrap();
+    send.write_all(b"authenticated").await.unwrap();
+    send.finish().unwrap();
+    let (_s, mut r) = conn_b.accept_bi().await.unwrap();
+    assert_eq!(&r.read_to_end(32).await.unwrap()[..], b"authenticated");
+}
+
+#[tokio::test]
+async fn inner_quic_rejects_a_wrong_server_pin() {
+    // A pins the WRONG server key; the handshake must fail closed.
+    let server = TestServer::start_with(enable_bind).await;
+    let id_a = Identity::generate().unwrap();
+    let id_b = Identity::generate().unwrap();
+    let impostor = Identity::generate().unwrap();
+
+    let (client_rustls, _) = inner_tls::client_config(&id_a, Some(impostor.pin())).unwrap();
+    let (server_rustls, _) = inner_tls::server_config(&id_b, None).unwrap();
+
+    let result = dial_inner(
+        &server,
+        quic_client(client_rustls),
+        quic_server(server_rustls),
+    )
+    .await;
+    assert!(result.is_err(), "handshake must fail on a pin mismatch");
 }

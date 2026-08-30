@@ -137,8 +137,11 @@ Token v2 {
 > endpoint over a bind session (`RelaySocket: quinn::AsyncUdpSocket` via
 > `Endpoint::new_with_abstract_socket`); an integration test handshakes a
 > peer↔peer connection and round-trips a stream through the relay. Inner TLS
-> is self-signed/insecure for now; RFC 7250 SPKI-pinned mTLS (the identity
-> layer, §3.2/§8) is the next step. On a constrained real path the outer
+> is RFC 7250 raw-public-key mTLS pinned by SPKI (`src/p2p/inner_tls.rs`):
+> each peer presents its identity's public key and verifies the other's
+> against an expected pin (`ppin`) or trust-on-first-use, a wrong pin failing
+> the handshake closed — all covered by integration tests. On a constrained
+> real path the outer
 > `initial_mtu` may need raising so the first inner Initial (≥1200 B) fits the
 > outer datagram (the §12 MTU-squeeze risk); loopback is unaffected.
 

@@ -73,8 +73,11 @@ pub fn pin_of_spki(spki_der: &[u8]) -> SpkiPin {
 /// expected one from the token (design §2.1). Length is fixed, so this only
 /// guards the byte comparison.
 pub fn pins_match(a: &SpkiPin, b: &SpkiPin) -> bool {
-    use ring::constant_time::verify_slices_are_equal;
-    verify_slices_are_equal(a, b).is_ok()
+    // Constant-time compare over the fixed-length pins.
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
