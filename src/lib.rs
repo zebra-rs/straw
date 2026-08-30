@@ -12,6 +12,7 @@ pub mod error;
 pub mod forwarding;
 pub mod iface;
 pub mod metrics;
+pub mod p2p;
 pub mod server;
 pub mod session;
 pub mod tls;
