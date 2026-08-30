@@ -46,7 +46,7 @@ Planned module structure (from design doc):
 Binaries: `straw` (proxy), `strawc` (client daemon: TUN device + kernel
 routes, the actual VPN client), `test_client` (synthetic-packet harness;
 exits non-zero unless every echo got a genuine echo back, so BDD can assert
-on it).
+on it), `strawcat` (P2P peer: `genkey`/`listen`/`connect`).
 
 Key design decisions:
 - quinn + h3 stack (pure Rust, async tokio-native) over quiche
@@ -105,6 +105,23 @@ carries a 10-byte virtio-net header, GSO aggregates are re-segmented in
 `forwarding/vnet.rs`. `vendor/quinn-proto` is 0.11.17 with a one-line
 fix for an upstream datagram-accounting bug that panicked the tunnel under
 sustained datagram overload — drop it when a fixed 0.11.x releases.
+
+## P2P direct path (`src/p2p/`, `src/udp_bind/`)
+
+`strawcat` peers form a mutually SPKI-pinned inner QUIC connection through a
+straw relay running CONNECT-UDP **bind mode** (`--udp-bind`, off by default,
+auth mandatory), which forwards only ciphertext (design goal G1). Layers:
+`udp_bind/` is the relay's bind side (per-session public (IP,port) allocation,
+compression-context codec, encap/decap socket loop, connect-udp handler);
+`p2p/identity` + `p2p/token` are the trust model (Ed25519 SPKI pin, `sc2_`
+CBOR token); `p2p/relay_socket` runs an inner `quinn::AsyncUdpSocket` over a
+bind session; `p2p/inner_tls` is RFC 7250 raw-public-key mTLS pinned by SPKI;
+`p2p/peer` orchestrates listen/connect. The egress SSRF guard always denies
+loopback/RFC1918/etc.; `--udp-bind-allow-dest` re-permits ranges for
+private/single-host relays (design §10.1). This is P1 (relay path); hole
+punching (P2, §5–6) and the standards-codepoint swap (§9) are future work.
+Everything provisional (bind capsule types 0x11–0x13, token format) is
+isolated for that swap. See `p2p-direct-path-design.md`.
 
 ## Key RFCs
 

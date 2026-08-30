@@ -15,5 +15,6 @@
 
 pub mod identity;
 pub mod inner_tls;
+pub mod peer;
 pub mod relay_socket;
 pub mod token;
