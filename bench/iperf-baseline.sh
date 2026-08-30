@@ -84,6 +84,13 @@ ip netns exec $NS_C ip link show strawc0 >/dev/null 2>&1 || { cat "$OUT/strawc.l
 sleep 3
 CLIENT_TUN_MTU=$(ip netns exec $NS_C cat /sys/class/net/strawc0/mtu)
 
+# KEEP=1: leave the topology and daemons up for manual poking; no runs.
+if [ "${KEEP:-}" = 1 ]; then
+    trap - EXIT
+    echo "topology kept (client=$NS_C proxy=$NS_P origin=$NS_O); clean with: sudo ip netns del {$NS_C,$NS_P,$NS_O}"
+    exit 0
+fi
+
 # Run one iperf3 case: label server_ns server_ip client_ns extra_flags
 run() {
     local label=$1 sns=$2 sip=$3 cns=$4; shift 4

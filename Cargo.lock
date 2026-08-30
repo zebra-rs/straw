@@ -1839,6 +1839,7 @@ dependencies = [
  "h3-quinn",
  "http",
  "ipnet",
+ "libc",
  "quinn",
  "rcgen",
  "ring",

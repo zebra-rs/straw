@@ -76,9 +76,36 @@ The gain lands exactly where the hops were removed (downlink); the uplink
 path kept its single TUN-reader→sender hop and is bound by QUIC crypto and
 per-datagram sends, as the baseline predicted.
 
-## Remaining optimization targets, in measured order
+## After TUN offload (IFF_VNET_HDR + TSO) and inline ingress
 
-1. TUN offload (IFF_VNET_HDR + TSO/GSO): a single read/write moves a
-   64 KB aggregate instead of one MTU packet — the standard next step
-   (wireguard-go, tailscale) and the only way past per-packet TUN syscalls.
-2. Then re-measure before anything fancier (io_uring, DSCP copy).
+The device now negotiates `TUNSETOFFLOAD(CSUM|TSO4|TSO6)` with a 10-byte
+virtio-net header on every read/write. GSO aggregates are re-segmented in
+userspace (`forwarding/vnet.rs`: per-segment IP/TCP headers and checksums,
+verified against an independent checksum implementation), and partial
+checksums (`NEEDS_CSUM`) are completed before packets enter the tunnel.
+Separately, the last per-packet channel hops were inlined: TUN reads now
+call straight into `send_datagram` (strawc) / the forwarding engine
+(straw) via a sink closure.
+
+Measured effect on the device, uplink iperf3: **63,614 bytes per TUN
+packet** — the kernel hands ~64 KB TCP aggregates, ~8.3k reads/s instead
+of ~370k — confirming the offload engages fully.
+
+Measured effect on throughput: **none**. Uplink 4.13–4.23 Gbit/s, downlink
+5.52–5.61 Gbit/s — within noise of the pre-TSO numbers. The earlier
+hypothesis that per-packet TUN syscalls dominate is therefore wrong: with
+those syscalls (and the remaining queue hops) eliminated, throughput did
+not move, so the bottleneck is the QUIC connection itself — per-packet
+AEAD and protocol processing at ~370k tunnel packets/s, the known
+single-connection QUIC floor. Both changes stay: they cut kernel-side
+work per byte, remove two tasks from the pipeline, and are fully covered
+by tests, but further single-tunnel throughput needs parallel QUIC
+connections or hardware-offloaded crypto, not more datapath surgery.
+
+## Remaining optimization ideas
+
+1. Parallelism across QUIC connections (the per-connection floor is the
+   binding constraint; multiple tunnels already work via `open_tunnel`).
+2. GRO on the write side (coalesce tunnel→kernel TCP segments into
+   aggregates) — reduces kernel-side receive cost, not tunnel throughput.
+3. io_uring, DSCP copy: only after a workload shows they matter.

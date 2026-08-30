@@ -14,6 +14,7 @@ pub mod nat;
 pub mod packet;
 pub mod router;
 pub mod tun;
+pub mod vnet;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -383,17 +384,6 @@ impl ForwardingEngine {
         Metrics::incr(&self.metrics.packets_to_client_total);
         Metrics::add(&self.metrics.bytes_to_client_total, len);
         Ok(())
-    }
-
-    /// Drive TUN → sessions: read packets from the TUN ingress channel and
-    /// dispatch until the channel closes.
-    pub async fn run_network_ingress(self: Arc<Self>, mut rx: mpsc::Receiver<Bytes>) {
-        while let Some(packet) = rx.recv().await {
-            match self.dispatch_from_network(packet) {
-                Ok(session) => tracing::trace!(%session, "network packet dispatched"),
-                Err(e) => tracing::trace!("network packet dropped: {e}"),
-            }
-        }
     }
 }
 

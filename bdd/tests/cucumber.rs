@@ -662,6 +662,11 @@ async fn ping_should_fail(world: &mut World, namespace: String, target: String) 
 }
 
 /// `ping -M do` with a payload sized so the IP packet is exactly `size`.
+///
+/// Polled: a full-MTU packet only fits once the session MTU has ramped to
+/// the configured value (quinn's path-MTU discovery raises it in steps,
+/// slower under concurrent load), so early attempts can be dropped at the
+/// tunnel with the drop counted — not a failure, just not converged yet.
 #[then(expr = "a {int} byte unfragmentable ping from {string} to {string} should succeed")]
 async fn sized_ping_should_succeed(
     world: &mut World,
@@ -673,26 +678,33 @@ async fn sized_ping_should_succeed(
     let header = if target.contains(':') { 48 } else { 28 };
     let payload = (size - header).to_string();
     let family = if target.contains(':') { "-6" } else { "-4" };
-    let out = netns::exec_in_netns(
-        &scoped,
-        "ping",
-        &[
-            family, "-c", "2", "-W", "3", "-M", "do", "-s", &payload, &target,
-        ],
-    )
-    .await;
-    assert!(
-        out.is_ok(),
-        "{} byte ping from {} to {} failed: {}",
-        size,
-        scoped,
-        target,
-        out.err().map(|e| e.to_string()).unwrap_or_default()
-    );
-    println!(
-        "✓ {} byte ping from {} to {} succeeded",
-        size, scoped, target
-    );
+    const ATTEMPTS: u32 = 15;
+    let mut last = String::new();
+    for i in 0..ATTEMPTS {
+        match netns::exec_in_netns(
+            &scoped,
+            "ping",
+            &[
+                family, "-c", "1", "-W", "2", "-M", "do", "-s", &payload, &target,
+            ],
+        )
+        .await
+        {
+            Ok(_) => {
+                println!(
+                    "✓ {} byte ping from {} to {} succeeded (attempt {})",
+                    size,
+                    scoped,
+                    target,
+                    i + 1
+                );
+                return;
+            }
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("{size} byte ping from {scoped} to {target} never succeeded: {last}");
 }
 
 #[then(
