@@ -28,7 +28,8 @@ use straw::error::ProxyError;
 use straw::p2p::identity::Identity;
 
 use straw::p2p::peer::{self, RelayAccess};
-use straw::p2p::session::{PathState, Session};
+use straw::p2p::session::{PathState, PunchConfig, Session};
+use straw::p2p::strategy::PunchStrategy;
 use straw::p2p::token::TokenV2;
 
 #[derive(Debug, Parser)]
@@ -84,6 +85,10 @@ struct RelayArgs {
     /// Seconds to wait for a direct path before piping over the relay.
     #[arg(long, default_value_t = 5)]
     punch_wait: u64,
+
+    /// NAT-traversal strategy: basic | predict | birthday | relay-assisted.
+    #[arg(long, default_value = "basic")]
+    punch_strategy: PunchStrategy,
 }
 
 #[tokio::main]
@@ -153,6 +158,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
         punch_endpoint,
         reflexive,
         relay_paddr,
+        punch_config(&args)?,
     );
     let best = best_path(&session, args.punch_wait).await;
     // The connecting peer opens the stream; accept it on the chosen path.
@@ -179,6 +185,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         peer_conn.punch_endpoint,
         peer_conn.reflexive,
         peer_conn.relay_paddr,
+        punch_config(&args)?,
     );
     let best = best_path(&session, args.punch_wait).await;
     let (send, recv) = best
@@ -225,6 +232,23 @@ async fn pipe_stdio(
     });
     let _ = tokio::join!(up, down);
     Ok(())
+}
+
+/// Build the strategy config: predict/birthday need relay access to open
+/// auxiliary bind sessions; relay-assisted wires its signal list in `connect`/
+/// `listen` (see [`peer_reflexive_pump`]). Basic needs neither.
+fn punch_config(args: &RelayArgs) -> Result<PunchConfig, ProxyError> {
+    let relay_access = match args.punch_strategy {
+        PunchStrategy::Predict | PunchStrategy::Birthday => {
+            Some(Arc::new(relay_access(args)?))
+        }
+        _ => None,
+    };
+    Ok(PunchConfig {
+        strategy: args.punch_strategy,
+        relay_access,
+        peer_reflexive: None,
+    })
 }
 
 fn relay_access(args: &RelayArgs) -> Result<RelayAccess, ProxyError> {

@@ -23,7 +23,8 @@ use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::relay_socket::inner_endpoint;
-use straw::p2p::session::{PathState, Session};
+use straw::p2p::session::{PathState, PunchConfig, Session};
+use straw::p2p::strategy::PunchStrategy;
 use straw::p2p::token::TokenV2;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
@@ -1419,24 +1420,30 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
     let issuer_id = issuer;
     let holder_id = holder;
     let (issuer_direct, holder_direct) = tokio::join!(
-        holepunch::coordinate(
-            &issuer_conn,
-            false,
-            &issuer_id,
-            Some(holder_id.pin()),
-            issuer_punch,
-            issuer_reflexive,
-            issuer_paddr,
-        ),
-        holepunch::coordinate(
-            &holder_side.conn,
-            true,
-            &holder_id,
-            Some(issuer_id.pin()),
-            holder_side.punch_endpoint.clone(),
-            holder_side.reflexive,
-            issuer_paddr,
-        ),
+        holepunch::coordinate(holepunch::PunchInputs {
+            inner: &issuer_conn,
+            initiator: false,
+            identity: &issuer_id,
+            peer_pin: Some(holder_id.pin()),
+            punch_endpoint: issuer_punch,
+            reflexive: issuer_reflexive,
+            relay: issuer_paddr,
+            strategy: PunchStrategy::Basic,
+            relay_access: None,
+            peer_reflexive: None,
+        }),
+        holepunch::coordinate(holepunch::PunchInputs {
+            inner: &holder_side.conn,
+            initiator: true,
+            identity: &holder_id,
+            peer_pin: Some(issuer_id.pin()),
+            punch_endpoint: holder_side.punch_endpoint.clone(),
+            reflexive: holder_side.reflexive,
+            relay: issuer_paddr,
+            strategy: PunchStrategy::Basic,
+            relay_access: None,
+            peer_reflexive: None,
+        }),
     );
     let issuer_direct = issuer_direct.expect("issuer gets a direct path");
     let holder_direct = holder_direct.expect("holder gets a direct path");
@@ -1493,6 +1500,7 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         issuer_punch,
         issuer_reflexive,
         issuer_paddr,
+        PunchConfig::default(),
     );
     let holder_sess = Session::start(
         holder_side.conn,
@@ -1502,6 +1510,7 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         holder_side.punch_endpoint.clone(),
         holder_side.reflexive,
         issuer_paddr,
+        PunchConfig::default(),
     );
 
     // Both reach DIRECT.

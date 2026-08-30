@@ -45,6 +45,44 @@ pub enum TlsMode {
     },
 }
 
+/// Manual `Clone`: `PrivateKeyDer` is not `Clone`, so rebuild it from its DER
+/// bytes. Lets a shared `RelayAccess` reconnect auxiliary bind sessions
+/// (predict/birthday NAT sampling).
+impl Clone for TlsMode {
+    fn clone(&self) -> Self {
+        use rustls::pki_types::{
+            PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+        };
+        match self {
+            TlsMode::Insecure => TlsMode::Insecure,
+            TlsMode::Ca(c) => TlsMode::Ca(c.clone()),
+            TlsMode::Mtls {
+                ca,
+                cert_chain,
+                key,
+            } => {
+                let key: PrivateKeyDer<'static> = match key {
+                    PrivateKeyDer::Pkcs1(k) => {
+                        PrivatePkcs1KeyDer::from(k.secret_pkcs1_der().to_vec()).into()
+                    }
+                    PrivateKeyDer::Pkcs8(k) => {
+                        PrivatePkcs8KeyDer::from(k.secret_pkcs8_der().to_vec()).into()
+                    }
+                    PrivateKeyDer::Sec1(k) => {
+                        PrivateSec1KeyDer::from(k.secret_sec1_der().to_vec()).into()
+                    }
+                    _ => unreachable!("PrivateKeyDer variant is exhaustive here"),
+                };
+                TlsMode::Mtls {
+                    ca: ca.clone(),
+                    cert_chain: cert_chain.clone(),
+                    key,
+                }
+            }
+        }
+    }
+}
+
 /// Request-level credentials sent with the Extended CONNECT.
 #[derive(Debug, Clone, Default)]
 pub enum ClientAuth {

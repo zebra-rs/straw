@@ -25,6 +25,8 @@ use std::sync::Arc as StdArc;
 
 use crate::p2p::holepunch::{self, Direct};
 use crate::p2p::identity::{Identity, SpkiPin};
+use crate::p2p::peer::RelayAccess;
+use crate::p2p::strategy::PunchStrategy;
 
 /// Which path a session is currently using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,18 @@ pub enum PathState {
 /// traffic is flowing").
 const REPUNCH_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Strategy selection and the extra inputs some strategies need. Bundled so
+/// `Session::start` stays readable; `Default` is the plain `basic` punch.
+#[derive(Default, Clone)]
+pub struct PunchConfig {
+    pub strategy: PunchStrategy,
+    /// How to reach the relay to open auxiliary bind sessions (predict/birthday).
+    pub relay_access: Option<StdArc<RelayAccess>>,
+    /// Peer-facing sources the on-path relay signalled (relay-assisted); a
+    /// shared list a pump task fills and the punch reads.
+    pub peer_reflexive: Option<StdArc<Mutex<Vec<SocketAddr>>>>,
+}
+
 /// The inputs the manager needs to punch, held for the session's life.
 struct PunchParams {
     initiator: bool,
@@ -52,6 +66,7 @@ struct PunchParams {
     punch_endpoint: quinn::Endpoint,
     reflexive: Option<SocketAddr>,
     relay_paddr: SocketAddr,
+    cfg: PunchConfig,
 }
 
 /// A peer session that manages the relay↔direct path transition.
@@ -76,6 +91,7 @@ impl Session {
         punch_endpoint: quinn::Endpoint,
         reflexive: Option<SocketAddr>,
         relay_paddr: SocketAddr,
+        cfg: PunchConfig,
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(PathState::Relay);
         let direct: Arc<Mutex<Option<Direct>>> = Arc::new(Mutex::new(None));
@@ -86,6 +102,7 @@ impl Session {
             punch_endpoint,
             reflexive,
             relay_paddr,
+            cfg,
         };
         let manager = tokio::spawn(manage(inner.clone(), params, direct.clone(), state_tx));
         Self {
@@ -155,17 +172,19 @@ async fn manage(
         }
 
         let _ = state.send(PathState::Punching);
-        match holepunch::coordinate(
-            &inner,
-            params.initiator,
-            &params.identity,
-            params.peer_pin,
-            params.punch_endpoint.clone(),
-            params.reflexive,
-            params.relay_paddr,
-        )
-        .await
-        {
+        let inputs = holepunch::PunchInputs {
+            inner: &inner,
+            initiator: params.initiator,
+            identity: &params.identity,
+            peer_pin: params.peer_pin,
+            punch_endpoint: params.punch_endpoint.clone(),
+            reflexive: params.reflexive,
+            relay: params.relay_paddr,
+            strategy: params.cfg.strategy,
+            relay_access: params.cfg.relay_access.clone(),
+            peer_reflexive: params.cfg.peer_reflexive.clone(),
+        };
+        match holepunch::coordinate(inputs).await {
             Ok(d) => {
                 let conn = d.conn.clone();
                 *direct.lock().unwrap() = Some(d);

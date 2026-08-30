@@ -20,6 +20,7 @@ use crate::p2p::relay_socket::inner_endpoint;
 use crate::p2p::token::TokenV2;
 
 /// How to reach and authenticate to the relay (the outer connection).
+#[derive(Clone)]
 pub struct RelayAccess {
     pub addr: SocketAddr,
     pub server_name: String,
