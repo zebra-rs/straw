@@ -89,6 +89,29 @@ struct RelayArgs {
     /// NAT-traversal strategy: basic | predict | birthday | relay-assisted.
     #[arg(long, default_value = "basic")]
     punch_strategy: PunchStrategy,
+
+    /// VPN mode: run an IP tunnel between the peers (straw's CONNECT-IP stack
+    /// over the peer connection) instead of piping stdin/stdout. Needs ambient
+    /// CAP_NET_ADMIN. The listener is the tunnel server, the connector the
+    /// client.
+    #[arg(long)]
+    vpn: bool,
+
+    /// (listen/server) address pool the connector is assigned from.
+    #[arg(long, default_value = "10.9.0.0/24")]
+    vpn_subnet: ipnet::Ipv4Net,
+
+    /// TUN device name for VPN mode.
+    #[arg(long, default_value = "strawcat0")]
+    vpn_tun: String,
+
+    /// Override the VPN tunnel MTU (default: sampled from the peer connection).
+    #[arg(long)]
+    vpn_mtu: Option<u16>,
+
+    /// (connect/client) configure the address but install no routes.
+    #[arg(long)]
+    vpn_no_routes: bool,
 }
 
 #[tokio::main]
@@ -162,6 +185,15 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
         punch_config(&args, sink)?,
     );
     let best = best_path(&session, args.punch_wait).await;
+    if args.vpn {
+        return straw::p2p::vpn::run_server(
+            best,
+            args.vpn_subnet,
+            args.vpn_tun.clone(),
+            args.vpn_mtu.unwrap_or(1400),
+        )
+        .await;
+    }
     // The connecting peer opens the stream; accept it on the chosen path.
     let (send, recv) = best
         .accept_bi()
@@ -190,6 +222,16 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         punch_config(&args, sink)?,
     );
     let best = best_path(&session, args.punch_wait).await;
+    if args.vpn {
+        return straw::p2p::vpn::run_client(
+            best,
+            args.vpn_tun.clone(),
+            args.vpn_mtu,
+            !args.vpn_no_routes,
+            Some(args.vpn_subnet.to_string()),
+        )
+        .await;
+    }
     let (send, recv) = best
         .open_bi()
         .await

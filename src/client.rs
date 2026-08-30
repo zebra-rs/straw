@@ -381,8 +381,9 @@ fn encode_template_value(value: &str) -> String {
 /// Derefs to [`Tunnel`], so the primary tunnel's methods and state are
 /// available directly on the client.
 pub struct TunnelClient {
-    // Held so the sockets outlive the tunnels.
-    _endpoint: quinn::Endpoint,
+    // Held so the sockets outlive the tunnels (None when the connection is
+    // supplied externally, e.g. a strawcat peer connection).
+    _endpoint: Option<quinn::Endpoint>,
     conn: quinn::Connection,
     // Also held because h3 closes the connection when the last one drops.
     send_request: SendRequest,
@@ -471,6 +472,33 @@ impl TunnelClient {
 
         let conn = endpoint.connect(server_addr, server_name)?.await?;
 
+        let authority = format!("{server_name}:{}", server_addr.port());
+        Self::from_conn(conn, Some(endpoint), authority, auth, target, ipproto).await
+    }
+
+    /// Run the CONNECT-IP client over an already-established QUIC connection —
+    /// e.g. a strawcat peer connection (relay or punched). `authority` is the
+    /// `:authority` for the request; the connection's lifetime is the caller's.
+    pub async fn over_connection(
+        conn: quinn::Connection,
+        authority: &str,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
+        Self::from_conn(conn, None, authority.to_string(), auth, target, ipproto).await
+    }
+
+    /// Wrap `conn` for HTTP/3, start the driver + datagram demux, and establish
+    /// the first tunnel. `endpoint` is held only when this owns the socket.
+    async fn from_conn(
+        conn: quinn::Connection,
+        endpoint: Option<quinn::Endpoint>,
+        authority: String,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
         // Wrap for HTTP/3, keeping the raw handle for DATAGRAM I/O.
         let h3_conn = h3_quinn::Connection::new(conn.clone());
         let (mut driver, mut send_request) = h3::client::builder()
@@ -505,7 +533,6 @@ impl TunnelClient {
             }
         });
 
-        let authority = format!("{server_name}:{}", server_addr.port());
         let tunnel = Tunnel::establish(
             &mut send_request,
             &conn,
