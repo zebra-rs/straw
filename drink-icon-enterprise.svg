@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 112 112">
+  <defs>
+    <clipPath id="glass"><path id="gp" d="M32.8125 32.8125 H79.1875 L74.375 87.5 Q73.71875 92.96875 68.25 92.96875 H43.75 Q38.28125 92.96875 37.625 87.5 Z"/></clipPath>
+    <clipPath id="straw"><rect x="-4.15625" y="-39.375" width="8.3125" height="78.75" rx="4.15625"/></clipPath>
+
+    <!-- dark graphite tile -->
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A3F46"/>
+      <stop offset="0.5" stop-color="#23272D"/>
+      <stop offset="1" stop-color="#15181C"/>
+    </linearGradient>
+    <!-- tile edge bevel -->
+    <linearGradient id="bevel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8A929C" stop-opacity="0.9"/>
+      <stop offset="0.12" stop-color="#5A616A" stop-opacity="0.35"/>
+      <stop offset="0.9" stop-color="#000000" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.55"/>
+    </linearGradient>
+    <!-- chrome for glass body -->
+    <linearGradient id="chrome" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#B9C2CC"/>
+      <stop offset="0.22" stop-color="#EDF2F7"/>
+      <stop offset="0.45" stop-color="#8E99A6"/>
+      <stop offset="0.62" stop-color="#D7DEE6"/>
+      <stop offset="0.82" stop-color="#7E8894"/>
+      <stop offset="1" stop-color="#AEB8C2"/>
+    </linearGradient>
+    <!-- steel-blue liquid -->
+    <linearGradient id="liquid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3E6E9E"/>
+      <stop offset="0.55" stop-color="#2A4B70"/>
+      <stop offset="1" stop-color="#1B3049"/>
+    </linearGradient>
+    <linearGradient id="liquidTop" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6FA3D4"/>
+      <stop offset="0.5" stop-color="#A9CBEA"/>
+      <stop offset="1" stop-color="#5E90BF"/>
+    </linearGradient>
+    <!-- brushed aluminum straw -->
+    <linearGradient id="strawMetal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#9AA3AD"/>
+      <stop offset="0.35" stop-color="#E9EEF3"/>
+      <stop offset="0.55" stop-color="#C2CAD2"/>
+      <stop offset="0.75" stop-color="#828C96"/>
+      <stop offset="1" stop-color="#A6AFB8"/>
+    </linearGradient>
+    <!-- dark steel stripes on straw -->
+    <linearGradient id="stripe" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4A5058"/>
+      <stop offset="1" stop-color="#2A2F35"/>
+    </linearGradient>
+    <!-- rim highlight for glass outline -->
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F4F8FC"/>
+      <stop offset="0.5" stop-color="#B7C1CB"/>
+      <stop offset="1" stop-color="#6E7883"/>
+    </linearGradient>
+  </defs>
+
+  <!-- tile: flat graphite -->
+  <rect width="112" height="112" rx="24.5" fill="#23272D"/>
+
+  <g transform="translate(56 56) scale(1.18) translate(-56 -56)">
+    <!-- glass body: chrome sheen -->
+    <use href="#gp" fill="url(#chrome)" fill-opacity="0.35"/>
+    <!-- liquid -->
+    <g clip-path="url(#glass)">
+      <rect x="30.625" y="59.0625" width="52.5" height="37.1875" fill="url(#liquid)"/>
+      <ellipse cx="56" cy="59.0625" rx="25.15625" ry="4.15625" fill="url(#liquidTop)"/>
+    </g>
+    <!-- straw -->
+    <g transform="translate(60.375 51.40625) rotate(18)">
+      <g clip-path="url(#straw)">
+        <rect x="-4.15625" y="-39.375" width="8.3125" height="78.75" fill="url(#strawMetal)"/>
+        <rect x="-13.125" y="-48.34375" width="26.25" height="4.8125" transform="rotate(-45 0 -45.9375)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="-36.3125" width="26.25" height="4.8125" transform="rotate(-45 0 -33.90625)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="-24.28125" width="26.25" height="4.8125" transform="rotate(-45 0 -21.875)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="-12.25" width="26.25" height="4.8125" transform="rotate(-45 0 -9.84375)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="-0.21875" width="26.25" height="4.8125" transform="rotate(-45 0 2.1875)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="11.8125" width="26.25" height="4.8125" transform="rotate(-45 0 14.21875)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="23.84375" width="26.25" height="4.8125" transform="rotate(-45 0 26.25)" fill="url(#stripe)"/>
+        <rect x="-13.125" y="35.875" width="26.25" height="4.8125" transform="rotate(-45 0 38.28125)" fill="url(#stripe)"/>
+        <!-- specular line down the straw -->
+        <rect x="-2.6" y="-39.375" width="1.4" height="78.75" fill="#FFFFFF" fill-opacity="0.55"/>
+      </g>
+    </g>
+    <!-- liquid tint over submerged straw -->
+    <g clip-path="url(#glass)">
+      <rect x="30.625" y="59.0625" width="52.5" height="37.1875" fill="url(#liquid)" fill-opacity="0.6"/>
+    </g>
+    <!-- glass specular highlight -->
+    <g clip-path="url(#glass)">
+      <path d="M36 33 L44 33 L40.5 92 L37.6 87.5 Z" fill="#FFFFFF" fill-opacity="0.28"/>
+      <path d="M72 33 L76.5 33 L72.6 90 L69.5 90 Z" fill="#FFFFFF" fill-opacity="0.14"/>
+    </g>
+    <!-- glass outline: steel rim -->
+    <use href="#gp" fill="none" stroke="url(#rim)" stroke-width="2.84375" stroke-linejoin="round"/>
+  </g>
+</svg>
