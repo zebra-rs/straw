@@ -28,6 +28,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 tun = { version = "0.8.14", features = ["async"] }
 
 # h3 0.0.8 with upstream's ConnectIp protocol variant backported

@@ -23,11 +23,21 @@ use futures::stream::{self, StreamExt};
 #[derive(Debug, Default, CucumberWorld)]
 pub struct World {
     feature_tag: String,
-    /// Byte length of `logs/<scoped>.log` when this run started the daemon.
-    /// Daemon logs append across runs, so the log-content steps only look
-    /// past this offset — a line from an earlier run must never satisfy an
-    /// assertion about the daemon started now.
-    log_offsets: HashMap<String, u64>,
+}
+
+/// Byte length of each `logs/<scoped>_<role>.log` when this process last
+/// started that daemon. Daemon logs append across runs, so the log-content
+/// steps only look past this offset — a line from an earlier run must never
+/// satisfy an assertion about the daemon started now.
+///
+/// Process-global, NOT in `World`: cucumber builds a fresh `World` per
+/// scenario, and daemons start in an earlier scenario than the assertions
+/// about their logs. Keeping the offsets in `World` silently reset them to
+/// 0 between scenarios, so `should eventually contain` matched stale lines
+/// from previous runs — a converge gate that never gated anything.
+fn log_offsets() -> &'static Mutex<HashMap<String, u64>> {
+    static OFFSETS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    OFFSETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl World {
@@ -60,12 +70,20 @@ impl World {
 
     fn mark_log_start(&mut self, log_file: &str) {
         let len = fs::metadata(log_file).map(|m| m.len()).unwrap_or(0);
-        self.log_offsets.insert(log_file.to_string(), len);
+        log_offsets()
+            .lock()
+            .unwrap()
+            .insert(log_file.to_string(), len);
     }
 
     fn log_since_start(&self, log_file: &str) -> String {
         let content = fs::read_to_string(log_file).unwrap_or_default();
-        let offset = self.log_offsets.get(log_file).copied().unwrap_or(0) as usize;
+        let offset = log_offsets()
+            .lock()
+            .unwrap()
+            .get(log_file)
+            .copied()
+            .unwrap_or(0) as usize;
         content.get(offset..).unwrap_or("").to_string()
     }
 
@@ -662,6 +680,11 @@ async fn ping_should_fail(world: &mut World, namespace: String, target: String) 
 }
 
 /// `ping -M do` with a payload sized so the IP packet is exactly `size`.
+///
+/// Polled: a full-MTU packet only fits once the session MTU has ramped to
+/// the configured value (quinn's path-MTU discovery raises it in steps,
+/// slower under concurrent load), so early attempts can be dropped at the
+/// tunnel with the drop counted — not a failure, just not converged yet.
 #[then(expr = "a {int} byte unfragmentable ping from {string} to {string} should succeed")]
 async fn sized_ping_should_succeed(
     world: &mut World,
@@ -673,26 +696,33 @@ async fn sized_ping_should_succeed(
     let header = if target.contains(':') { 48 } else { 28 };
     let payload = (size - header).to_string();
     let family = if target.contains(':') { "-6" } else { "-4" };
-    let out = netns::exec_in_netns(
-        &scoped,
-        "ping",
-        &[
-            family, "-c", "2", "-W", "3", "-M", "do", "-s", &payload, &target,
-        ],
-    )
-    .await;
-    assert!(
-        out.is_ok(),
-        "{} byte ping from {} to {} failed: {}",
-        size,
-        scoped,
-        target,
-        out.err().map(|e| e.to_string()).unwrap_or_default()
-    );
-    println!(
-        "✓ {} byte ping from {} to {} succeeded",
-        size, scoped, target
-    );
+    const ATTEMPTS: u32 = 15;
+    let mut last = String::new();
+    for i in 0..ATTEMPTS {
+        match netns::exec_in_netns(
+            &scoped,
+            "ping",
+            &[
+                family, "-c", "1", "-W", "2", "-M", "do", "-s", &payload, &target,
+            ],
+        )
+        .await
+        {
+            Ok(_) => {
+                println!(
+                    "✓ {} byte ping from {} to {} succeeded (attempt {})",
+                    size,
+                    scoped,
+                    target,
+                    i + 1
+                );
+                return;
+            }
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("{size} byte ping from {scoped} to {target} never succeeded: {last}");
 }
 
 #[then(

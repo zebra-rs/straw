@@ -136,12 +136,22 @@ async fn run() -> Result<(), ProxyError> {
 
     // The device is created bare; addresses and routes are applied from the
     // capsules, which also lets us configure IPv6 (the tun crate cannot).
-    let channels = spawn_tun(&TunConfig {
-        name: args.tun_name.clone(),
-        mtu,
-        ipv4: None,
-        ipv6: None,
-    })?;
+    // Uplink packets go straight from the read pump into the tunnel —
+    // `send_packet` is synchronous — with no queue or task between.
+    let uplink_sender = sender.clone();
+    let channels = spawn_tun(
+        &TunConfig {
+            name: args.tun_name.clone(),
+            mtu,
+            ipv4: None,
+            ipv6: None,
+        },
+        move |packet| {
+            if let Err(e) = uplink_sender.send_packet(packet) {
+                tracing::debug!("packet not sent: {e}");
+            }
+        },
+    )?;
     tracing::info!(dev = %args.tun_name, mtu, "TUN device up");
 
     // A proxy reached over loopback needs no pin route (and pinning would
@@ -153,17 +163,6 @@ async fn run() -> Result<(), ProxyError> {
     let mut guard = Some(apply(&client, &args.tun_name, pin, !args.no_routes)?);
     report(&client, &args.tun_name);
 
-    // Data plane, in tasks independent of the capsule stream this task keeps
-    // reading: TUN → tunnel, and tunnel → TUN off the taken packet receiver.
-    let mut from_net = channels.from_net;
-    let to_tunnel = sender.clone();
-    let uplink = tokio::spawn(async move {
-        while let Some(packet) = from_net.recv().await {
-            if let Err(e) = to_tunnel.send_packet(packet) {
-                tracing::trace!("packet not sent: {e}");
-            }
-        }
-    });
     // Downlink: the connection's demux task feeds the TUN writer directly —
     // no intermediate queue or task (Step 32).
     client.set_packet_sink(channels.to_net.clone());
@@ -214,7 +213,6 @@ async fn run() -> Result<(), ProxyError> {
         }
     }
 
-    uplink.abort();
     drop(guard);
     client.close().await;
     Ok(())

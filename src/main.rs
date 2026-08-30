@@ -68,18 +68,33 @@ async fn run() -> Result<(), ProxyError> {
     let route_table = Arc::new(RouteTable::new());
 
     // Optional kernel TUN device; without it only hairpin forwarding works.
-    let mut tun_ingress = None;
+    let mut tun_engine_slot = None;
     let tun_tx = if config.tun {
         let (gateway, prefix) = pool.ipv4_gateway();
         let ipv6 = pool.ipv6_gateway();
-        let channels = spawn_tun(&TunConfig {
-            name: config.tun_name.clone(),
-            mtu: config.mtu,
-            ipv4: Some((gateway, prefix)),
-            ipv6,
-        })?;
+        // The engine is built after the device (it needs the device's
+        // sender), so the inline ingress reaches it through a OnceLock —
+        // set exactly once below, before any traffic can flow.
+        let engine_slot: Arc<std::sync::OnceLock<Arc<ForwardingEngine>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let ingress_engine = engine_slot.clone();
+        let channels = spawn_tun(
+            &TunConfig {
+                name: config.tun_name.clone(),
+                mtu: config.mtu,
+                ipv4: Some((gateway, prefix)),
+                ipv6,
+            },
+            move |packet| {
+                if let Some(engine) = ingress_engine.get()
+                    && let Err(e) = engine.dispatch_from_network(packet)
+                {
+                    tracing::debug!("network packet dropped: {e}");
+                }
+            },
+        )?;
         tracing::info!(name = %config.tun_name, %gateway, "TUN device up");
-        tun_ingress = Some(channels.from_net);
+        tun_engine_slot = Some(engine_slot);
         Some(channels.to_net)
     } else {
         tracing::info!("running without TUN: client<->client hairpin forwarding only");
@@ -109,8 +124,8 @@ async fn run() -> Result<(), ProxyError> {
         limits,
         metrics.clone(),
     ));
-    if let Some(rx) = tun_ingress {
-        tokio::spawn(engine.clone().run_network_ingress(rx));
+    if let Some(slot) = tun_engine_slot {
+        let _ = slot.set(engine.clone());
     }
 
     let sessions = SessionManager::new(config.max_sessions);

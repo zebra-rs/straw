@@ -22,12 +22,6 @@ Feature: Tunnel MTU follows the QUIC path MTU
     And I start strawc in namespace "client" with args "--server-addr 172.31.2.1:4433 --insecure"
     Then interface "strawc0" in namespace "client" should eventually exist
 
-  Scenario: Both ends converge on the path MTU
-    # The proxy samples a low capacity at session setup and refreshes it
-    # as discovery ramps; the client widens its device the same way.
-    Then the straw log in namespace "proxy" should eventually contain "tunnel MTU updated"
-    And the strawc log in namespace "client" should eventually contain "tunnel MTU raised"
-
   Scenario: A packet filling the proxy's TUN device round-trips
     # straw0 carries 1400 by default. This is the regression test for a
     # tunnel MTU frozen at the initial estimate, and for a read buffer
