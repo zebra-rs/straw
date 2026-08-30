@@ -23,6 +23,7 @@ pub mod punch;
 pub mod relay_socket;
 pub mod session;
 pub mod strategy;
+pub mod stun;
 pub mod token;
 pub mod vpn;
 pub mod wire;

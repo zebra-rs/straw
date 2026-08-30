@@ -148,6 +148,16 @@ pub struct ProxyConfig {
     /// symmetric NATs can be traversed when the relay is on the path (§12).
     #[arg(long)]
     pub udp_bind_observe: bool,
+
+    /// Primary address of the RFC 5780 STUN server (NAT behaviour discovery).
+    /// Enabled together with --stun-alt-addr (a different IP *and* port).
+    #[arg(long)]
+    pub stun_addr: Option<std::net::SocketAddr>,
+
+    /// Alternate STUN address advertised as OTHER-ADDRESS for the RFC 5780
+    /// mapping tests. Must differ from --stun-addr in both IP and port.
+    #[arg(long)]
+    pub stun_alt_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for ProxyConfig {
@@ -184,6 +194,8 @@ impl Default for ProxyConfig {
             udp_bind_max_bps: 0,
             udp_bind_allow_dest: Vec::new(),
             udp_bind_observe: false,
+            stun_addr: None,
+            stun_alt_addr: None,
         }
     }
 }
@@ -352,6 +364,8 @@ fn overlay_cli(config: &mut ProxyConfig, cli: ProxyConfig, matches: &clap::ArgMa
         udp_bind_max_bps,
         udp_bind_allow_dest,
         udp_bind_observe,
+        stun_addr,
+        stun_alt_addr,
     );
 }
 

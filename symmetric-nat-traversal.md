@@ -216,6 +216,26 @@ scoped to exclude the relay so the bind connection is untouched). The punch then
 **succeeds through the symmetric double NAT** (3/3), where every other strategy
 relays — both peers reach `direct (hole punched)` at each other's mapped port.
 
+### 4.6 `--stun-detect` — classify the NAT first (RFC 5780)
+
+Rather than *attempt* a punch and time out, a peer can *classify* its NAT up
+front. RFC 5780 NAT-behaviour discovery probes a dual-address STUN server (the
+relay, `straw --stun-addr/--stun-alt-addr`) from a fresh socket and compares the
+reflexive across three destinations (`src/p2p/stun.rs::detect_mapping`):
+
+- **Test I** → primary; learn the reflexive + the server's `OTHER-ADDRESS`.
+- **Test II** → the alternate IP:port; same reflexive ⇒ **endpoint-independent**
+  (cone) — punchable.
+- **Test III** → primary IP, alternate port; same reflexive as Test I ⇒
+  **address-dependent**, else **address-and-port-dependent** (symmetric).
+
+`strawcat --stun-detect <server>` reports the class before connecting; a
+symmetric verdict tells the peer (or operator) to use `--port-map` or expect the
+relay, instead of burning a 5 s punch window. The mapping is a property of the
+NAT, so a fresh probe socket answers for the punch socket too. Verified over
+loopback (→ endpoint-independent) and against the netns MASQUERADE (→
+address-and-port-dependent).
+
 ---
 
 ## 5. Why relay-assisted does not converge on Linux MASQUERADE — the "moving target"
@@ -334,6 +354,7 @@ sudo PORTMAP=1 NAT_MODE=symmetric scripts/nat-punch-test.sh    # PCP/NAT-PMP →
 | Session config | `src/p2p/session.rs` (`PunchConfig`) |
 | Relay flag | `src/config.rs` (`udp_bind_observe`), `src/main.rs` |
 | PCP / NAT-PMP client | `src/p2p/portmap.rs` (`map_udp`); `Mapped` candidate in `p2p/wire.rs` |
+| RFC 5780 STUN client + relay server | `src/p2p/stun.rs` (`detect_mapping`, `serve`); `strawcat --stun-detect`, `straw --stun-addr/--stun-alt-addr` |
 | Harness PCP/NAT-PMP responder | `scripts/natpmp-stub.py` (`PORTMAP=1`) |
 
 **Wire additions (provisional codepoints, subject to the §9 standards swap)**
