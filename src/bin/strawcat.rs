@@ -204,8 +204,13 @@ async fn best_path(session: &Session, wait_secs: u64) -> quinn::Connection {
     session.connection()
 }
 
-/// Pipe stdin → the QUIC send stream and the recv stream → stdout, until
-/// either side reaches EOF.
+/// Pipe stdin → the QUIC send stream and the recv stream → stdout. Both
+/// directions run to their own EOF and are awaited independently: the peer
+/// finishing its send (recv EOF) must not cut off our still-draining send.
+/// Aborting the upload would drop the SendStream unfinished, which quinn turns
+/// into a stream *reset* — discarding buffered bytes the peer never receives.
+/// So we always let the upload reach stdin EOF and call `finish()`, matching a
+/// half-close pipe: the process exits once both halves are done.
 async fn pipe_stdio(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -215,12 +220,15 @@ async fn pipe_stdio(
     let up = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let _ = copy(&mut stdin, &mut send).await;
+        // Graceful FIN so all buffered bytes are delivered before close.
         let _ = send.finish();
     });
-    let mut stdout = tokio::io::stdout();
-    let _ = copy(&mut recv, &mut stdout).await;
-    let _ = stdout.flush().await;
-    up.abort();
+    let down = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        let _ = copy(&mut recv, &mut stdout).await;
+        let _ = stdout.flush().await;
+    });
+    let _ = tokio::join!(up, down);
     Ok(())
 }
 

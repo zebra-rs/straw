@@ -36,6 +36,33 @@ enum Role {
     Server,
 }
 
+/// Choose the connection both peers agree to keep from those that completed,
+/// closing the rest. Prefer the canonical one (the lower-pinned peer is the
+/// client); with no canonical connection, keep the first (a lone success).
+fn pick(
+    collected: &mut Vec<(Role, quinn::Connection)>,
+    my_pin: SpkiPin,
+    peer_pin: Option<SpkiPin>,
+) -> quinn::Connection {
+    let canonical = |role: Role, conn: &quinn::Connection| -> bool {
+        match peer_pin.or_else(|| peer_pin_of(conn)) {
+            // The client is us when we dialed, the peer when we accepted.
+            Some(pp) if role == Role::Client => my_pin < pp,
+            Some(pp) => pp < my_pin,
+            None => role == Role::Client,
+        }
+    };
+    let idx = collected
+        .iter()
+        .position(|(r, c)| canonical(*r, c))
+        .unwrap_or(0);
+    let (_, keep) = collected.remove(idx);
+    for (_, other) in collected.drain(..) {
+        other.close(0u32.into(), b"tie-break");
+    }
+    keep
+}
+
 /// The peer's SPKI pin from a completed connection's raw-public-key identity.
 fn peer_pin_of(conn: &quinn::Connection) -> Option<SpkiPin> {
     let certs = conn
@@ -141,30 +168,30 @@ impl Puncher {
         }
         drop(tx);
 
+        // Simultaneous open can complete up to two connections (each side's
+        // dial). Keep the first, but wait a short grace for a possible
+        // duplicate; on a genuine duplicate the tie-break picks the canonical
+        // one — the connection whose *client* is the lower-pinned peer — so
+        // both sides converge. A lone success is kept regardless of role
+        // (asymmetric NAT often lets only one direction through).
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
+        let mut collected: Vec<(Role, quinn::Connection)> = Vec::new();
+        let grace = Duration::from_millis(300);
         let result = loop {
+            let waiting_grace = !collected.is_empty();
             tokio::select! {
-                _ = &mut deadline => break Err(ProxyError::Quic("hole punch timed out".into())),
-                next = rx.recv() => {
-                    let Some((role, conn)) = next else {
-                        break Err(ProxyError::Quic("all punch attempts failed".into()));
-                    };
-                    // Resolve the tie-break: the lower-pinned peer is client.
-                    let want_client = match peer_pin.or_else(|| peer_pin_of(&conn)) {
-                        Some(pp) => my_pin < pp,
-                        // No peer pin available (should not happen post-
-                        // handshake): accept the first completion.
-                        None => role == Role::Client,
-                    };
-                    let keep = (want_client && role == Role::Client)
-                        || (!want_client && role == Role::Server);
-                    if keep {
-                        break Ok(conn);
-                    }
-                    // The other connection is the keeper; drop this one.
-                    conn.close(0u32.into(), b"tie-break");
+                _ = &mut deadline, if !waiting_grace => {
+                    break Err(ProxyError::Quic("hole punch timed out".into()));
                 }
+                _ = tokio::time::sleep(grace), if waiting_grace => {
+                    break Ok(pick(&mut collected, my_pin, peer_pin));
+                }
+                next = rx.recv() => match next {
+                    Some(item) => collected.push(item),
+                    None if waiting_grace => break Ok(pick(&mut collected, my_pin, peer_pin)),
+                    None => break Err(ProxyError::Quic("all punch attempts failed".into())),
+                },
             }
         };
         accept_task.abort();

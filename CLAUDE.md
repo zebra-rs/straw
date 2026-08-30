@@ -118,10 +118,43 @@ CBOR token); `p2p/relay_socket` runs an inner `quinn::AsyncUdpSocket` over a
 bind session; `p2p/inner_tls` is RFC 7250 raw-public-key mTLS pinned by SPKI;
 `p2p/peer` orchestrates listen/connect. The egress SSRF guard always denies
 loopback/RFC1918/etc.; `--udp-bind-allow-dest` re-permits ranges for
-private/single-host relays (design §10.1). This is P1 (relay path); hole
-punching (P2, §5–6) and the standards-codepoint swap (§9) are future work.
-Everything provisional (bind capsule types 0x11–0x13, token format) is
-isolated for that swap. See `p2p-direct-path-design.md`.
+private/single-host relays (design §10.1).
+
+P2 hole punching is implemented: `p2p/candidates` + `p2p/wire` gather and
+exchange host/reflexive/relay candidates over the inner control stream,
+`p2p/punch` does the simultaneous-open DCUtR punch with the §5.3.4 tie-break,
+and `p2p/session` is the `Relay→Punching→Direct` path state machine that
+promotes on success, reverts + re-punches on loss. On a duplicate success both
+sides converge on the connection whose *client* is the lower-pinned peer; a
+lone success (asymmetric NAT) is kept regardless of role — never reject the
+only working path.
+
+**Relay-path inner MTU is pinned to 1200 with MTU discovery OFF**
+(`p2p/peer::relay_transport`). Each inner QUIC packet is re-wrapped as one
+outer QUIC DATAGRAM, so the inner MTU must fit inside it; quinn's own path-MTU
+discovery would probe the inner connection past that ceiling and those oversize
+packets fail `send_datagram`, stalling the connection *after* the handshake.
+This only bites once packets exceed ~1200 B, so small-payload tests miss it —
+`relay_path_carries_a_large_transfer` guards it with a 256 KiB transfer. The
+direct (punched) path has no such limit; it runs over a real socket.
+
+`pipe_stdio` in `strawcat` awaits **both** directions (never aborts the
+upload): aborting drops the `SendStream` unfinished, which quinn turns into a
+stream reset that discards buffered bytes the peer never sees.
+
+`scripts/nat-punch-test.sh` is the netns double-NAT harness
+(`peerA─natA══relay══natB─peerB`, MASQUERADE both sides). It asserts the relay
+data plane carries payload both ways through the double NAT; the punch is
+best-effort and reported, not asserted — Linux MASQUERADE often remaps the
+fresh punch socket to a different external port than the advertised reflexive,
+which blocks the punch and both peers stay on the relay. Reflexive prediction
+assumes a port-preserving NAT; robust traversal needs the punch socket's actual
+mapping (STUN-style discovery or reusing the outer socket), which is future
+work.
+
+The standards-codepoint swap (§9) is still future work; everything provisional
+(bind capsule types 0x11–0x13, token format) is isolated for that swap. See
+`p2p-direct-path-design.md`.
 
 ## Key RFCs
 

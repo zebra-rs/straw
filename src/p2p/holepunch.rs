@@ -98,12 +98,29 @@ pub async fn coordinate(
     let puncher = Puncher::new(bind_addr, identity, peer_pin)?;
     let host = puncher.local_addr()?;
 
+    // A wildcard bind (0.0.0.0) yields no usable host candidate. Offer a host
+    // candidate only when bound to a concrete interface (LAN-adjacent peers).
+    let host_cands = if host.ip().is_unspecified() {
+        vec![]
+    } else {
+        vec![host]
+    };
+    // Predict the punch socket's *own* server-reflexive address. The relay's
+    // OBSERVED_ADDRESS reports the outer connection's mapping; a fresh punch
+    // socket gets a different one, but under a port-preserving NAT (Linux
+    // default) the public port equals the socket's local port, so the punch
+    // reflexive is (observed public IP, punch local port). This is what makes
+    // the simultaneous open reach the peer through the NAT.
+    let punch_reflexive = reflexive.map(|obs| SocketAddr::new(obs.ip(), host.port()));
+
     let local = gather(&Sources {
-        host: vec![host],
-        reflexive,
+        host: host_cands,
+        reflexive: punch_reflexive,
         relay,
     });
+    tracing::debug!(?local, "punch: local candidates");
     let remote = exchange_candidates(inner, &local, initiator).await?;
+    tracing::debug!(?remote, "punch: remote candidates");
 
     // Punch every distinct host/reflexive candidate. The relay candidate is
     // the fallback path (its address is the relay's forwarding socket, not a
@@ -114,6 +131,7 @@ pub async fn coordinate(
             targets.push(c.addr);
         }
     }
+    tracing::debug!(?targets, "punch: dialing");
     if targets.is_empty() {
         return Err(ProxyError::Quic(
             "peer offered no punchable candidates".into(),
