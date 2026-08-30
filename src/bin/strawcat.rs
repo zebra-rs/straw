@@ -112,6 +112,12 @@ struct RelayArgs {
     /// (connect/client) configure the address but install no routes.
     #[arg(long)]
     vpn_no_routes: bool,
+
+    /// Ask the local router (PCP / NAT-PMP) to forward the punch socket and
+    /// advertise the mapped address — rescues symmetric NATs on routers that
+    /// support it (design §11 / P3).
+    #[arg(long)]
+    port_map: bool,
 }
 
 #[tokio::main]
@@ -293,6 +299,7 @@ fn punch_config(
         strategy: args.punch_strategy,
         relay_access,
         peer_reflexive,
+        port_map: args.port_map,
     })
 }
 

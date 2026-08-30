@@ -186,6 +186,36 @@ MASQUERADE; see §5.
 address-dependent (restricted cone) rather than address-and-port-dependent.
 Linux MASQUERADE is the latter, so it fails — §5.
 
+### 4.5 `--port-map` — ask the router for an explicit forward (PCP / NAT-PMP)
+
+The strategies above try to *discover* or *guess* a working path through an
+uncooperative NAT. Port mapping instead *asks the router to cooperate*: PCP
+(RFC 6887) and NAT-PMP (RFC 6886) let a host request an explicit UDP forward
+from its gateway. Most consumer routers speak one of them (or UPnP-IGD).
+
+Mechanism (`src/p2p/portmap.rs`, gated by `strawcat --port-map`):
+
+1. Discover the default gateway (`/proc/net/route`); the PCP/NAT-PMP server is
+   at `gateway:5351`.
+2. Request a UDP mapping for the punch socket's *internal* port — PCP first,
+   NAT-PMP as fallback. The router replies with an external `(IP, port)` it now
+   forwards, both ways, to that socket.
+3. Advertise that external address as a **`Mapped`** candidate (priority above
+   reflexive). The peer dials it; the router's forward delivers it to the punch
+   socket regardless of the NAT's mapping/filtering behaviour.
+
+This is orthogonal to the punch strategy — combine `--port-map` with `basic`.
+It is the one approach that **reliably traverses a symmetric NAT**, because the
+forward is explicit rather than inferred. It requires a router that supports
+PCP/NAT-PMP and will honour the request.
+
+**Demonstrated end to end.** `sudo PORTMAP=1 NAT_MODE=symmetric
+scripts/nat-punch-test.sh` runs a PCP/NAT-PMP responder (`scripts/natpmp-stub.py`)
+in each NAT that installs a 1:1 iptables forward on request (DNAT in, SNAT out,
+scoped to exclude the relay so the bind connection is untouched). The punch then
+**succeeds through the symmetric double NAT** (3/3), where every other strategy
+relays — both peers reach `direct (hole punched)` at each other's mapped port.
+
 ---
 
 ## 5. Why relay-assisted does not converge on Linux MASQUERADE — the "moving target"
@@ -248,6 +278,7 @@ not.
 | `predict` | sequential-symmetric | relay (detects "random") | a sequential-allocating NAT |
 | `birthday` | narrow-range random symmetric | relay (range too wide) | narrow-port NAT + many sockets |
 | `relay-assisted` | address-dependent-filtering symmetric, on-path relay | relay (moving target) | restricted-cone NAT + on-path relay |
+| `--port-map` | **any NAT whose router speaks PCP/NAT-PMP** | **PUNCHED** (explicit forward) | `PORTMAP=1` → **direct asserted** |
 
 The one universally-true row: **the relay path always carries the data**, both
 ways, through the double NAT (asserted by the harness in every mode).
@@ -256,10 +287,12 @@ ways, through the double NAT (asserted by the harness in every mode).
 
 ## 7. The honest conclusion
 
-There is **no technique** that traverses an address-and-port-dependent symmetric
-NAT with random port allocation, short of impractical brute force. Linux
-`MASQUERADE` is exactly that NAT, which is why every strategy above falls back to
-the relay against it — and why production peer-to-peer systems (tailscale,
+There is **no client-side or observation** technique that traverses an
+address-and-port-dependent symmetric NAT with random port allocation, short of
+impractical brute force. Linux `MASQUERADE` is exactly that NAT, which is why
+every *punch* strategy above falls back to the relay against it. The escape
+hatch is `--port-map`: if the router speaks PCP/NAT-PMP it installs an explicit
+forward and the punch succeeds (demonstrated in `PORTMAP=1`). Otherwise it — and why production peer-to-peer systems (tailscale,
 libp2p, WebRTC/ICE) all keep a relay (TURN) fallback and accept that a fraction
 of pairs never punch. straw's strategies push the boundary outward to several
 *easier* symmetric classes that real routers commonly have; the relay covers the
@@ -273,6 +306,7 @@ rest.
 
 ```
 strawcat --punch-strategy basic|predict|birthday|relay-assisted   # peer side
+strawcat --port-map                                               # ask the router (PCP/NAT-PMP) for a forward
 straw    --udp-bind-observe                                        # relay side (relay-assisted; needs CAP_NET_RAW)
 ```
 
@@ -283,6 +317,7 @@ sudo scripts/nat-punch-test.sh                                  # symmetric MASQ
 sudo NAT_MODE=cone scripts/nat-punch-test.sh                    # EIM 1:1 NETMAP → direct punch asserted
 sudo STRATEGY=relay-assisted scripts/nat-punch-test.sh          # also sets --udp-bind-observe
 sudo STRATEGY=predict NAT_MODE=symmetric scripts/nat-punch-test.sh
+sudo PORTMAP=1 NAT_MODE=symmetric scripts/nat-punch-test.sh    # PCP/NAT-PMP → punch asserted
 ```
 
 **Code**
@@ -298,6 +333,8 @@ sudo STRATEGY=predict NAT_MODE=symmetric scripts/nat-punch-test.sh
 | Client capsule surfacing | `src/client.rs` (`into_relay_socket`) |
 | Session config | `src/p2p/session.rs` (`PunchConfig`) |
 | Relay flag | `src/config.rs` (`udp_bind_observe`), `src/main.rs` |
+| PCP / NAT-PMP client | `src/p2p/portmap.rs` (`map_udp`); `Mapped` candidate in `p2p/wire.rs` |
+| Harness PCP/NAT-PMP responder | `scripts/natpmp-stub.py` (`PORTMAP=1`) |
 
 **Wire additions (provisional codepoints, subject to the §9 standards swap)**
 

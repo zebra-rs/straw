@@ -33,6 +33,7 @@ NSES="natpunch_pa natpunch_na natpunch_r natpunch_nb natpunch_pb"
 cleanup() {
     set +e
     pkill -f "$BIN/strawcat" 2>/dev/null; pkill -f "$BIN/straw " 2>/dev/null
+    pkill -f natpmp-stub.py 2>/dev/null
     for ns in $NSES; do ip netns del $ns 2>/dev/null; done
     set -e
 }
@@ -99,6 +100,18 @@ STRATEGY=${STRATEGY:-basic}
 OBSERVE_FLAG=""
 [ "$STRATEGY" = relay-assisted ] && OBSERVE_FLAG="--udp-bind-observe"
 echo "  STRATEGY=$STRATEGY${OBSERVE_FLAG:+ (relay observer on)}"
+# PORTMAP=1 runs a PCP/NAT-PMP responder in each NAT that installs an explicit
+# 1:1 port-forward on request, and passes --port-map to the peers.
+PORTMAP=${PORTMAP:-0}
+PORTMAP_FLAG=""
+if [ "$PORTMAP" = 1 ]; then
+    PORTMAP_FLAG="--port-map"
+    STUB="$(dirname "$(readlink -f "$0")")/natpmp-stub.py"
+    ip netns exec natpunch_na python3 "$STUB" --public-ip 192.0.2.2 --iface public --relay-ip 192.0.2.1 >"$OUT/np_natpmp_a.log" 2>&1 &
+    ip netns exec natpunch_nb python3 "$STUB" --public-ip 192.0.2.6 --iface public --relay-ip 192.0.2.1 >"$OUT/np_natpmp_b.log" 2>&1 &
+    sleep 0.4
+    echo "  PORTMAP=1 — NAT-PMP/PCP responders on natA/natB; peers use --port-map"
+fi
 
 log "sanity"
 ip netns exec natpunch_pa ping -c1 -W2 192.0.2.1 >/dev/null && echo "  peerA → relay OK" || fail "peerA → relay"
@@ -128,7 +141,7 @@ log "peerA listens (issuer)"
 ( printf 'HELLO-FROM-A\n'; sleep "$HOLD" ) | ip netns exec natpunch_pa env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" listen --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
+    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" $PORTMAP_FLAG \
     >"$OUT/np_listen.out" 2>"$OUT/np_listen.err" &
 LISTEN_PID=$!
 for _ in $(seq 100); do [ -s "$OUT/np_listen.out" ] && break; sleep 0.1; done
@@ -139,7 +152,7 @@ log "peerB connects (holder)"
 ( printf 'HELLO-FROM-B\n'; sleep "$HOLD" ) | ip netns exec natpunch_pb env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" connect "$TOKEN" --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
+    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" $PORTMAP_FLAG \
     >"$OUT/np_connect.out" 2>"$OUT/np_connect.err" || true
 wait "$LISTEN_PID" 2>/dev/null || true
 sleep 1
@@ -174,6 +187,9 @@ if [ "$PUNCHED" = 1 ]; then
     ok "direct path established — both peers punched through the NAT"
 elif [ "$NAT_MODE" = cone ]; then
     fail "cone (EIM) NAT must allow the punch, but a peer stayed on the relay"
+    DATA_OK=0
+elif [ "$PORTMAP" = 1 ]; then
+    fail "port-map (explicit forward) must allow the punch, but a peer stayed on the relay"
     DATA_OK=0
 else
     echo "  no direct path — both peers stayed on the relay (symmetric NAT blocked the punch)"

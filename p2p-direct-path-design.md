@@ -302,7 +302,7 @@ Tokens carry `v`, so old and new peers fail cleanly, never confusingly.
 | P0 | Core relay + strawcat client (existing PLAN Phases 2–3 + smoltcp client + hairpin forwarding) | — | already planned |
 | P1 ✅ **complete** | `udp_bind/` at relay **(done: `udp_bind/{context,alloc,socket,handler}.rs` + `:protocol` dispatch + demux routing; relays UDP end to end)**; token v2 **(done: `p2p/token.rs`)**; peer identity + SPKI pinning **(done: `p2p/identity.rs`)**; inner QUIC through relay (Phase A+B); `strawcat/1` ALPN pipes | P0 | ~2–3 weeks |
 | P2 | OBSERVED_ADDRESS capsule; candidates, punch, path state machine (Phase C+D) | P1 | ~2–3 weeks |
-| P3 | Inner CONNECT-IP **(VPN mode done: `strawcat --vpn`, `src/p2p/vpn.rs`)**; PCP/NAT-PMP; v2 standards swap as gates clear | P2 | open-ended |
+| P3 | Inner CONNECT-IP **(VPN mode done: `strawcat --vpn`, `src/p2p/vpn.rs`)**; PCP/NAT-PMP **(done: `strawcat --port-map`, `p2p/portmap.rs`)**; v2 standards swap as gates clear | P2 | open-ended |
 
 P1 ships user-visible value on its own (E2E privacy; relay = untrusted forwarder). P2 ships the bandwidth/latency win.
 

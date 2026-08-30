@@ -54,6 +54,9 @@ pub struct PunchConfig {
     /// Peer-facing sources the on-path relay signalled (relay-assisted); a
     /// shared list a pump task fills and the punch reads.
     pub peer_reflexive: Option<StdArc<Mutex<Vec<SocketAddr>>>>,
+    /// Ask the router (PCP / NAT-PMP) to forward the punch socket, advertising
+    /// the mapped address as a candidate (design §11 / P3).
+    pub port_map: bool,
 }
 
 /// The inputs the manager needs to punch, held for the session's life.
@@ -183,6 +186,7 @@ async fn manage(
             strategy: params.cfg.strategy,
             relay_access: params.cfg.relay_access.clone(),
             peer_reflexive: params.cfg.peer_reflexive.clone(),
+            port_map: params.cfg.port_map,
         };
         match holepunch::coordinate(inputs).await {
             Ok(d) => {
