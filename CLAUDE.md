@@ -46,7 +46,7 @@ Planned module structure (from design doc):
 Binaries: `straw` (proxy), `strawc` (client daemon: TUN device + kernel
 routes, the actual VPN client), `test_client` (synthetic-packet harness;
 exits non-zero unless every echo got a genuine echo back, so BDD can assert
-on it), `strawcat` (P2P peer: `genkey`/`listen`/`connect`).
+on it), `strawcat` (P2P peer: `genkey`/`listen`/`connect`, plus `--vpn` IP-tunnel mode).
 
 Key design decisions:
 - quinn + h3 stack (pure Rust, async tokio-native) over quiche
@@ -141,6 +141,20 @@ direct (punched) path has no such limit; it runs over a real socket.
 `pipe_stdio` in `strawcat` awaits **both** directions (never aborts the
 upload): aborting drops the `SendStream` unfinished, which quinn turns into a
 stream reset that discards buffered bytes the peer never sees.
+
+**VPN mode (P3)** — `strawcat --vpn` runs straw's own RFC 9484 CONNECT-IP stack
+over the peer connection instead of piping stdio, giving a real IP tunnel
+between the two hosts (`src/p2p/vpn.rs`; needs ambient `CAP_NET_ADMIN`). The
+listener is the tunnel **server** (`run_server`: a minimal `ProxyContext` + TUN,
+runs `server::handle_connection` over the inner conn, assigns from
+`--vpn-subnet`, default `10.9.0.0/24`); the connector is the **client**
+(`run_client`: `TunnelClient::over_connection` — the h3 client over an existing
+`quinn::Connection` — + TUN). The client **scopes the tunnel to the VPN subnet**
+(`--vpn-subnet` as the flow scope, §8.3) so the server advertises only that
+route — a full/default tunnel would capture the peer connection's own transport
+and dead-lock it. It rides whichever path the `Session` picked (relay or
+punched). `scripts/vpn-test.sh` is the netns proof: two peers, relay in the
+middle, ping across the tunnel.
 
 **The punch reuses the outer bind socket** (`peer::listen`/`connect` expose
 `punch_endpoint`, the real UDP socket whose NAT mapping the relay observed as

@@ -115,7 +115,7 @@ pub fn spawn_idle_reaper(ctx: Arc<ProxyContext>) -> Option<tokio::task::JoinHand
     }))
 }
 
-async fn handle_connection(
+pub async fn handle_connection(
     conn: quinn::Connection,
     conn_seq: u64,
     ctx: Arc<ProxyContext>,
