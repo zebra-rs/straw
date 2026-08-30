@@ -118,6 +118,12 @@ struct RelayArgs {
     /// support it (design §11 / P3).
     #[arg(long)]
     port_map: bool,
+
+    /// Run RFC 5780 NAT-mapping detection against this STUN server first and
+    /// report the class (a symmetric NAT will not punch — use --port-map or
+    /// expect relay fallback).
+    #[arg(long)]
+    stun_detect: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -151,6 +157,7 @@ async fn run() -> Result<(), ProxyError> {
 }
 
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
+    report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
     let sink = peer_reflexive_sink(&args);
     let listener = peer::listen(relay_access(&args)?, &identity, None, sink.clone()).await?;
@@ -209,6 +216,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
 }
 
 async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
+    report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
     let token = TokenV2::decode(&token)?;
     if token.is_expired(now()) {
@@ -282,6 +290,26 @@ async fn pipe_stdio(
     });
     let _ = tokio::join!(up, down);
     Ok(())
+}
+
+/// Detect and report the NAT's mapping behaviour (RFC 5780), if a STUN server
+/// was given, before establishing the connection.
+async fn report_nat_mapping(args: &RelayArgs) {
+    let Some(server) = args.stun_detect else {
+        return;
+    };
+    match straw::p2p::stun::detect_mapping(server).await {
+        Ok(m) => {
+            eprintln!("NAT mapping: {}", m.as_str());
+            if !m.is_punchable() {
+                eprintln!(
+                    "  -> symmetric NAT: the basic punch will not traverse it; \
+                     use --port-map or expect relay fallback"
+                );
+            }
+        }
+        Err(e) => eprintln!("NAT detection failed: {e}"),
+    }
 }
 
 /// Build the strategy config: predict/birthday need relay access to open

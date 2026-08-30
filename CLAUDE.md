@@ -207,6 +207,13 @@ by `sudo PORTMAP=1 scripts/nat-punch-test.sh` (a `scripts/natpmp-stub.py`
 responder installs a 1:1 iptables forward; the punch then succeeds through the
 symmetric double NAT).
 
+`strawcat --stun-detect <server>` runs RFC 5780 NAT-behaviour discovery
+(`p2p/stun.rs`) against the relay's dual-address STUN server (`straw
+--stun-addr/--stun-alt-addr`, four UDP sockets on two IPs) to classify the NAT
+(endpoint-independent / address-dependent / address-and-port-dependent) *before*
+punching — so a symmetric verdict skips the futile punch and goes to --port-map
+or the relay.
+
 **Honest result: none of these traverse the netns MASQUERADE** — it is the
 worst case (address-AND-port-dependent filtering *and* random per-destination
 allocation). predict detects "random" and relays; birthday's window is far too

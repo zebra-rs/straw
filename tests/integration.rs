@@ -1673,3 +1673,23 @@ async fn port_map_requests_a_forward_via_pcp() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn stun_detects_endpoint_independent_over_loopback() {
+    // The relay's RFC 5780 STUN server on two loopback IPs; a client detects
+    // its mapping behaviour end to end. Loopback has no NAT, so the reflexive
+    // is the same for every destination — endpoint-independent (cone).
+    use straw::p2p::stun::{self, NatMapping};
+    let primary: std::net::SocketAddr = "127.0.0.1:34790".parse().unwrap();
+    let alternate: std::net::SocketAddr = "127.0.0.2:34791".parse().unwrap();
+    tokio::spawn(async move {
+        let _ = stun::serve(primary, alternate).await;
+    });
+    // Let the four sockets bind.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mapping = stun::detect_mapping(primary)
+        .await
+        .expect("detection completes against the STUN server");
+    assert_eq!(mapping, NatMapping::EndpointIndependent);
+    assert!(mapping.is_punchable());
+}

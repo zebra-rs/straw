@@ -201,6 +201,16 @@ async fn run() -> Result<(), ProxyError> {
     // Graceful shutdown (Step 29): SIGINT/SIGTERM -> stop accepting, GOAWAY
     // established connections, drain within the grace period, then close.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // RFC 5780 STUN server (NAT behaviour discovery), if configured.
+    if let (Some(primary), Some(alternate)) = (ctx.config.stun_addr, ctx.config.stun_alt_addr) {
+        tracing::info!(%primary, %alternate, "RFC 5780 STUN server enabled");
+        tokio::spawn(async move {
+            if let Err(e) = straw::p2p::stun::serve(primary, alternate).await {
+                tracing::warn!("STUN server stopped: {e}");
+            }
+        });
+    }
+
     let server = tokio::spawn(run_server(endpoint.clone(), ctx.clone(), shutdown_rx));
 
     wait_for_termination().await;
