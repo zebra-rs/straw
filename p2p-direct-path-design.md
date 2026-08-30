@@ -1,6 +1,6 @@
 # Straw P2P Direct Path — Design
 
-Status: **Draft for review** · Depends on: `rfc9484-proxy-design.md` (Phases 2–3), `PLAN-TEST-CLIENT.md` · Date: 2026-08-30
+Status: **P1 in progress** (trust model landed: `src/p2p/{identity,token}.rs`) · Depends on: `rfc9484-proxy-design.md` (Phases 2–3), `PLAN-TEST-CLIENT.md` · Date: 2026-08-30
 
 This document designs the peer-to-peer extension to straw: two "strawcat" peers that today would exchange packets by hairpin-forwarding through a straw relay upgrade to a **direct, end-to-end encrypted QUIC connection**, keeping the relay as rendezvous and fallback. It closes the two gaps identified against tailcat: (1) the relay sees tunneled plaintext, and (2) the relay stays in the data path forever.
 
@@ -288,7 +288,7 @@ Tokens carry `v`, so old and new peers fail cleanly, never confusingly.
 | Phase | Scope | Depends on | Size |
 |-------|-------|-----------|------|
 | P0 | Core relay + strawcat client (existing PLAN Phases 2–3 + smoltcp client + hairpin forwarding) | — | already planned |
-| P1 | `udp_bind/` at relay; token v2; inner QUIC through relay (Phase A+B); `strawcat/1` ALPN pipes | P0 | ~2–3 weeks |
+| P1 | `udp_bind/` at relay; token v2 **(done: `p2p/token.rs`)**; peer identity + SPKI pinning **(done: `p2p/identity.rs`)**; inner QUIC through relay (Phase A+B); `strawcat/1` ALPN pipes | P0 | ~2–3 weeks |
 | P2 | OBSERVED_ADDRESS capsule; candidates, punch, path state machine (Phase C+D) | P1 | ~2–3 weeks |
 | P3 | Inner CONNECT-IP (VPN mode between peers); PCP/NAT-PMP; v2 standards swap as gates clear | P2 | open-ended |
 

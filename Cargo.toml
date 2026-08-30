@@ -10,6 +10,7 @@ default-run = "straw"
 [dependencies]
 base64 = "0.23.1"
 bytes = "1"
+ciborium = "0.2.2"
 clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
 h3 = "0.0.8"
@@ -21,6 +22,7 @@ rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "
 ring = "0.17.14"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_bytes = "0.11"
 thiserror = "2"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.4"
