@@ -81,12 +81,6 @@ struct RelayArgs {
     #[arg(long, default_value_t = 86_400)]
     ttl: u64,
 
-    /// Local address the hole-punch socket binds to. Use an interface IP (or
-    /// 127.0.0.1 for a same-host demo); 0.0.0.0 advertises no usable host
-    /// candidate, leaving only the reflexive/relay paths.
-    #[arg(long, default_value = "0.0.0.0:0")]
-    punch_addr: std::net::SocketAddr,
-
     /// Seconds to wait for a direct path before piping over the relay.
     #[arg(long, default_value_t = 5)]
     punch_wait: u64,
@@ -127,6 +121,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let listener = peer::listen(relay_access(&args)?, &identity, None).await?;
     let reflexive = listener.reflexive;
     let relay_paddr = listener.paddr;
+    let punch_endpoint = listener.punch_endpoint.clone();
 
     // Mint and print a token the other peer connects with. The relay pin and
     // credential are placeholders in v1 (the holder reaches the relay with
@@ -155,7 +150,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
         false,
         identity,
         None,
-        args.punch_addr,
+        punch_endpoint,
         reflexive,
         relay_paddr,
     );
@@ -181,7 +176,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         true,
         identity,
         Some(token.peer_pin()),
-        args.punch_addr,
+        peer_conn.punch_endpoint,
         peer_conn.reflexive,
         peer_conn.relay_paddr,
     );

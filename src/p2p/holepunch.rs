@@ -19,7 +19,7 @@ use std::time::Duration;
 use crate::error::ProxyError;
 use crate::p2p::candidates::{Sources, gather};
 use crate::p2p::identity::{Identity, SpkiPin};
-use crate::p2p::punch::Puncher;
+use crate::p2p::punch::{self, Puncher};
 use crate::p2p::wire::{Candidate, Control};
 
 /// Total time to spend punching before falling back to the relay.
@@ -87,35 +87,31 @@ pub async fn coordinate(
     initiator: bool,
     identity: &Identity,
     peer_pin: Option<SpkiPin>,
-    bind_addr: SocketAddr,
+    punch_endpoint: quinn::Endpoint,
     reflexive: Option<SocketAddr>,
     relay: SocketAddr,
 ) -> Result<Direct, ProxyError> {
-    // Bind the punch socket to a concrete address, not the wildcard, so its
-    // local address is a usable host candidate. Production callers pass an
-    // interface IP (loopback in tests); the reflexive candidate covers the
-    // NAT case.
-    let puncher = Puncher::new(bind_addr, identity, peer_pin)?;
+    // Punch on the *outer* bind socket — the one whose NAT mapping the relay
+    // observed as our reflexive. Its source therefore matches the reflexive we
+    // advertise (endpoint-independent NATs keep one mapping per socket across
+    // destinations), so the simultaneous open reaches the peer. A fresh socket
+    // would get a different, unadvertised mapping (design §5.3, §12). Pin the
+    // now-known peer key on the accept side.
+    punch_endpoint.set_server_config(Some(punch::build_server_config(identity, peer_pin)?));
+    let puncher = Puncher::on_endpoint(punch_endpoint.clone(), identity, peer_pin)?;
     let host = puncher.local_addr()?;
 
-    // A wildcard bind (0.0.0.0) yields no usable host candidate. Offer a host
-    // candidate only when bound to a concrete interface (LAN-adjacent peers).
+    // The outer socket is bound to the wildcard, so its local address is not a
+    // usable host candidate; offer one only if bound to a concrete interface.
     let host_cands = if host.ip().is_unspecified() {
         vec![]
     } else {
         vec![host]
     };
-    // Predict the punch socket's *own* server-reflexive address. The relay's
-    // OBSERVED_ADDRESS reports the outer connection's mapping; a fresh punch
-    // socket gets a different one, but under a port-preserving NAT (Linux
-    // default) the public port equals the socket's local port, so the punch
-    // reflexive is (observed public IP, punch local port). This is what makes
-    // the simultaneous open reach the peer through the NAT.
-    let punch_reflexive = reflexive.map(|obs| SocketAddr::new(obs.ip(), host.port()));
 
     let local = gather(&Sources {
         host: host_cands,
-        reflexive: punch_reflexive,
+        reflexive,
         relay,
     });
     tracing::debug!(?local, "punch: local candidates");

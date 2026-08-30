@@ -1398,6 +1398,8 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
         .await
         .unwrap();
     let issuer_paddr = listener.paddr;
+    let issuer_punch = listener.punch_endpoint.clone();
+    let issuer_reflexive = listener.reflexive;
     let token = TokenV2::issue(
         "h3://relay.test:443".into(),
         [0u8; 32],
@@ -1422,8 +1424,8 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
             false,
             &issuer_id,
             Some(holder_id.pin()),
-            "127.0.0.1:0".parse().unwrap(),
-            None,
+            issuer_punch,
+            issuer_reflexive,
             issuer_paddr,
         ),
         holepunch::coordinate(
@@ -1431,8 +1433,8 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
             true,
             &holder_id,
             Some(issuer_id.pin()),
-            "127.0.0.1:0".parse().unwrap(),
-            None,
+            holder_side.punch_endpoint.clone(),
+            holder_side.reflexive,
             issuer_paddr,
         ),
     );
@@ -1463,6 +1465,8 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         .await
         .unwrap();
     let issuer_paddr = listener.paddr;
+    let issuer_punch = listener.punch_endpoint.clone();
+    let issuer_reflexive = listener.reflexive;
     let token = TokenV2::issue(
         "h3://r:443".into(),
         [0u8; 32],
@@ -1486,8 +1490,8 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         false,
         Arc::new(issuer),
         Some(holder_pin),
-        "127.0.0.1:0".parse().unwrap(),
-        None,
+        issuer_punch,
+        issuer_reflexive,
         issuer_paddr,
     );
     let holder_sess = Session::start(
@@ -1495,8 +1499,8 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         true,
         Arc::new(holder),
         Some(issuer_pin),
-        "127.0.0.1:0".parse().unwrap(),
-        None,
+        holder_side.punch_endpoint.clone(),
+        holder_side.reflexive,
         issuer_paddr,
     );
 
