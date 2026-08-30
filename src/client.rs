@@ -701,6 +701,53 @@ impl BindClient {
         let _ = self.stream.finish().await;
         self.conn.close(0u32.into(), b"done");
     }
+
+    /// Turn this bind session into a [`RelaySocket`](crate::p2p::relay_socket::RelaySocket):
+    /// a `quinn::AsyncUdpSocket` an inner-QUIC endpoint runs over (design
+    /// §4). The spawned pump owns the request stream — keeping the relay
+    /// session open — and decapsulates inbound datagrams into the socket.
+    pub fn into_relay_socket(self) -> Arc<crate::p2p::relay_socket::RelaySocket> {
+        use crate::capsule::codec::read_varint;
+        use crate::udp_bind::context::decode_uncompressed_body;
+        use bytes::Buf as _;
+
+        let BindClient {
+            _endpoint,
+            _send_request,
+            conn,
+            stream,
+            qsid,
+            uncompressed,
+            public_addr,
+            contexts: _,
+        } = self;
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let conn_rx = conn.clone();
+        let recv = tokio::spawn(async move {
+            // Hold the session's resources open for the socket's lifetime.
+            let _stream = stream;
+            let _endpoint = _endpoint;
+            let _send_request = _send_request;
+            loop {
+                let wire = match conn_rx.read_datagram().await {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+                let mut cursor = wire.clone();
+                let Ok(got) = read_varint(&mut cursor) else {
+                    continue;
+                };
+                if got != qsid {
+                    continue;
+                }
+                let body = wire.slice(wire.len() - cursor.remaining()..);
+                if let Ok((_, remote, payload)) = decode_uncompressed_body(body) {
+                    let _ = tx.try_send((remote, payload));
+                }
+            }
+        });
+        crate::p2p::relay_socket::RelaySocket::new(conn, qsid, uncompressed, public_addr, rx, recv)
+    }
 }
 
 /// Apply request credentials to an Extended CONNECT builder.

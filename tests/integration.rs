@@ -6,6 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::CertificateDer;
 use straw::address_pool::AddressPool;
 use straw::capsule::{IpAddressRange, RequestedAddress};
@@ -17,6 +18,7 @@ use straw::forwarding::limiter::RateLimits;
 use straw::forwarding::packet::{build_ipv4_icmp_echo, build_ipv6_icmpv6_echo, parse_packet};
 use straw::forwarding::router::RouteTable;
 use straw::metrics::Metrics;
+use straw::p2p::relay_socket::inner_endpoint;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
 use straw::session::auth::Authenticator;
@@ -1056,4 +1058,81 @@ async fn connect_udp_is_refused_when_bind_disabled() {
         Ok(_) => panic!("expected a 501 rejection, bind succeeded"),
         Err(e) => panic!("expected a 501 rejection, got {e}"),
     }
+}
+
+#[tokio::test]
+async fn inner_quic_connects_peer_to_peer_through_the_relay() {
+    // Two peers, each a bind session at one relay; an inner QUIC connection
+    // handshakes and carries a stream between them, the relay forwarding
+    // ciphertext it cannot read (design §4, Phase B).
+    let server = TestServer::start_with(enable_bind).await;
+
+    let a = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .expect("peer A bind");
+    let b = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .expect("peer B bind");
+    let b_pub = b.public_addr;
+
+    let sock_a = a.into_relay_socket();
+    let sock_b = b.into_relay_socket();
+
+    // Inner TLS: self-signed, verification skipped — this test isolates the
+    // transport; SPKI-pinned RFC 7250 mTLS is the identity layer on top.
+    let (icert, ikey) = straw::tls::generate_self_signed_cert(&["peer"]).unwrap();
+    let inner_server = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(straw::tls::build_server_tls_config(vec![icert], ikey).unwrap())
+            .unwrap(),
+    ));
+    let ep_b = inner_endpoint(sock_b, Some(inner_server)).unwrap();
+    let ep_a = inner_endpoint(sock_a, None).unwrap();
+
+    // B accepts the inner connection.
+    let accept = tokio::spawn(async move {
+        let incoming = ep_b.accept().await.expect("inner incoming");
+        let conn = incoming.await.expect("inner accept");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept stream");
+        let msg = recv.read_to_end(64).await.expect("read");
+        send.write_all(&msg).await.expect("echo");
+        send.finish().unwrap();
+        // Hold the connection open until the client is done.
+        conn.closed().await;
+    });
+
+    // A dials B at its relay-public address.
+    let client_cfg = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(straw::tls::build_client_tls_config_insecure().unwrap())
+            .unwrap(),
+    ));
+    let conn_a = tokio::time::timeout(
+        Duration::from_secs(10),
+        ep_a.connect_with(client_cfg, b_pub, "peer").expect("dial"),
+    )
+    .await
+    .expect("inner handshake within 10s")
+    .expect("inner connected");
+
+    let (mut send, mut recv) = conn_a.open_bi().await.expect("open stream");
+    send.write_all(b"hello-peer").await.unwrap();
+    send.finish().unwrap();
+    let echoed = recv.read_to_end(64).await.expect("read echo");
+    assert_eq!(
+        &echoed[..],
+        b"hello-peer",
+        "stream round-trips peer to peer"
+    );
+
+    conn_a.close(0u32.into(), b"done");
+    let _ = accept.await;
 }

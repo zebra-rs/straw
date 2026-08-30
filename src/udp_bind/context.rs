@@ -259,6 +259,28 @@ impl std::fmt::Display for ContextError {
     }
 }
 
+/// Encode an uncompressed HTTP Datagram body — `context_id`, then the
+/// remote `(version, address, port)`, then the UDP payload — without a
+/// [`ContextTable`]. The relay-socket hot path uses this to avoid locking a
+/// table on every packet; the peer registers only the uncompressed context,
+/// so this is the only framing it emits.
+pub fn encode_uncompressed_body(context_id: u64, remote: SocketAddr, payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(1 + 19 + payload.len());
+    write_varint(&mut buf, context_id).expect("context id fits varint");
+    put_addr(&mut buf, remote);
+    buf.extend_from_slice(payload);
+    buf.freeze()
+}
+
+/// Decode an uncompressed HTTP Datagram body produced by
+/// [`encode_uncompressed_body`], returning `(context_id, remote, payload)`.
+pub fn decode_uncompressed_body(mut body: Bytes) -> Result<(u64, SocketAddr, Bytes), DecodeError> {
+    let context_id = read_varint(&mut body)?;
+    let version = get_u8(&mut body)?;
+    let remote = get_addr(&mut body, version)?;
+    Ok((context_id, remote, body))
+}
+
 // ── address (de)serialization: version (u8) + address + port (u16) ──────
 
 fn put_addr(buf: &mut BytesMut, addr: SocketAddr) {
@@ -451,6 +473,17 @@ mod tests {
             t.decode_datagram(buf.freeze()),
             Err(ContextError::Unknown(8))
         );
+    }
+
+    #[test]
+    fn uncompressed_body_free_helpers_round_trip() {
+        for remote in [v4("198.51.100.7:9000"), v6("[2001:db8::9]:443")] {
+            let body = encode_uncompressed_body(2, remote, b"inner-quic-initial");
+            let (id, got, payload) = decode_uncompressed_body(body).unwrap();
+            assert_eq!(id, 2);
+            assert_eq!(got, remote);
+            assert_eq!(&payload[..], b"inner-quic-initial");
+        }
     }
 
     #[test]
