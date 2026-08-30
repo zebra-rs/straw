@@ -115,6 +115,27 @@ pub struct PunchInputs<'a> {
     /// Peer-facing sources the on-path relay observed and signalled
     /// (relay-assisted); a growing shared list read each attempt.
     pub peer_reflexive: Option<StdArc<Mutex<Vec<SocketAddr>>>>,
+    /// Ask the router for a PCP/NAT-PMP forward and advertise it (design §11).
+    pub port_map: bool,
+}
+
+/// If `enabled`, ask the router to forward `endpoint`'s socket and return the
+/// mapped external address to advertise. Best-effort: any failure yields `None`.
+async fn mapped_candidate(endpoint: &quinn::Endpoint, enabled: bool) -> Option<SocketAddr> {
+    if !enabled {
+        return None;
+    }
+    let port = endpoint.local_addr().ok()?.port();
+    match crate::p2p::portmap::map_udp(port, std::time::Duration::from_secs(120)).await {
+        Ok(m) => {
+            tracing::info!(external = %m.external, "port-map: router installed a forward");
+            Some(m.external)
+        }
+        Err(e) => {
+            tracing::debug!("port-map: no forward ({e})");
+            None
+        }
+    }
 }
 
 /// Reuse the outer bind socket and advertise the relay-observed reflexive —
@@ -128,8 +149,13 @@ async fn strategy_basic(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError> {
         punch_endpoint,
         reflexive,
         relay,
+        port_map,
         ..
     } = inputs;
+
+    // Ask the router for an explicit forward before pinning the endpoint's
+    // server config (mapping and punching share the same socket).
+    let mapped = mapped_candidate(&punch_endpoint, port_map).await;
 
     // Punch on the outer socket so its source matches the advertised reflexive;
     // pin the now-known peer key on the accept side.
@@ -137,11 +163,18 @@ async fn strategy_basic(inputs: PunchInputs<'_>) -> Result<Direct, ProxyError> {
     let puncher = Puncher::on_endpoint(punch_endpoint.clone(), identity, peer_pin)?;
     let host = host_candidate(&puncher)?;
 
-    let local = gather(&Sources {
+    let mut local = gather(&Sources {
         host,
         reflexive,
         relay,
     });
+    if let Some(addr) = mapped {
+        local.push(Candidate {
+            seq: local.len() as u32,
+            addr,
+            kind: CandidateKind::Mapped,
+        });
+    }
     tracing::debug!(?local, "punch: local candidates");
     let remote = exchange_candidates(inner, &local, initiator).await?;
     tracing::debug!(?remote, "punch: remote candidates");

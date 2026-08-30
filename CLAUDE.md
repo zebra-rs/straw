@@ -199,6 +199,14 @@ So real cone NATs (most home routers) punch with the outer-socket reuse alone.
   *peer-facing* source off the forwarded punch packets and signals it to the
   other peer as a PEER_REFLEXIVE capsule (0x15), which dials it.
 
+`strawcat --port-map` (orthogonal to the strategy) asks the router for an
+explicit PCP (RFC 6887) / NAT-PMP (RFC 6886) UDP forward (`p2p/portmap.rs`) and
+advertises the mapped address as a `Mapped` candidate — the one approach that
+*reliably* traverses a symmetric NAT, when the router supports it. Demonstrated
+by `sudo PORTMAP=1 scripts/nat-punch-test.sh` (a `scripts/natpmp-stub.py`
+responder installs a 1:1 iptables forward; the punch then succeeds through the
+symmetric double NAT).
+
 **Honest result: none of these traverse the netns MASQUERADE** — it is the
 worst case (address-AND-port-dependent filtering *and* random per-destination
 allocation). predict detects "random" and relays; birthday's window is far too

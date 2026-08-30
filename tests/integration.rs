@@ -1429,6 +1429,7 @@ async fn predict_strategy_runs_and_establishes_a_path() {
             strategy: PunchStrategy::Predict,
             relay_access: Some(ra.clone()),
             peer_reflexive: None,
+            port_map: false,
         }),
         holepunch::coordinate(holepunch::PunchInputs {
             inner: &holder_side.conn,
@@ -1441,6 +1442,7 @@ async fn predict_strategy_runs_and_establishes_a_path() {
             strategy: PunchStrategy::Predict,
             relay_access: Some(ra.clone()),
             peer_reflexive: None,
+            port_map: false,
         }),
     );
     let issuer_direct = issuer_direct.expect("issuer gets a direct path (predict)");
@@ -1503,6 +1505,7 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
             strategy: PunchStrategy::Basic,
             relay_access: None,
             peer_reflexive: None,
+            port_map: false,
         }),
         holepunch::coordinate(holepunch::PunchInputs {
             inner: &holder_side.conn,
@@ -1515,6 +1518,7 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
             strategy: PunchStrategy::Basic,
             relay_access: None,
             peer_reflexive: None,
+            port_map: false,
         }),
     );
     let issuer_direct = issuer_direct.expect("issuer gets a direct path");
@@ -1621,5 +1625,51 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
         issuer_sess.connection().stable_id(),
         issuer_relay.stable_id(),
         "back on the relay connection"
+    );
+}
+
+/// A tiny in-process PCP server that answers one MAP request with a fixed
+/// assigned external address (echoing the client's nonce).
+async fn pcp_stub(assigned_port: u16, assigned_ip: std::net::Ipv4Addr) -> std::net::SocketAddr {
+    use tokio::net::UdpSocket;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1100];
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            if n >= 60 && buf[0] == 2 {
+                let mut resp = vec![0u8; 60];
+                resp[0] = 2;
+                resp[1] = 0x81; // response | opcode MAP
+                resp[4..8].copy_from_slice(&3600u32.to_be_bytes());
+                resp[24..36].copy_from_slice(&buf[24..36]); // echo nonce
+                resp[42..44].copy_from_slice(&assigned_port.to_be_bytes());
+                resp[54] = 0xff;
+                resp[55] = 0xff;
+                resp[56..60].copy_from_slice(&assigned_ip.octets());
+                let _ = sock.send_to(&resp, from).await;
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn port_map_requests_a_forward_via_pcp() {
+    // The PCP/NAT-PMP client sends a MAP request and returns the router's
+    // assigned external address — the candidate a peer behind a symmetric NAT
+    // advertises so the far side can reach it through an explicit forward.
+    let stub = pcp_stub(50000, "198.51.100.7".parse().unwrap()).await;
+    let mapping = straw::p2p::portmap::map_udp_via(stub, 41000, Duration::from_secs(120))
+        .await
+        .expect("stub grants the mapping");
+    assert_eq!(
+        mapping.external,
+        "198.51.100.7:50000"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
     );
 }

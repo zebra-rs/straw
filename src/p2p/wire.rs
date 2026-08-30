@@ -24,6 +24,10 @@ pub enum CandidateKind {
     Host,
     /// The peer's outer source as seen by the relay (from OBSERVED_ADDRESS).
     Reflexive,
+    /// An explicit port-mapping the router installed (PCP / NAT-PMP): the
+    /// gateway forwards this external address to our punch socket, so it is
+    /// reachable regardless of the NAT's mapping behaviour (design §11 / P3).
+    Mapped,
     /// The relay-allocated `paddr` — always present, already validated.
     Relay,
 }
@@ -33,6 +37,7 @@ impl CandidateKind {
     pub fn priority(self) -> u32 {
         match self {
             Self::Host => 126,
+            Self::Mapped => 110,
             Self::Reflexive => 100,
             Self::Relay => 0,
         }

@@ -18,6 +18,7 @@ pub mod holepunch;
 pub mod identity;
 pub mod inner_tls;
 pub mod peer;
+pub mod portmap;
 pub mod punch;
 pub mod relay_socket;
 pub mod session;
