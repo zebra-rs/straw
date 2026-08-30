@@ -110,6 +110,32 @@ pub struct ProxyConfig {
     /// Seconds to let sessions drain after SIGINT/SIGTERM before closing.
     #[arg(long, default_value_t = 5)]
     pub shutdown_grace_sec: u64,
+
+    /// Enable CONNECT-UDP bind mode (the P2P relay / TURN-equivalent).
+    /// Off by default: it makes straw an authenticated UDP relay, so it
+    /// requires --auth-mode other than none (design §7.4, §10).
+    #[arg(long)]
+    pub udp_bind: bool,
+
+    /// Public IPs to allocate bind-session (IP, port) tuples from.
+    #[arg(long, value_delimiter = ',')]
+    pub udp_bind_public_ips: Vec<std::net::IpAddr>,
+
+    /// Low end of the bind-session port range.
+    #[arg(long, default_value_t = 32768)]
+    pub udp_bind_port_lo: u16,
+
+    /// High end of the bind-session port range.
+    #[arg(long, default_value_t = 60999)]
+    pub udp_bind_port_hi: u16,
+
+    /// Per-bind-session egress packet rate cap (packets/sec); 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub udp_bind_max_pps: u64,
+
+    /// Per-bind-session egress byte rate cap (bytes/sec); 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    pub udp_bind_max_bps: u64,
 }
 
 impl Default for ProxyConfig {
@@ -138,6 +164,12 @@ impl Default for ProxyConfig {
             metrics_listen: None,
             nat_interface: None,
             shutdown_grace_sec: 5,
+            udp_bind: false,
+            udp_bind_public_ips: Vec::new(),
+            udp_bind_port_lo: 32768,
+            udp_bind_port_hi: 60999,
+            udp_bind_max_pps: 0,
+            udp_bind_max_bps: 0,
         }
     }
 }
@@ -171,6 +203,21 @@ impl ProxyConfig {
             _ => {}
         }
         self.basic_credentials()?;
+        if self.udp_bind {
+            if self.auth_mode == AuthMode::None {
+                return Err(ProxyError::Config(
+                    "--udp-bind requires authentication (no anonymous bind mode)".into(),
+                ));
+            }
+            if self.udp_bind_public_ips.is_empty() {
+                return Err(ProxyError::Config(
+                    "--udp-bind requires at least one --udp-bind-public-ips".into(),
+                ));
+            }
+            if self.udp_bind_port_lo > self.udp_bind_port_hi {
+                return Err(ProxyError::Config("udp-bind port range is inverted".into()));
+            }
+        }
         if self.nat_interface.is_some() && !self.tun {
             return Err(ProxyError::Config("--nat-interface requires --tun".into()));
         }
@@ -299,6 +346,7 @@ pub struct FileConfig {
     auth: Option<AuthSection>,
     limits: Option<LimitsSection>,
     metrics: Option<MetricsSection>,
+    udp_bind: Option<UdpBindSection>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -361,6 +409,17 @@ struct LimitsSection {
 #[serde(deny_unknown_fields)]
 struct MetricsSection {
     listen: Option<SocketAddr>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UdpBindSection {
+    enabled: Option<bool>,
+    public_ips: Option<Vec<std::net::IpAddr>>,
+    port_lo: Option<u16>,
+    port_hi: Option<u16>,
+    max_pps: Option<u64>,
+    max_bps: Option<u64>,
 }
 
 impl FileConfig {
@@ -440,6 +499,26 @@ impl FileConfig {
             }
             if let Some(v) = limits.max_byte_rate {
                 config.max_byte_rate = v;
+            }
+        }
+        if let Some(u) = self.udp_bind {
+            if let Some(v) = u.enabled {
+                config.udp_bind = v;
+            }
+            if let Some(v) = u.public_ips {
+                config.udp_bind_public_ips = v;
+            }
+            if let Some(v) = u.port_lo {
+                config.udp_bind_port_lo = v;
+            }
+            if let Some(v) = u.port_hi {
+                config.udp_bind_port_hi = v;
+            }
+            if let Some(v) = u.max_pps {
+                config.udp_bind_max_pps = v;
+            }
+            if let Some(v) = u.max_bps {
+                config.udp_bind_max_bps = v;
             }
         }
         if let Some(metrics) = self.metrics
