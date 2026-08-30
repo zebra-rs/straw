@@ -166,6 +166,29 @@ impl ContextTable {
         self.contexts.get(&context_id).copied()
     }
 
+    /// The active compressed context bound to `remote`, if one exists — the
+    /// preferred (smallest) framing for that remote.
+    pub fn compressed_context_for(&self, remote: SocketAddr) -> Option<u64> {
+        self.contexts
+            .iter()
+            .find_map(|(id, binding)| match binding {
+                Binding::Compressed(addr) if *addr == remote => Some(*id),
+                _ => None,
+            })
+    }
+
+    /// An active uncompressed context, if one is registered — the fallback
+    /// framing that spells the address out. `None` once it is closed, which
+    /// is what turns the relay into a firewall (design §7.3).
+    pub fn uncompressed_context(&self) -> Option<u64> {
+        self.contexts
+            .iter()
+            .find_map(|(id, binding)| match binding {
+                Binding::Uncompressed => Some(*id),
+                _ => None,
+            })
+    }
+
     /// Decode one datagram body against this table. The leading context id
     /// selects the addressing: an uncompressed context reads an explicit
     /// address, a compressed one supplies its bound remote.
