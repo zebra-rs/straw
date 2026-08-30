@@ -17,6 +17,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// QUIC PING interval on the direct path: NAT UDP bindings commonly expire at
+/// ~30s, so keep it alive well under that (design §6).
+const KEEPALIVE: Duration = Duration::from_secs(20);
+
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 
 use crate::error::ProxyError;
@@ -43,10 +47,18 @@ impl Puncher {
         let server = quinn::ServerConfig::with_crypto(Arc::new(
             QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
         ));
-        let client_config = quinn::ClientConfig::new(Arc::new(
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
         ));
-        let endpoint = quinn::Endpoint::server(server, bind_addr).map_err(|e| ProxyError::Io(e))?;
+        // Keepalive on both directions so the direct path holds its NAT
+        // binding once established (design §6).
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(KEEPALIVE));
+        let transport = Arc::new(transport);
+        client_config.transport_config(transport.clone());
+        let mut server = server;
+        server.transport_config(transport);
+        let endpoint = quinn::Endpoint::server(server, bind_addr).map_err(ProxyError::Io)?;
         Ok(Self {
             endpoint,
             client_config,

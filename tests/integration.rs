@@ -23,6 +23,7 @@ use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::relay_socket::inner_endpoint;
+use straw::p2p::session::{PathState, Session};
 use straw::p2p::token::TokenV2;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
@@ -1388,4 +1389,92 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
     s.finish().unwrap();
     let (_s2, mut r2) = issuer_direct.conn.accept_bi().await.unwrap();
     assert_eq!(&r2.read_to_end(16).await.unwrap()[..], b"direct!");
+}
+
+#[tokio::test]
+async fn session_upgrades_to_direct_then_falls_back_on_loss() {
+    // The path state machine: RELAY → PUNCHING → DIRECT, connection() tracks
+    // the best path, and killing the direct path reverts to the relay.
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
+        .await
+        .unwrap();
+    let issuer_paddr = listener.paddr;
+    let token = TokenV2::issue(
+        "h3://r:443".into(),
+        [0u8; 32],
+        "a".into(),
+        issuer.pin(),
+        vec![issuer_paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
+        .await
+        .unwrap();
+    let issuer_conn = accept.await.unwrap().unwrap();
+
+    let issuer_pin = issuer.pin();
+    let holder_pin = holder.pin();
+    let issuer_relay = issuer_conn.clone();
+    let issuer_sess = Session::start(
+        issuer_conn,
+        false,
+        issuer,
+        Some(holder_pin),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        issuer_paddr,
+    );
+    let holder_sess = Session::start(
+        holder_side.conn,
+        true,
+        holder,
+        Some(issuer_pin),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        issuer_paddr,
+    );
+
+    // Both reach DIRECT.
+    assert!(
+        issuer_sess.await_direct(Duration::from_secs(10)).await,
+        "issuer direct"
+    );
+    assert!(
+        holder_sess.await_direct(Duration::from_secs(10)).await,
+        "holder direct"
+    );
+    assert_eq!(issuer_sess.state(), PathState::Direct);
+
+    // connection() now returns the direct path, not the relay.
+    let direct = issuer_sess.connection();
+    assert!(direct.remote_address().ip().is_loopback());
+    assert_ne!(
+        direct.stable_id(),
+        issuer_relay.stable_id(),
+        "distinct from the relay conn"
+    );
+
+    // Kill the direct path from the holder side; the issuer session reverts.
+    holder_sess.connection().close(0u32.into(), b"drop direct");
+    let mut rx_state = PathState::Direct;
+    for _ in 0..50 {
+        if issuer_sess.state() == PathState::Relay {
+            rx_state = PathState::Relay;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rx_state, PathState::Relay, "issuer fell back to the relay");
+    // And connection() is the relay again.
+    assert_eq!(
+        issuer_sess.connection().stable_id(),
+        issuer_relay.stable_id(),
+        "back on the relay connection"
+    );
 }
