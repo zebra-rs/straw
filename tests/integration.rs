@@ -1424,7 +1424,7 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
     let issuer_sess = Session::start(
         issuer_conn,
         false,
-        issuer,
+        Arc::new(issuer),
         Some(holder_pin),
         "127.0.0.1:0".parse().unwrap(),
         None,
@@ -1433,7 +1433,7 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
     let holder_sess = Session::start(
         holder_side.conn,
         true,
-        holder,
+        Arc::new(holder),
         Some(issuer_pin),
         "127.0.0.1:0".parse().unwrap(),
         None,
