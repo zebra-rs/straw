@@ -32,6 +32,11 @@ pub const CAPSULE_COMPRESSION_ASSIGN: u64 = 0x11;
 pub const CAPSULE_COMPRESSION_ACK: u64 = 0x12;
 /// Provisional capsule type: retire a context.
 pub const CAPSULE_COMPRESSION_CLOSE: u64 = 0x13;
+/// Provisional vendor capsule type: the relay's view of the peer's outer
+/// source address — the peer's server-reflexive candidate for hole punching
+/// (design §5.1). Replaced by draft-ietf-quic-address-discovery once quinn
+/// supports OBSERVED_ADDRESS frames (§9).
+pub const CAPSULE_OBSERVED_ADDRESS: u64 = 0x14;
 
 /// The first client-allocated (even) context id (design §3.1).
 pub const FIRST_UNCOMPRESSED_CONTEXT: u64 = 2;
@@ -99,6 +104,25 @@ pub fn decode_context_capsule(mut body: Bytes) -> Result<u64, DecodeError> {
         return Err(DecodeError::TrailingBytes(body.remaining()));
     }
     Ok(context_id)
+}
+
+/// Encode an OBSERVED_ADDRESS capsule carrying `addr` (design §5.1).
+pub fn encode_observed_address(addr: SocketAddr, buf: &mut BytesMut) {
+    let mut body = BytesMut::new();
+    put_addr(&mut body, addr);
+    write_varint(buf, CAPSULE_OBSERVED_ADDRESS).unwrap();
+    write_varint(buf, body.len() as u64).unwrap();
+    buf.extend_from_slice(&body);
+}
+
+/// Decode an OBSERVED_ADDRESS capsule body into the observed address.
+pub fn decode_observed_address(mut body: Bytes) -> Result<SocketAddr, DecodeError> {
+    let version = get_u8(&mut body)?;
+    let addr = get_addr(&mut body, version)?;
+    if body.has_remaining() {
+        return Err(DecodeError::TrailingBytes(body.remaining()));
+    }
+    Ok(addr)
 }
 
 /// One HTTP Datagram body on a bind session: a remote and its UDP payload.
@@ -473,6 +497,18 @@ mod tests {
             t.decode_datagram(buf.freeze()),
             Err(ContextError::Unknown(8))
         );
+    }
+
+    #[test]
+    fn observed_address_capsule_round_trips() {
+        for addr in [v4("203.0.113.7:41000"), v6("[2001:db8::7]:41000")] {
+            let mut buf = BytesMut::new();
+            encode_observed_address(addr, &mut buf);
+            let mut b = buf.freeze();
+            assert_eq!(read_varint(&mut b).unwrap(), CAPSULE_OBSERVED_ADDRESS);
+            let len = read_varint(&mut b).unwrap() as usize;
+            assert_eq!(decode_observed_address(b.slice(..len)).unwrap(), addr);
+        }
     }
 
     #[test]

@@ -536,6 +536,9 @@ pub struct BindClient {
     uncompressed: u64,
     /// The relay-allocated public address, from `proxy-public-address`.
     pub public_addr: std::net::SocketAddr,
+    /// The peer's outer source as the relay observes it — the server-
+    /// reflexive candidate for hole punching (design §5.1), if reported.
+    pub observed_addr: Option<std::net::SocketAddr>,
 }
 
 impl BindClient {
@@ -547,8 +550,8 @@ impl BindClient {
         auth: ClientAuth,
     ) -> Result<Self, ProxyError> {
         use crate::udp_bind::context::{
-            Binding, CAPSULE_COMPRESSION_ACK, CompressionAssign, FIRST_UNCOMPRESSED_CONTEXT,
-            decode_context_capsule,
+            Binding, CAPSULE_COMPRESSION_ACK, CAPSULE_OBSERVED_ADDRESS, CompressionAssign,
+            FIRST_UNCOMPRESSED_CONTEXT, decode_context_capsule, decode_observed_address,
         };
 
         let tls_config = match tls_mode {
@@ -632,7 +635,9 @@ impl BindClient {
         assign.encode(&mut buf);
         stream.send_data(buf.freeze()).await?;
 
-        // Wait for the relay's COMPRESSION_ACK before using the context.
+        // Read capsules until the relay's COMPRESSION_ACK, capturing the
+        // OBSERVED_ADDRESS (our reflexive candidate) along the way.
+        let mut observed_addr = None;
         let mut capsules = CapsuleBuffer::new();
         'ack: loop {
             let Some(chunk) = stream.recv_data().await? else {
@@ -640,12 +645,19 @@ impl BindClient {
             };
             capsules.push(chunk);
             while let Some(capsule) = capsules.next_capsule()? {
-                if let Capsule::Unknown { type_id, data } = capsule
-                    && type_id == CAPSULE_COMPRESSION_ACK
-                    && decode_context_capsule(data)? == uncompressed
-                {
-                    contexts.ack(uncompressed).expect("acked our context");
-                    break 'ack;
+                if let Capsule::Unknown { type_id, data } = capsule {
+                    match type_id {
+                        CAPSULE_OBSERVED_ADDRESS => {
+                            observed_addr = decode_observed_address(data).ok();
+                        }
+                        CAPSULE_COMPRESSION_ACK
+                            if decode_context_capsule(data)? == uncompressed =>
+                        {
+                            contexts.ack(uncompressed).expect("acked our context");
+                            break 'ack;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -659,6 +671,7 @@ impl BindClient {
             contexts,
             uncompressed,
             public_addr,
+            observed_addr,
         })
     }
 
@@ -719,6 +732,7 @@ impl BindClient {
             qsid,
             uncompressed,
             public_addr,
+            observed_addr: _,
             contexts: _,
         } = self;
         let (tx, rx) = tokio::sync::mpsc::channel(256);

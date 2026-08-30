@@ -13,8 +13,10 @@
 //! behind `p2p::wire`; the rendezvous, hole-punching and path-management
 //! layers (design §3–6) build on the two modules here.
 
+pub mod candidates;
 pub mod identity;
 pub mod inner_tls;
 pub mod peer;
 pub mod relay_socket;
 pub mod token;
+pub mod wire;

@@ -1296,3 +1296,25 @@ async fn strawcat_peers_pipe_over_a_token() {
     let echoed = recv.read_to_end(64).await.unwrap();
     assert_eq!(&echoed[..], b"strawcat-hello");
 }
+
+#[tokio::test]
+async fn bind_session_reports_the_reflexive_candidate() {
+    // The relay reports the peer's outer source as OBSERVED_ADDRESS; the
+    // BindClient captures it as its reflexive candidate (design §5.1).
+    let server = TestServer::start_with(enable_bind).await;
+    let client = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .expect("bind session");
+    let observed = client
+        .observed_addr
+        .expect("relay reported an observed address");
+    // The client dialed the relay from a loopback ephemeral port; the relay
+    // sees exactly that source.
+    assert!(observed.ip().is_loopback());
+    assert_ne!(observed.port(), 0);
+}
