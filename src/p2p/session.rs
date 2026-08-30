@@ -47,7 +47,9 @@ struct PunchParams {
     initiator: bool,
     identity: StdArc<Identity>,
     peer_pin: Option<SpkiPin>,
-    bind_addr: SocketAddr,
+    /// The outer bind endpoint, reused for the punch so its source matches the
+    /// advertised reflexive (design §5.3, §12).
+    punch_endpoint: quinn::Endpoint,
     reflexive: Option<SocketAddr>,
     relay_paddr: SocketAddr,
 }
@@ -71,7 +73,7 @@ impl Session {
         initiator: bool,
         identity: StdArc<Identity>,
         peer_pin: Option<SpkiPin>,
-        bind_addr: SocketAddr,
+        punch_endpoint: quinn::Endpoint,
         reflexive: Option<SocketAddr>,
         relay_paddr: SocketAddr,
     ) -> Self {
@@ -81,7 +83,7 @@ impl Session {
             initiator,
             identity,
             peer_pin,
-            bind_addr,
+            punch_endpoint,
             reflexive,
             relay_paddr,
         };
@@ -158,7 +160,7 @@ async fn manage(
             params.initiator,
             &params.identity,
             params.peer_pin,
-            params.bind_addr,
+            params.punch_endpoint.clone(),
             params.reflexive,
             params.relay_paddr,
         )

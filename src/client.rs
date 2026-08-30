@@ -719,6 +719,15 @@ impl BindClient {
     /// a `quinn::AsyncUdpSocket` an inner-QUIC endpoint runs over (design
     /// §4). The spawned pump owns the request stream — keeping the relay
     /// session open — and decapsulates inbound datagrams into the socket.
+    /// A clone of the outer QUIC endpoint (the real UDP socket whose NAT
+    /// mapping the relay observed as this peer's reflexive). Reused for the
+    /// hole punch so the punch source matches the advertised reflexive
+    /// (endpoint-independent NATs keep one mapping per socket across
+    /// destinations); a fresh socket would get a different, unadvertised one.
+    pub fn endpoint(&self) -> quinn::Endpoint {
+        self._endpoint.clone()
+    }
+
     pub fn into_relay_socket(self) -> Arc<crate::p2p::relay_socket::RelaySocket> {
         use crate::capsule::codec::read_varint;
         use crate::udp_bind::context::decode_uncompressed_body;

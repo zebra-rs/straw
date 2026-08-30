@@ -73,8 +73,47 @@ fn peer_pin_of(conn: &quinn::Connection) -> Option<SpkiPin> {
     Some(crate::p2p::identity::pin_of_spki(spki.as_ref()))
 }
 
-/// A fresh QUIC endpoint for one punch attempt: both accepts inbound probes
-/// and dials the peer's candidates, all pinned to the peer's key.
+/// Keepalive transport so the direct path holds its NAT binding once
+/// established (design §6). The punch runs over a real socket, so — unlike the
+/// relay path — full-size packets and MTU discovery are fine.
+fn punch_transport() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(KEEPALIVE));
+    Arc::new(transport)
+}
+
+/// The RFC 7250 pinned client config for dialing a peer's punch candidates.
+pub fn build_client_config(
+    identity: &Identity,
+    expected_peer: Option<SpkiPin>,
+) -> Result<quinn::ClientConfig, ProxyError> {
+    let (client_tls, _) = inner_tls::client_config(identity, expected_peer)?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
+    ));
+    client_config.transport_config(punch_transport());
+    Ok(client_config)
+}
+
+/// The RFC 7250 pinned server config for accepting a peer's punch. Set this on
+/// the (shared) punch endpoint so inbound probes are pin-verified.
+pub fn build_server_config(
+    identity: &Identity,
+    expected_peer: Option<SpkiPin>,
+) -> Result<quinn::ServerConfig, ProxyError> {
+    let (server_tls, _) = inner_tls::server_config(identity, expected_peer)?;
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
+    ));
+    server.transport_config(punch_transport());
+    Ok(server)
+}
+
+/// Accepts inbound probes and dials the peer's candidates, all pinned to the
+/// peer's key. The endpoint may be a fresh socket ([`Puncher::new`]) or the
+/// shared outer bind socket ([`Puncher::on_endpoint`]); reusing the outer
+/// socket makes the punch source match the advertised reflexive on
+/// endpoint-independent NATs (design §5.3, §12).
 pub struct Puncher {
     endpoint: quinn::Endpoint,
     client_config: quinn::ClientConfig,
@@ -82,29 +121,33 @@ pub struct Puncher {
 
 impl Puncher {
     /// Bind a fresh punch endpoint on `bind_addr` (use `0.0.0.0:0` for an
-    /// ephemeral socket). `expected_peer` pins the far peer's key.
+    /// ephemeral socket). `expected_peer` pins the far peer's key. Used by
+    /// the unit tests; production reuses the outer socket via
+    /// [`Puncher::on_endpoint`].
     pub fn new(
         bind_addr: SocketAddr,
         identity: &Identity,
         expected_peer: Option<SpkiPin>,
     ) -> Result<Self, ProxyError> {
-        let (server_tls, _) = inner_tls::server_config(identity, expected_peer)?;
-        let (client_tls, _) = inner_tls::client_config(identity, expected_peer)?;
-        let server = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
-        ));
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
-        ));
-        // Keepalive on both directions so the direct path holds its NAT
-        // binding once established (design §6).
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(KEEPALIVE));
-        let transport = Arc::new(transport);
-        client_config.transport_config(transport.clone());
-        let mut server = server;
-        server.transport_config(transport);
+        let server = build_server_config(identity, expected_peer)?;
+        let client_config = build_client_config(identity, expected_peer)?;
         let endpoint = quinn::Endpoint::server(server, bind_addr).map_err(ProxyError::Io)?;
+        Ok(Self {
+            endpoint,
+            client_config,
+        })
+    }
+
+    /// Punch on an existing endpoint — the outer bind socket, shared with the
+    /// relay connection. The caller must have set the punch server config on
+    /// `endpoint` (via [`build_server_config`]) so inbound probes are accepted
+    /// and pin-verified; this side supplies the matching dial config.
+    pub fn on_endpoint(
+        endpoint: quinn::Endpoint,
+        identity: &Identity,
+        expected_peer: Option<SpkiPin>,
+    ) -> Result<Self, ProxyError> {
+        let client_config = build_client_config(identity, expected_peer)?;
         Ok(Self {
             endpoint,
             client_config,

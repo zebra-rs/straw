@@ -93,7 +93,7 @@ log "peerA listens (issuer)"
 ( printf 'HELLO-FROM-A\n'; sleep "$HOLD" ) | ip netns exec natpunch_pa env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" listen --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_a.key" --punch-addr 0.0.0.0:0 --punch-wait "$PUNCH_WAIT" \
+    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" \
     >"$OUT/np_listen.out" 2>"$OUT/np_listen.err" &
 LISTEN_PID=$!
 for _ in $(seq 100); do [ -s "$OUT/np_listen.out" ] && break; sleep 0.1; done
@@ -104,7 +104,7 @@ log "peerB connects (holder)"
 ( printf 'HELLO-FROM-B\n'; sleep "$HOLD" ) | ip netns exec natpunch_pb env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" connect "$TOKEN" --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_b.key" --punch-addr 0.0.0.0:0 --punch-wait "$PUNCH_WAIT" \
+    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" \
     >"$OUT/np_connect.out" 2>"$OUT/np_connect.err" || true
 wait "$LISTEN_PID" 2>/dev/null || true
 sleep 1
@@ -127,10 +127,13 @@ DATA_OK=1
 [ "$A_RX" = "HELLO-FROM-B" ] || { fail "peerA did not receive peerB's payload over the relay"; DATA_OK=0; }
 [ "$DATA_OK" = 1 ] && ok "relay data plane carries payload both ways through double NAT"
 
-# --- Informational: did a direct path form? On a port-preserving NAT the
-# punch succeeds; a symmetric / port-randomising NAT (Linux MASQUERADE here
-# often remaps the fresh punch socket) blocks it and both peers stay on the
-# relay. Either way the relay path above must work.
+# --- Informational: did a direct path form? The punch reuses the outer bind
+# socket, so on an endpoint-independent (cone) NAT its source matches the
+# relay-observed reflexive and the simultaneous open succeeds. This netns
+# MASQUERADE is endpoint-DEPENDENT on the holder's side (it maps the same
+# socket to a different external port per destination — symmetric behaviour),
+# so the punch is blocked and both peers stay on the relay. Either way the
+# relay path above must work.
 echo
 log "hole-punch outcome (best-effort, NAT-dependent)"
 if echo "$B_PATH$A_PATH" | grep -q "hole punched"; then

@@ -33,6 +33,8 @@ pub struct Listener {
     pub paddr: SocketAddr,
     /// The relay's view of this peer's outer source (its reflexive candidate).
     pub reflexive: Option<SocketAddr>,
+    /// The outer bind socket, reused for the hole punch (design §5.3, §12).
+    pub punch_endpoint: quinn::Endpoint,
     endpoint: quinn::Endpoint,
 }
 
@@ -57,6 +59,8 @@ pub struct PeerConnection {
     pub reflexive: Option<SocketAddr>,
     /// This peer's own relay-allocated public address (its relay candidate).
     pub relay_paddr: SocketAddr,
+    /// The outer bind socket, reused for the hole punch (design §5.3, §12).
+    pub punch_endpoint: quinn::Endpoint,
     _endpoint: quinn::Endpoint,
 }
 
@@ -87,6 +91,7 @@ pub async fn listen(
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
     let paddr = bind.public_addr;
     let reflexive = bind.observed_addr;
+    let punch_endpoint = bind.endpoint();
     let (server_tls, _verifier) = inner_tls::server_config(identity, expected_peer)?;
     let mut quic = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
@@ -97,6 +102,7 @@ pub async fn listen(
     Ok(Listener {
         paddr,
         reflexive,
+        punch_endpoint,
         endpoint,
     })
 }
@@ -118,6 +124,7 @@ pub async fn connect(
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
     let reflexive = bind.observed_addr;
     let relay_paddr = bind.public_addr;
+    let punch_endpoint = bind.endpoint();
     let (client_tls, _verifier) = inner_tls::client_config(identity, Some(token.peer_pin()))?;
     let mut quic = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
@@ -134,6 +141,7 @@ pub async fn connect(
         conn,
         reflexive,
         relay_paddr,
+        punch_endpoint,
         _endpoint: endpoint,
     })
 }
