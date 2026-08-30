@@ -6,13 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use http::{Method, Request, Response, StatusCode};
-use tokio::sync::mpsc;
 
 use crate::capsule::{
     AddressAssign, AssignedAddress, Capsule, CapsuleBuffer, IpAddressRange, RouteAdvertisement,
     encode_capsule, merge_ranges,
 };
-use crate::datagram::{IpProxyingDatagram, encode_quic_datagram, quarter_stream_id};
+use crate::datagram::quarter_stream_id;
 use crate::error::ProxyError;
 use crate::forwarding::EgressPolicy;
 use crate::forwarding::router::entries_from_client_ranges;
@@ -22,9 +21,6 @@ use crate::uri_template::parse_connect_ip_path;
 
 /// The connect-ip Extended CONNECT protocol token (RFC 9484 §4.2).
 pub const CONNECT_IP_PROTOCOL: &str = "connect-ip";
-
-/// Depth of the per-session client-bound packet queue.
-const SESSION_QUEUE_DEPTH: usize = 256;
 
 /// How often the forwarding loop re-reads the QUIC path MTU.
 const MTU_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -212,7 +208,6 @@ async fn run_tunnel(
 
     // 5. Install forwarding state. The egress policy is exactly what was
     // advertised (RFC 9484 §4.7.3: clients MUST NOT send outside it).
-    let (client_tx, mut client_rx) = mpsc::channel::<Bytes>(SESSION_QUEUE_DEPTH);
     for a in &assigned {
         ctx.engine
             .route_table()
@@ -221,9 +216,15 @@ async fn run_tunnel(
     // Live tunnel MTU: the smaller of the configured MTU and what one QUIC
     // DATAGRAM carries on this path, refreshed as discovery ramps (§7.2).
     let mtu = Arc::new(AtomicUsize::new(effective_mtu(&quinn_conn, qsid, ctx)));
-    ctx.engine.register_session(
+    // Client-bound packets go straight from the forwarding engine to
+    // `send_datagram` (Step 32); this task only serves capsules and is
+    // woken by `closed` when the reaper unregisters the session.
+    let closed = ctx.engine.register_session(
         session_id,
-        client_tx,
+        crate::forwarding::SessionSink::Datagram {
+            conn: quinn_conn.clone(),
+            qsid,
+        },
         EgressPolicy::new(std::sync::Arc::new(routes.clone())),
         mtu.clone(),
     );
@@ -265,10 +266,9 @@ async fn run_tunnel(
                     Err(e) => return Err(e.into()),
                 }
             }
-            // Packets routed toward this client (hairpin or TUN ingress).
-            packet = client_rx.recv() => {
-                let Some(packet) = packet else { return Ok(()) };
-                send_packet_datagram(&quinn_conn, qsid, packet, &ctx.metrics);
+            // The reaper (or any teardown) unregistered this session.
+            _ = closed.notified() => {
+                return Ok(());
             }
         }
     }
@@ -286,30 +286,6 @@ fn effective_mtu(conn: &quinn::Connection, qsid: u64, ctx: &Arc<ProxyContext>) -
         .and_then(|max| crate::datagram::max_ip_packet_size(max, qsid))
         .map(|capacity| capacity.min(configured))
         .unwrap_or(configured)
-}
-
-fn send_packet_datagram(
-    conn: &quinn::Connection,
-    qsid: u64,
-    packet: Bytes,
-    metrics: &crate::metrics::Metrics,
-) {
-    let datagram = IpProxyingDatagram::ip_packet(packet);
-    let wire = encode_quic_datagram(qsid, &datagram);
-    if let Some(max) = conn.max_datagram_size()
-        && wire.len() > max
-    {
-        crate::metrics::Metrics::incr(&metrics.packets_mtu_dropped_total);
-        tracing::debug!(
-            len = wire.len(),
-            max,
-            "dropping packet exceeding datagram size; tunnel MTU is stale"
-        );
-        return;
-    }
-    if let Err(e) = conn.send_datagram(wire) {
-        tracing::trace!("send_datagram failed: {e}");
-    }
 }
 
 async fn handle_capsule(

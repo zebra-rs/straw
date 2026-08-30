@@ -301,6 +301,16 @@ impl Tunnel {
         self.rx.take()
     }
 
+    /// Route this tunnel's inbound packets straight into `sink` from the
+    /// connection's demux task, replacing the internal queue — one less
+    /// channel hop and one less task on the downlink path (Step 32).
+    /// `strawc` points this at its TUN writer. After this, [`recv_packet`]
+    /// errors.
+    pub fn set_packet_sink(&mut self, sink: tokio::sync::mpsc::Sender<Bytes>) {
+        self.rx = None;
+        self.demux.insert(self.qsid, sink);
+    }
+
     /// A cheap, cloneable handle for sending packets on this tunnel from
     /// another task. `quinn::Connection` is `Arc`-backed, so cloning is free.
     pub fn sender(&self) -> PacketSender {
