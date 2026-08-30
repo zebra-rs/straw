@@ -124,6 +124,14 @@ pub async fn handle_connect_udp_bind_stream(
         )
         .await?;
 
+    // Report the peer's outer source (its server-reflexive candidate for
+    // hole punching, design §5.1) once on session open.
+    {
+        let mut buf = BytesMut::new();
+        crate::udp_bind::context::encode_observed_address(quinn_conn.remote_address(), &mut buf);
+        stream.send_data(buf.freeze()).await?;
+    }
+
     // 5. Wire the data plane. `to_peer` carries encapsulated datagrams from
     // the socket back to the peer over QUIC; `from_peer` carries the peer's
     // datagrams (routed here by the connection demux) to the socket.
