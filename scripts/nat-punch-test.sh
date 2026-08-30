@@ -10,10 +10,15 @@
 #
 #   relay: 192.0.2.1/30 (link A) + 192.0.2.5/30 (link B), ip_forward=1
 #
-# Checks the relay path works through real NAT, then whether the peers
-# hole-punch a direct path — the honest question this harness answers.
+# Checks payload crosses the double NAT, then whether the peers hole-punch a
+# direct path. Two NAT modes:
+#   NAT_MODE=symmetric (default) — MASQUERADE; endpoint-dependent, so the punch
+#     is blocked and the relay carries the data (best-effort, not asserted).
+#   NAT_MODE=cone — stateless 1:1 NETMAP; endpoint-independent (full-cone), so
+#     the outer-socket punch traverses and a direct path is ASSERTED.
 #
 #   sudo scripts/nat-punch-test.sh
+#   sudo NAT_MODE=cone scripts/nat-punch-test.sh
 set -uo pipefail
 BIN=${BIN:-target/debug}
 PORT=4433
@@ -56,14 +61,38 @@ ip -n natpunch_nb route add default via 192.0.2.5
 # the relay routes between the two public links.
 ip netns exec natpunch_r sysctl -qw net.ipv4.ip_forward=1 \
     net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
-# NAT: MASQUERADE each internal subnet out the nat's public interface.
-for pair in "natpunch_na 10.1.0.0/24" "natpunch_nb 10.2.0.0/24"; do
-    set -- $pair
+# NAT mode:
+#   symmetric (default) — MASQUERADE: Linux's port allocation is endpoint-
+#     DEPENDENT for the holder here (one socket → a different external port per
+#     destination), so the punch is blocked and both peers use the relay.
+#   cone — a stateless 1:1 NETMAP: the socket keeps ONE external (ip,port)
+#     across every destination (endpoint-independent mapping) and any peer may
+#     send to it (full-cone, no filtering). The outer-socket punch source then
+#     equals the advertised reflexive, so the simultaneous open lands. This is
+#     the reliable way to get EIM in netns — conntrack's PAT will not preserve
+#     a port across destinations even for a fixed source port, but NETMAP,
+#     being stateless, bypasses it entirely.
+NAT_MODE=${NAT_MODE:-symmetric}
+# fields: nat-ns  internal-subnet  internal-host  public-ip
+for row in "natpunch_na 10.1.0.0/24 10.1.0.2 192.0.2.2" \
+           "natpunch_nb 10.2.0.0/24 10.2.0.2 192.0.2.6"; do
+    set -- $row
     ip netns exec $1 sysctl -qw net.ipv4.ip_forward=1 \
         net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
     ip netns exec $1 iptables -P FORWARD ACCEPT
-    ip netns exec $1 iptables -t nat -A POSTROUTING -s $2 -o public -j MASQUERADE
+    if [ "$NAT_MODE" = cone ]; then
+        # 1:1 map the single punching host to the nat's public IP, both ways.
+        ip netns exec $1 iptables -t nat -A POSTROUTING -s "$3" -o public -j NETMAP --to "$4"
+        ip netns exec $1 iptables -t nat -A PREROUTING -i public -d "$4" -j NETMAP --to "$3"
+    else
+        ip netns exec $1 iptables -t nat -A POSTROUTING -s "$2" -o public -j MASQUERADE
+    fi
 done
+if [ "$NAT_MODE" = cone ]; then
+    echo "  NAT_MODE=cone — endpoint-independent 1:1 (full-cone); punch asserted"
+else
+    echo "  NAT_MODE=symmetric — MASQUERADE; punch best-effort (set NAT_MODE=cone for EIM)"
+fi
 
 log "sanity"
 ip netns exec natpunch_pa ping -c1 -W2 192.0.2.1 >/dev/null && echo "  peerA → relay OK" || fail "peerA → relay"
@@ -119,29 +148,32 @@ echo "  peerA received: '$A_RX'  (expect HELLO-FROM-B)"
 echo "  peerA $A_PATH"
 echo "  peerB $B_PATH"
 
-# --- Hard assertion: the relay data plane must carry payload both ways
-# through the double NAT. This is what the harness proves; the direct-path
-# punch is best-effort and NAT-dependent (reported below, never asserted).
+# --- Hard assertion: payload must cross both ways through the double NAT
+# (over whichever path won — relay in symmetric mode, direct in cone mode).
 DATA_OK=1
-[ "$B_RX" = "HELLO-FROM-A" ] || { fail "peerB did not receive peerA's payload over the relay"; DATA_OK=0; }
-[ "$A_RX" = "HELLO-FROM-B" ] || { fail "peerA did not receive peerB's payload over the relay"; DATA_OK=0; }
-[ "$DATA_OK" = 1 ] && ok "relay data plane carries payload both ways through double NAT"
+[ "$B_RX" = "HELLO-FROM-A" ] || { fail "peerB did not receive peerA's payload"; DATA_OK=0; }
+[ "$A_RX" = "HELLO-FROM-B" ] || { fail "peerA did not receive peerB's payload"; DATA_OK=0; }
+[ "$DATA_OK" = 1 ] && ok "payload delivered both ways through the double NAT"
 
-# --- Informational: did a direct path form? The punch reuses the outer bind
-# socket, so on an endpoint-independent (cone) NAT its source matches the
-# relay-observed reflexive and the simultaneous open succeeds. This netns
-# MASQUERADE is endpoint-DEPENDENT on the holder's side (it maps the same
-# socket to a different external port per destination — symmetric behaviour),
-# so the punch is blocked and both peers stay on the relay. Either way the
-# relay path above must work.
+# --- Did a direct path form? The punch reuses the outer bind socket, so on an
+# endpoint-independent (cone) NAT its source matches the relay-observed
+# reflexive and the simultaneous open succeeds — asserted in cone mode. The
+# default symmetric MASQUERADE maps the one socket to a different external port
+# per destination, so the punch is blocked and the relay carries the data.
 echo
-log "hole-punch outcome (best-effort, NAT-dependent)"
-if echo "$B_PATH$A_PATH" | grep -q "hole punched"; then
-    ok "direct path established — NAT allowed the punch"
+log "hole-punch outcome (NAT_MODE=$NAT_MODE)"
+PUNCHED=0
+echo "$B_PATH$A_PATH" | grep -q "hole punched" && PUNCHED=1
+if [ "$PUNCHED" = 1 ]; then
+    ok "direct path established — both peers punched through the NAT"
+elif [ "$NAT_MODE" = cone ]; then
+    fail "cone (EIM) NAT must allow the punch, but a peer stayed on the relay"
+    DATA_OK=0
 else
-    echo "  no direct path — both peers stayed on the relay (NAT blocked the punch)"
+    echo "  no direct path — both peers stayed on the relay (symmetric NAT blocked the punch)"
     echo "  holder punch trace:"
-    grep -iE "punch: (local|remote|dialing)|hole punch (failed|timed out)" "$OUT/np_connect.err"         | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9T:.-]+Z +[A-Z]+ +[a-z_:]+: //' | head -4 | sed 's/^/    /'
+    grep -iE "punch: (local|remote|dialing)|hole punch (failed|timed out)" "$OUT/np_connect.err" \
+        | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9T:.-]+Z +[A-Z]+ +[a-z_:]+: //' | head -4 | sed 's/^/    /'
 fi
 
 [ "$DATA_OK" = 1 ] || exit 1

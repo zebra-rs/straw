@@ -152,15 +152,23 @@ because endpoint-independent NATs keep one external port per socket across
 destinations.
 
 `scripts/nat-punch-test.sh` is the netns double-NAT harness
-(`peerA─natA══relay══natB─peerB`, MASQUERADE both sides). It asserts the relay
-data plane carries payload both ways through the double NAT; the punch is
-best-effort and reported, not asserted. tcpdump confirms the reuse works on the
-endpoint-independent side (advertised reflexive == actual punch source), but
-this netns MASQUERADE is endpoint-DEPENDENT on the holder's side — it maps the
-one outer socket to a different external port per destination (symmetric
-behaviour), so the punch stays blocked there and both peers use the relay.
-Traversing a symmetric NAT needs port prediction or a STUN probe toward the
-peer; real cone NATs (most home routers) punch with the reuse alone.
+(`peerA─natA══relay══natB─peerB`) with two NAT modes, both asserting payload
+crosses the double NAT both ways:
+- `NAT_MODE=symmetric` (default) — MASQUERADE. Linux's PAT is endpoint-
+  DEPENDENT here: it maps the one outer socket to a different external port per
+  destination, so the punch is blocked and the relay carries the data
+  (best-effort, not asserted). Confirmed by tcpdump.
+- `NAT_MODE=cone` (`sudo NAT_MODE=cone …`) — a stateless 1:1 NETMAP:
+  endpoint-independent (full-cone) mapping, so the outer-socket punch source
+  equals the advertised reflexive and a **direct path is asserted**. The direct
+  connection's remote is the peer's *public* address (not the relay), proving
+  it bypasses the relay. NETMAP is the reliable way to get EIM in netns —
+  conntrack PAT will not preserve a port across destinations even for a fixed
+  source port; NETMAP, being stateless, bypasses it.
+
+So real cone NATs (most home routers) punch with the outer-socket reuse alone;
+a genuinely symmetric NAT still needs port prediction or a STUN probe toward
+the peer.
 
 The standards-codepoint swap (§9) is still future work; everything provisional
 (bind capsule types 0x11–0x13, token format) is isolated for that swap. See
