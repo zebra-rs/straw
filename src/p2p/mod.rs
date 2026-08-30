@@ -20,5 +20,6 @@ pub mod inner_tls;
 pub mod peer;
 pub mod punch;
 pub mod relay_socket;
+pub mod session;
 pub mod token;
 pub mod wire;
