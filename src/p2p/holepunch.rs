@@ -120,7 +120,9 @@ pub async fn coordinate(
         ));
     }
 
-    let conn = puncher.punch(&targets, PUNCH_TIMEOUT).await?;
+    let conn = puncher
+        .punch(identity.pin(), peer_pin, &targets, PUNCH_TIMEOUT)
+        .await?;
     tracing::info!(remote = %conn.remote_address(), "direct path established");
     Ok(Direct {
         conn,

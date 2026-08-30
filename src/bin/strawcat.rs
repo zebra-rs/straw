@@ -21,10 +21,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
+use std::time::Duration;
 use straw::client::{ClientAuth, TlsMode};
 use straw::error::ProxyError;
 use straw::p2p::identity::Identity;
+
 use straw::p2p::peer::{self, RelayAccess};
+use straw::p2p::session::{PathState, Session};
 use straw::p2p::token::TokenV2;
 
 #[derive(Debug, Parser)]
@@ -76,6 +80,16 @@ struct RelayArgs {
     /// Token lifetime in seconds (listen only).
     #[arg(long, default_value_t = 86_400)]
     ttl: u64,
+
+    /// Local address the hole-punch socket binds to. Use an interface IP (or
+    /// 127.0.0.1 for a same-host demo); 0.0.0.0 advertises no usable host
+    /// candidate, leaving only the reflexive/relay paths.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    punch_addr: std::net::SocketAddr,
+
+    /// Seconds to wait for a direct path before piping over the relay.
+    #[arg(long, default_value_t = 5)]
+    punch_wait: u64,
 }
 
 #[tokio::main]
@@ -109,8 +123,10 @@ async fn run() -> Result<(), ProxyError> {
 }
 
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
-    let identity = load_identity(&args.identity)?;
+    let identity = Arc::new(load_identity(&args.identity)?);
     let listener = peer::listen(relay_access(&args)?, &identity, None).await?;
+    let reflexive = listener.reflexive;
+    let relay_paddr = listener.paddr;
 
     // Mint and print a token the other peer connects with. The relay pin and
     // credential are placeholders in v1 (the holder reaches the relay with
@@ -133,9 +149,19 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     );
 
     let conn = listener.accept().await?;
-    eprintln!("peer connected: {}", conn.remote_address());
-    // The connecting peer opens the stream; we accept it.
-    let (send, recv) = conn
+    eprintln!("peer connected via relay: {}", conn.remote_address());
+    let session = Session::start(
+        conn,
+        false,
+        identity,
+        None,
+        args.punch_addr,
+        reflexive,
+        relay_paddr,
+    );
+    let best = best_path(&session, args.punch_wait).await;
+    // The connecting peer opens the stream; accept it on the chosen path.
+    let (send, recv) = best
         .accept_bi()
         .await
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
@@ -143,19 +169,39 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
 }
 
 async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
-    let identity = load_identity(&args.identity)?;
+    let identity = Arc::new(load_identity(&args.identity)?);
     let token = TokenV2::decode(&token)?;
     if token.is_expired(now()) {
         return Err(ProxyError::InvalidRequest("token has expired".into()));
     }
     let peer_conn = peer::connect(relay_access(&args)?, &identity, &token).await?;
-    eprintln!("connected to peer {}", hex(&token.peer_pin()));
-    let (send, recv) = peer_conn
-        .conn
+    eprintln!("connected to peer {} via relay", hex(&token.peer_pin()));
+    let session = Session::start(
+        peer_conn.conn,
+        true,
+        identity,
+        Some(token.peer_pin()),
+        args.punch_addr,
+        peer_conn.reflexive,
+        peer_conn.relay_paddr,
+    );
+    let best = best_path(&session, args.punch_wait).await;
+    let (send, recv) = best
         .open_bi()
         .await
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     pipe_stdio(send, recv).await
+}
+
+/// Wait briefly for a direct path, then return the connection to pipe over,
+/// reporting which path won.
+async fn best_path(session: &Session, wait_secs: u64) -> quinn::Connection {
+    let direct = session.await_direct(Duration::from_secs(wait_secs)).await;
+    match session.state() {
+        PathState::Direct if direct => eprintln!("path: direct (hole punched)"),
+        _ => eprintln!("path: relay (no direct path)"),
+    }
+    session.connection()
 }
 
 /// Pipe stdin → the QUIC send stream and the recv stream → stdout, until

@@ -31,6 +31,8 @@ pub struct RelayAccess {
 /// token, and an inner endpoint that accepts one SPKI-pinned connection.
 pub struct Listener {
     pub paddr: SocketAddr,
+    /// The relay's view of this peer's outer source (its reflexive candidate).
+    pub reflexive: Option<SocketAddr>,
     endpoint: quinn::Endpoint,
 }
 
@@ -51,6 +53,10 @@ impl Listener {
 /// An established inner connection to a peer; holds its endpoint alive.
 pub struct PeerConnection {
     pub conn: quinn::Connection,
+    /// This peer's reflexive candidate (the relay's view of its outer source).
+    pub reflexive: Option<SocketAddr>,
+    /// This peer's own relay-allocated public address (its relay candidate).
+    pub relay_paddr: SocketAddr,
     _endpoint: quinn::Endpoint,
 }
 
@@ -64,13 +70,18 @@ pub async fn listen(
 ) -> Result<Listener, ProxyError> {
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
     let paddr = bind.public_addr;
+    let reflexive = bind.observed_addr;
     let (server_tls, _verifier) = inner_tls::server_config(identity, expected_peer)?;
     let quic = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     let endpoint = inner_endpoint(bind.into_relay_socket(), Some(quic))
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
-    Ok(Listener { paddr, endpoint })
+    Ok(Listener {
+        paddr,
+        reflexive,
+        endpoint,
+    })
 }
 
 /// Open a bind session and dial the token's issuer at its `paddr`, pinning
@@ -88,6 +99,8 @@ pub async fn connect(
         .map_err(|e| ProxyError::InvalidRequest(format!("token paddr invalid: {e}")))?;
 
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
+    let reflexive = bind.observed_addr;
+    let relay_paddr = bind.public_addr;
     let (client_tls, _verifier) = inner_tls::client_config(identity, Some(token.peer_pin()))?;
     let quic = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
@@ -101,6 +114,8 @@ pub async fn connect(
         .map_err(|e| ProxyError::Quic(format!("inner connect failed: {e}")))?;
     Ok(PeerConnection {
         conn,
+        reflexive,
+        relay_paddr,
         _endpoint: endpoint,
     })
 }

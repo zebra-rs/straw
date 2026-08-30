@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use std::sync::Arc as StdArc;
+
 use crate::error::ProxyError;
 use crate::p2p::holepunch::{self, Direct};
 use crate::p2p::identity::{Identity, SpkiPin};
@@ -44,7 +46,7 @@ const REPUNCH_BACKOFF: Duration = Duration::from_secs(30);
 /// The inputs the manager needs to punch, held for the session's life.
 struct PunchParams {
     initiator: bool,
-    identity: Identity,
+    identity: StdArc<Identity>,
     peer_pin: Option<SpkiPin>,
     bind_addr: SocketAddr,
     reflexive: Option<SocketAddr>,
@@ -68,7 +70,7 @@ impl Session {
     pub fn start(
         inner: quinn::Connection,
         initiator: bool,
-        identity: Identity,
+        identity: StdArc<Identity>,
         peer_pin: Option<SpkiPin>,
         bind_addr: SocketAddr,
         reflexive: Option<SocketAddr>,

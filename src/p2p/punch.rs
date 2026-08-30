@@ -27,6 +27,25 @@ use crate::error::ProxyError;
 use crate::p2p::identity::{Identity, SpkiPin};
 use crate::p2p::inner_tls;
 
+/// Which side dialed a completed probe connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// We dialed it (we are the QUIC client).
+    Client,
+    /// We accepted it (we are the QUIC server).
+    Server,
+}
+
+/// The peer's SPKI pin from a completed connection's raw-public-key identity.
+fn peer_pin_of(conn: &quinn::Connection) -> Option<SpkiPin> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    let spki = certs.first()?;
+    Some(crate::p2p::identity::pin_of_spki(spki.as_ref()))
+}
+
 /// A fresh QUIC endpoint for one punch attempt: both accepts inbound probes
 /// and dials the peer's candidates, all pinned to the peer's key.
 pub struct Puncher {
@@ -70,58 +89,86 @@ impl Puncher {
         self.endpoint.local_addr().map_err(ProxyError::Io)
     }
 
-    /// Race dials to every `remote` candidate against inbound probes; return
-    /// the first connection that completes and pin-verifies, or time out.
+    /// Race dials to every `remote` candidate against inbound probes and
+    /// return the single connection both peers agree to keep, or time out.
     ///
-    /// Both peers calling this at once is the simultaneous open. Dials to a
-    /// closed NAT simply fail; the inbound side (opened by the peer's own
-    /// dials) is what usually completes.
+    /// Both peers dialing and accepting at once is the simultaneous open —
+    /// that is what opens the NATs — so up to two connections can complete.
+    /// The duplicate-success tie-break (design §5.3.4, §2.1) makes both sides
+    /// keep the *same* one: the connection whose client is the peer with the
+    /// lexicographically lower SPKI pin. Each side keeps the connection whose
+    /// role (client if it dialed, server if it accepted) matches that rule,
+    /// and closes any other — so the two peers converge without coordination.
     pub async fn punch(
         &self,
+        my_pin: SpkiPin,
+        peer_pin: Option<SpkiPin>,
         remotes: &[SocketAddr],
         timeout: Duration,
     ) -> Result<quinn::Connection, ProxyError> {
-        let mut attempts = tokio::task::JoinSet::new();
+        // (role, connection): Client = we dialed it, Server = we accepted it.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Role, quinn::Connection)>(8);
 
-        // Inbound: accept a probe the peer dialed to us.
+        // Inbound accept loop: every probe the peer dialed to us.
         let ep = self.endpoint.clone();
-        attempts.spawn(async move {
-            let incoming = ep.accept().await?;
-            incoming.await.ok()
+        let accept_tx = tx.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                if let Ok(conn) = incoming.await
+                    && accept_tx.send((Role::Server, conn)).await.is_err()
+                {
+                    return;
+                }
+            }
         });
 
-        // Outbound: dial each of the peer's candidates.
+        // Outbound dials.
         for &remote in remotes {
             match self
                 .endpoint
                 .connect_with(self.client_config.clone(), remote, "peer")
             {
                 Ok(connecting) => {
-                    attempts.spawn(async move { connecting.await.ok() });
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conn) = connecting.await {
+                            let _ = tx.send((Role::Client, conn)).await;
+                        }
+                    });
                 }
                 Err(e) => tracing::debug!(%remote, "punch dial not started: {e}"),
             }
         }
+        drop(tx);
 
         let deadline = tokio::time::sleep(timeout);
         tokio::pin!(deadline);
-        loop {
+        let result = loop {
             tokio::select! {
-                _ = &mut deadline => {
-                    return Err(ProxyError::Quic("hole punch timed out".into()));
-                }
-                next = attempts.join_next() => {
-                    match next {
-                        Some(Ok(Some(conn))) => return Ok(conn),
-                        // A failed attempt (join error, or None result):
-                        // keep waiting for the others.
-                        Some(_) => continue,
-                        // All attempts finished without success.
-                        None => return Err(ProxyError::Quic("all punch attempts failed".into())),
+                _ = &mut deadline => break Err(ProxyError::Quic("hole punch timed out".into())),
+                next = rx.recv() => {
+                    let Some((role, conn)) = next else {
+                        break Err(ProxyError::Quic("all punch attempts failed".into()));
+                    };
+                    // Resolve the tie-break: the lower-pinned peer is client.
+                    let want_client = match peer_pin.or_else(|| peer_pin_of(&conn)) {
+                        Some(pp) => my_pin < pp,
+                        // No peer pin available (should not happen post-
+                        // handshake): accept the first completion.
+                        None => role == Role::Client,
+                    };
+                    let keep = (want_client && role == Role::Client)
+                        || (!want_client && role == Role::Server);
+                    if keep {
+                        break Ok(conn);
                     }
+                    // The other connection is the keeper; drop this one.
+                    conn.close(0u32.into(), b"tie-break");
                 }
             }
-        }
+        };
+        accept_task.abort();
+        result
     }
 
     /// The underlying endpoint, kept alive for the connection's lifetime.
@@ -153,8 +200,18 @@ mod tests {
         let a_remotes = [b_addr];
         let b_remotes = [a_addr];
         let (ra, rb) = tokio::join!(
-            a.punch(&a_remotes, Duration::from_secs(5)),
-            b.punch(&b_remotes, Duration::from_secs(5)),
+            a.punch(
+                id_a.pin(),
+                Some(id_b.pin()),
+                &a_remotes,
+                Duration::from_secs(5)
+            ),
+            b.punch(
+                id_b.pin(),
+                Some(id_a.pin()),
+                &b_remotes,
+                Duration::from_secs(5)
+            ),
         );
         let ca = ra.expect("A gets a direct connection");
         let cb = rb.expect("B gets a direct connection");
@@ -172,6 +229,8 @@ mod tests {
         // 203.0.113.0/24 is TEST-NET-3 — nothing answers.
         let r = p
             .punch(
+                id.pin(),
+                None,
                 &["203.0.113.1:9".parse().unwrap()],
                 Duration::from_millis(400),
             )
