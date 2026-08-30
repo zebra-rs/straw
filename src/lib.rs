@@ -6,6 +6,7 @@
 pub mod address_pool;
 pub mod capsule;
 pub mod client;
+pub mod codepoints;
 pub mod config;
 pub mod datagram;
 pub mod error;

@@ -16,11 +16,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::ProxyError;
 use crate::p2p::identity::SpkiPin;
 
-/// The only token version this build speaks.
-pub const TOKEN_VERSION: u8 = 2;
-
-/// Human-facing prefix; the base64url CBOR follows it.
-const TOKEN_PREFIX: &str = "sc2_";
+// The token version and prefix live in the codepoint registry
+// (`crate::codepoints`) for the v2 swap (design §9); re-exported so
+// `token::TOKEN_VERSION` still resolves.
+use crate::codepoints::TOKEN_PREFIX;
+pub use crate::codepoints::TOKEN_VERSION;
 
 /// A decoded rendezvous token (design §3.2). Integer CBOR keys in the
 /// `serde(rename)`s keep the wire form compact and order-independent.

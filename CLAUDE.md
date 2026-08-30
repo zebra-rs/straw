@@ -219,9 +219,14 @@ narrow port range / address-dependent filtering) that a real router may have.
 Harness: `STRATEGY=<name>` (relay-assisted also sets `--udp-bind-observe`);
 the punch stays best-effort in `symmetric` mode and asserted only in `cone`.
 
-The standards-codepoint swap (§9) is still future work; everything provisional
-(bind capsule types 0x11–0x13, token format) is isolated for that swap. See
-`p2p-direct-path-design.md`.
+The standards-codepoint swap (§9) is still future work (gated on quinn
+extension-frame / transport-param APIs and RFC publication), but **every
+provisional codepoint now lives in one registry, `src/codepoints.rs`** — bind
+capsule types 0x11–0x15, the `strawcat/1` ALPN, the `sc2_` token marker,
+and the documented v2 NAT-traversal frame target — each annotated with its v2
+standard and the gate; `udp_bind::context`, `p2p::token`, `p2p::inner_tls`
+re-export from it, so the swap is a one-file edit. See
+`p2p-direct-path-design.md` §9.
 
 ## Key RFCs
 

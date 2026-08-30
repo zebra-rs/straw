@@ -275,7 +275,7 @@ The inner-connection TLS identity mirrors tailcat's key model: ephemeral in-memo
 
 ## 9. Wire-Format Isolation and the v2 Standards Path
 
-Everything provisional lives in `p2p::wire` and `udp_bind::context` behind one constant table. The v2 migration, when the ecosystem is ready, swaps:
+Everything provisional lives in one constant table — the `crate::codepoints` registry — with each item annotated with its v2 target and gate; `p2p::wire`, `udp_bind::context`, `p2p::token` and `p2p::inner_tls` re-export from it. The v2 migration, when the ecosystem is ready, swaps:
 
 | v1 (this design) | v2 (standards) | Gate |
 |---|---|---|
