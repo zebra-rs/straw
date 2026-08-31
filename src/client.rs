@@ -739,6 +739,14 @@ pub struct BindClient {
 }
 
 impl BindClient {
+    /// The outer QUIC connection carrying this bind session. Its datagram
+    /// capacity is the ceiling every inner packet has to fit inside.
+    pub fn connection(&self) -> &quinn::Connection {
+        &self.conn
+    }
+}
+
+impl BindClient {
     /// Open a bind session and register the uncompressed context (id 2).
     pub async fn connect(
         server_addr: SocketAddr,

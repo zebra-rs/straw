@@ -98,8 +98,8 @@ pub struct PeerConnection {
 fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
     let mut t = noq::TransportConfig::default();
     t.mtu_discovery_config(None);
-    t.initial_mtu(1200);
-    t.min_mtu(1200);
+    t.initial_mtu(INNER_MTU);
+    t.min_mtu(INNER_MTU);
     t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     // Allow a relay path + a direct path on one connection (Stage 3).
     t.max_concurrent_multipath_paths(8);
@@ -116,6 +116,52 @@ fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
 /// offers its reflexive candidate and, with `--port-map`, a mapped one; the
 /// headroom covers host candidates and future strategies.
 pub const MAX_NAT_ADDRESSES: u8 = 8;
+
+/// The pinned inner MTU. Every relay-path packet is re-wrapped as one outer
+/// QUIC DATAGRAM, so this must fit inside one — and it is the QUIC floor, the
+/// only size guaranteed to fit whatever the outer path turns out to carry.
+///
+/// It applies to the **direct** path too, which is the cost: a real socket
+/// would carry ~1400. Lifting it needs a per-path MTU, and noq 1.2.0 has none
+/// — `mtu_discovery_config` is per *connection* and `allow_mtud` is fixed per
+/// *endpoint* at construction (from `AsyncUdpSocket::may_fragment`). Raising
+/// the shared pin instead is the trap this pin exists for: an inner packet
+/// larger than one outer datagram fails `send_datagram`, and the connection
+/// stalls *after* a handshake that fit. See `log_mtu_headroom` for what the
+/// cost actually is on a given path.
+const INNER_MTU: u16 = 1200;
+
+/// Report how much room the pinned inner MTU leaves unused on this session, so
+/// the cost of the connection-wide pin is visible rather than theoretical.
+/// Purely observational.
+fn log_mtu_headroom(outer: &quinn::Connection) {
+    let Some(outer_datagram) = outer.max_datagram_size() else {
+        tracing::debug!("outer connection carries no datagrams; relay path will not work");
+        return;
+    };
+    // The bind framing (quarter-stream id + context id + address) rides inside
+    // the outer datagram with the inner packet.
+    let usable = outer_datagram.saturating_sub(BIND_FRAMING_MAX);
+    tracing::debug!(
+        outer_datagram,
+        usable,
+        inner_mtu = INNER_MTU,
+        "inner MTU is pinned at the QUIC floor; a per-path MTU would let the \
+         direct path run larger (noq 1.2.0 has no such API)"
+    );
+    if usable < INNER_MTU as usize {
+        tracing::warn!(
+            usable,
+            inner_mtu = INNER_MTU,
+            "the outer datagram cannot carry a floor-sized inner packet; the \
+             relay path may stall once packets reach full size"
+        );
+    }
+}
+
+/// Worst-case bind framing per datagram: quarter-stream id, context id, and an
+/// IPv6 address with port, each varint-or-fixed encoded.
+const BIND_FRAMING_MAX: usize = 8 + 8 + 1 + 16 + 2;
 
 /// Bind the socket that carries direct paths, in the **same address family as
 /// the relay path**.
@@ -148,6 +194,7 @@ pub async fn listen(
     peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<Listener, ProxyError> {
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
+    log_mtu_headroom(bind.connection());
     let paddr = bind.public_addr;
     let reflexive = bind.observed_addr;
     let punch_endpoint = bind.endpoint();
@@ -191,6 +238,7 @@ pub async fn connect(
         .map_err(|e| ProxyError::InvalidRequest(format!("token paddr invalid: {e}")))?;
 
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
+    log_mtu_headroom(bind.connection());
     let reflexive = bind.observed_addr;
     let relay_paddr = bind.public_addr;
     let punch_endpoint = bind.endpoint();
