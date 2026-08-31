@@ -1482,6 +1482,7 @@ async fn a_session_punches_and_promotes_the_direct_path() {
     let issuer_inputs = PunchInputs {
         mux: listener.mux.clone(),
         reflexive: listener.reflexive,
+        relay_addr: relay.addr,
     };
     let issuer_direct = listener.mux.direct_local().port();
     let token = TokenV2::issue(
@@ -1513,6 +1514,7 @@ async fn a_session_punches_and_promotes_the_direct_path() {
         PunchInputs {
             mux: holder_side.mux.clone(),
             reflexive: holder_side.reflexive,
+            relay_addr: relay.addr,
         },
         PunchConfig::default(),
     );
@@ -1734,6 +1736,7 @@ async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
     let issuer_inputs = PunchInputs {
         mux: listener.mux.clone(),
         reflexive: listener.reflexive,
+        relay_addr: relay.addr,
     };
     let token = TokenV2::issue(
         "h3://relay.test:443".into(),
@@ -1763,6 +1766,7 @@ async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
         PunchInputs {
             mux: holder_side.mux.clone(),
             reflexive: holder_side.reflexive,
+            relay_addr: relay.addr,
         },
         PunchConfig::default(),
     );

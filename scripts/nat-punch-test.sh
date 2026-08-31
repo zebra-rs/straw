@@ -102,6 +102,10 @@ OBSERVE_FLAG=""
 echo "  STRATEGY=$STRATEGY${OBSERVE_FLAG:+ (relay observer on)}"
 # PORTMAP=1 runs a PCP/NAT-PMP responder in each NAT that installs an explicit
 # 1:1 port-forward on request, and passes --port-map to the peers.
+# DIRECT picks which candidates the peers offer: reflexive (default) | full
+# (also the LAN address) | off (never punch — pins both peers to the relay).
+DIRECT=${DIRECT:-reflexive}
+[ "$DIRECT" = reflexive ] || echo "  DIRECT=$DIRECT"
 PORTMAP=${PORTMAP:-0}
 PORTMAP_FLAG=""
 if [ "$PORTMAP" = 1 ]; then
@@ -141,7 +145,8 @@ log "peerA listens (issuer)"
 ( printf 'HELLO-FROM-A\n'; sleep "$HOLD" ) | ip netns exec natpunch_pa env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" listen --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" $PORTMAP_FLAG \
+    --identity "$OUT/np_a.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
+    --direct "$DIRECT" $PORTMAP_FLAG \
     >"$OUT/np_listen.out" 2>"$OUT/np_listen.err" &
 LISTEN_PID=$!
 for _ in $(seq 100); do [ -s "$OUT/np_listen.out" ] && break; sleep 0.1; done
@@ -152,7 +157,8 @@ log "peerB connects (holder)"
 ( printf 'HELLO-FROM-B\n'; sleep "$HOLD" ) | ip netns exec natpunch_pb env RUST_LOG=straw=debug \
     timeout -s INT "$PEER_TL" \
     "$BIN/strawcat" connect "$TOKEN" --relay 192.0.2.1:$PORT --insecure --bearer-token s3cret \
-    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" $PORTMAP_FLAG \
+    --identity "$OUT/np_b.key" --punch-wait "$PUNCH_WAIT" --punch-strategy "$STRATEGY" \
+    --direct "$DIRECT" $PORTMAP_FLAG \
     >"$OUT/np_connect.out" 2>"$OUT/np_connect.err" || true
 wait "$LISTEN_PID" 2>/dev/null || true
 sleep 1
@@ -183,7 +189,15 @@ echo
 log "hole-punch outcome (NAT_MODE=$NAT_MODE)"
 PUNCHED=0
 echo "$B_PATH$A_PATH" | grep -q "hole punched" && PUNCHED=1
-if [ "$PUNCHED" = 1 ]; then
+if [ "$DIRECT" = off ]; then
+    # The escape hatch must hold even where the punch would have worked.
+    if [ "$PUNCHED" = 0 ]; then
+        ok "--direct=off pinned both peers to the relay (no punch attempted)"
+    else
+        fail "--direct=off must not punch, but a peer reported a direct path"
+        DATA_OK=0
+    fi
+elif [ "$PUNCHED" = 1 ]; then
     ok "direct path established — both peers punched through the NAT"
     # Each peer must name the *other peer's* public address (192.0.2.2 /
     # 192.0.2.6), not the relay's 192.0.2.1 — that is what makes it direct.
