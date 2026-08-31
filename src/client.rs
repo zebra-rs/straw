@@ -938,15 +938,11 @@ impl BindClient {
         self._endpoint.clone()
     }
 
-    pub(crate) fn into_relay_parts(
-        self,
-        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> crate::p2p::relay_socket::RelayParts {
+    pub(crate) fn into_relay_parts(self) -> crate::p2p::relay_socket::RelayParts {
         use crate::capsule::Capsule;
         use crate::capsule::codec::read_varint;
-        use crate::udp_bind::context::{
-            CAPSULE_PEER_REFLEXIVE, decode_peer_reflexive, decode_uncompressed_body,
-        };
+        use crate::codepoints::CAPSULE_COMPRESSION_ACK;
+        use crate::udp_bind::context::decode_context_capsule;
 
         let BindClient {
             _endpoint,
@@ -954,17 +950,24 @@ impl BindClient {
             conn,
             mut stream,
             qsid,
-            uncompressed,
+            uncompressed: _,
             public_addr,
             observed_addr: _,
-            contexts: _,
+            contexts,
         } = self;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
+        // The pump owns the stream, so anything that wants to *write* a
+        // capsule — the §10.4 lockdown — hands it over here.
+        let (capsule_tx, mut capsule_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        // Shared with the send half: it picks its framing from this table, the
+        // pump decodes inbound against it and promotes a context on ACK.
+        let contexts = Arc::new(Mutex::new(contexts));
+        let acked = Arc::new(tokio::sync::Notify::new());
         let conn_rx = conn.clone();
+        let pump_contexts = contexts.clone();
+        let pump_acked = acked.clone();
         let recv = tokio::spawn(async move {
-            // Hold the session's resources open for the socket's lifetime and
-            // serve two streams: inner-QUIC datagrams (to the relay socket) and
-            // control capsules (relay-assisted PEER_REFLEXIVE signals).
+            // Hold the session's resources open for the socket's lifetime.
             let _endpoint = _endpoint;
             let _send_request = _send_request;
             let mut capsules = crate::capsule::CapsuleBuffer::new();
@@ -978,8 +981,17 @@ impl BindClient {
                             continue;
                         }
                         let body = wire.slice(wire.len() - cursor.remaining()..);
-                        if let Ok((_, remote, payload)) = decode_uncompressed_body(body) {
-                            let _ = tx.try_send((remote, payload));
+                        // Decoded against the table, so a compressed context
+                        // (post-lockdown) supplies the remote the wire omits.
+                        let decoded = pump_contexts.lock().unwrap().decode_datagram(body);
+                        match decoded {
+                            Ok(dg) => { let _ = tx.try_send((dg.remote, dg.payload)); }
+                            Err(e) => tracing::trace!("relay pump dropped datagram: {e}"),
+                        }
+                    }
+                    Some(out) = capsule_rx.recv() => {
+                        if stream.send_data(out).await.is_err() {
+                            return;
                         }
                     }
                     data = stream.recv_data() => {
@@ -989,15 +1001,22 @@ impl BindClient {
                                 while let Ok(Some(Capsule::Unknown { type_id, data })) =
                                     capsules.next_capsule()
                                 {
-                                    if type_id == CAPSULE_PEER_REFLEXIVE
-                                        && let Ok(addr) = decode_peer_reflexive(data)
-                                        && let Some(sink) = &peer_reflexive_sink
+                                    // The relay acknowledging a context we
+                                    // proposed is what makes it usable.
+                                    if type_id == CAPSULE_COMPRESSION_ACK
+                                        && let Ok(id) = decode_context_capsule(data)
                                     {
-                                        tracing::debug!(%addr, "bind: PEER_REFLEXIVE from relay");
-                                        let mut v = sink.lock().unwrap();
-                                        if !v.contains(&addr) {
-                                            v.push(addr);
+                                        match pump_contexts.lock().unwrap().ack(id) {
+                                            Ok(()) => tracing::debug!(
+                                                context = id,
+                                                "relay acknowledged compression context"
+                                            ),
+                                            Err(e) => tracing::debug!(
+                                                context = id,
+                                                "unexpected COMPRESSION_ACK: {e}"
+                                            ),
                                         }
+                                        pump_acked.notify_waiters();
                                     }
                                 }
                             }
@@ -1011,7 +1030,9 @@ impl BindClient {
         crate::p2p::relay_socket::RelayParts {
             conn,
             qsid,
-            uncompressed,
+            contexts,
+            capsules: capsule_tx,
+            acked,
             local: public_addr,
             rx,
             recv_task: recv,
@@ -1019,13 +1040,8 @@ impl BindClient {
     }
 
     /// Turn this bind session into a relay-only inner-QUIC socket.
-    pub fn into_relay_socket(
-        self,
-        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> crate::p2p::relay_socket::RelaySocket {
-        crate::p2p::relay_socket::RelaySocket::from_parts(
-            self.into_relay_parts(peer_reflexive_sink),
-        )
+    pub fn into_relay_socket(self) -> crate::p2p::relay_socket::RelaySocket {
+        crate::p2p::relay_socket::RelaySocket::from_parts(self.into_relay_parts())
     }
 }
 

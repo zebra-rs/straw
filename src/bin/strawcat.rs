@@ -170,7 +170,7 @@ async fn run() -> Result<(), ProxyError> {
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let nat_mapping = report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
-    let listener = peer::listen(relay_access(&args)?, &identity, None, None).await?;
+    let listener = peer::listen(relay_access(&args)?, &identity, None).await?;
     let inputs = PunchInputs {
         mux: listener.mux.clone(),
         reflexive: listener.reflexive,
@@ -227,7 +227,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     if token.is_expired(now()) {
         return Err(ProxyError::InvalidRequest("token has expired".into()));
     }
-    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token, None).await?;
+    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token).await?;
     eprintln!("connected to peer {} via relay", hex(&token.peer_pin()));
     let inputs = PunchInputs {
         mux: peer_conn.mux.clone(),

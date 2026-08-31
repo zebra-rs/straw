@@ -1045,6 +1045,99 @@ async fn bind_session_relays_udp_both_ways() {
 }
 
 #[tokio::test]
+async fn lockdown_binds_the_relay_to_one_peer_and_keeps_carrying_it() {
+    use noq::udp::Transmit;
+    use noq::{AsyncUdpSocket, UdpSender};
+    use tokio::net::UdpSocket;
+
+    // Two loopback remotes: the "peer" the session will lock down to, and a
+    // stranger that must stop being reachable once it has.
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stranger_addr = stranger.local_addr().unwrap();
+
+    let server = TestServer::start_with(enable_bind).await;
+    let client = BindClient::connect(
+        server.addr,
+        "localhost",
+        TlsMode::Ca(server.cert.clone()),
+        ClientAuth::None,
+    )
+    .await
+    .expect("bind session opens");
+    let public_addr = client.public_addr;
+
+    let socket = client.into_relay_socket();
+    let lockdown = socket.lockdown_for(peer_addr);
+
+    // Engaging drives the real capsule exchange against the real relay:
+    // COMPRESSION_ASSIGN out, COMPRESSION_ACK back (which is what promotes the
+    // context), then COMPRESSION_CLOSE of the uncompressed one.
+    let bound = tokio::time::timeout(Duration::from_secs(5), lockdown.engage())
+        .await
+        .expect("lockdown completes within 5s")
+        .expect("relay acknowledges the compressed context");
+    assert_eq!(bound, peer_addr);
+
+    // Outbound still reaches the peer — with the address elided from the wire,
+    // which only works if the relay resolved it from the context. This is the
+    // G3 property: locking down narrows the relay, it does not close it.
+    let mut sender = socket.create_sender();
+    async fn send(
+        sender: &mut std::pin::Pin<Box<dyn UdpSender>>,
+        dst: std::net::SocketAddr,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
+        std::future::poll_fn(|cx| {
+            sender.as_mut().poll_send(
+                &Transmit {
+                    destination: dst,
+                    ecn: None,
+                    contents: payload,
+                    segment_size: None,
+                    src_ip: None,
+                },
+                cx,
+            )
+        })
+        .await
+    }
+    send(&mut sender, peer_addr, b"after-lockdown")
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 128];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("the peer still hears us through the relay")
+        .unwrap();
+    assert_eq!(&buf[..n], b"after-lockdown");
+    assert_eq!(
+        from, public_addr,
+        "the relay forwards from this session's public address"
+    );
+
+    // Our side stops carrying anyone else: no context can frame it, so the
+    // packet never leaves. Sending must not error — dropping is correct.
+    // (That the *relay* also drops such traffic at its edge is what makes this
+    // worth doing, and is tested where it can actually be observed:
+    // udp_bind::socket::tests::after_lockdown_only_the_bound_peer_reaches_the_session.
+    // Asserting it from here would pass for the wrong reason, since this
+    // session's own table can no longer decode a stranger's datagram either.)
+    send(&mut sender, stranger_addr, b"should-not-arrive")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 128];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), stranger.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "post-lockdown, nothing but the bound peer may be sent through the relay"
+    );
+}
+
+#[tokio::test]
 async fn connect_udp_is_refused_when_bind_disabled() {
     // Default server has bind mode off: the request is rejected, not served.
     let server = TestServer::start().await;
@@ -1092,8 +1185,8 @@ async fn inner_quic_connects_peer_to_peer_through_the_relay() {
     .expect("peer B bind");
     let b_pub = b.public_addr;
 
-    let sock_a = a.into_relay_socket(None);
-    let sock_b = b.into_relay_socket(None);
+    let sock_a = a.into_relay_socket();
+    let sock_b = b.into_relay_socket();
 
     // Inner TLS: self-signed, verification skipped — this test isolates the
     // transport; SPKI-pinned RFC 7250 mTLS is the identity layer on top.
@@ -1171,8 +1264,8 @@ async fn dial_inner(
     .await
     .unwrap();
     let b_pub = b.public_addr;
-    let ep_b = inner_endpoint(b.into_relay_socket(None), Some(server_cfg)).unwrap();
-    let ep_a = inner_endpoint(a.into_relay_socket(None), None).unwrap();
+    let ep_b = inner_endpoint(b.into_relay_socket(), Some(server_cfg)).unwrap();
+    let ep_a = inner_endpoint(a.into_relay_socket(), None).unwrap();
     let accept = tokio::spawn(async move {
         let incoming = ep_b.accept().await.expect("incoming");
         incoming.await
@@ -1266,7 +1359,7 @@ async fn strawcat_peers_pipe_over_a_token() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .expect("issuer listens");
 
@@ -1284,7 +1377,7 @@ async fn strawcat_peers_pipe_over_a_token() {
 
     // Listener accept and holder connect must run concurrently to handshake.
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_conn = peer::connect(relay_access(&relay), &holder, &decoded, None)
+    let holder_conn = peer::connect(relay_access(&relay), &holder, &decoded)
         .await
         .expect("holder connects");
     let issuer_conn = accept.await.unwrap().expect("issuer accepts");
@@ -1314,7 +1407,7 @@ async fn relay_path_carries_a_large_transfer() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .expect("issuer listens");
     let token = TokenV2::issue(
@@ -1328,7 +1421,7 @@ async fn relay_path_carries_a_large_transfer() {
     );
 
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_conn = peer::connect(relay_access(&relay), &holder, &token, None)
+    let holder_conn = peer::connect(relay_access(&relay), &holder, &token)
         .await
         .expect("holder connects");
     let issuer_conn = accept.await.unwrap().expect("issuer accepts");
@@ -1397,7 +1490,7 @@ async fn peers_open_a_direct_path_over_the_mux() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .unwrap();
     let issuer_paddr = listener.paddr;
@@ -1415,7 +1508,7 @@ async fn peers_open_a_direct_path_over_the_mux() {
     );
 
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
         .await
         .unwrap();
     let holder_direct = SocketAddr::new(
@@ -1481,7 +1574,7 @@ async fn a_session_punches_and_promotes_the_direct_path() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .unwrap();
     let issuer_inputs = PunchInputs {
@@ -1501,7 +1594,7 @@ async fn a_session_punches_and_promotes_the_direct_path() {
     );
 
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
         .await
         .unwrap();
     let holder_direct = holder_side.mux.direct_local().port();
@@ -1583,7 +1676,7 @@ async fn peers_punch_a_direct_path_over_ipv6() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .unwrap();
     assert!(
@@ -1611,7 +1704,7 @@ async fn peers_punch_a_direct_path_over_ipv6() {
     );
 
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
         .await
         .unwrap();
     let issuer_conn = accept.await.unwrap().unwrap();
@@ -1679,7 +1772,7 @@ async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
 
-    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+    let listener = peer::listen(relay_access(&relay), &issuer, None)
         .await
         .unwrap();
     let issuer_inputs = PunchInputs {
@@ -1698,7 +1791,7 @@ async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
     );
 
     let accept = tokio::spawn(async move { listener.accept().await });
-    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token)
         .await
         .unwrap();
     let issuer_conn = accept.await.unwrap().unwrap();

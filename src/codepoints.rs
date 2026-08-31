@@ -14,7 +14,6 @@
 //! |---|---|---|
 //! | compression capsules `0x11`–`0x13` | draft-ietf-masque-connect-udp-listen final codepoints | RFC publication |
 //! | `OBSERVED_ADDRESS` capsule `0x14` | draft-ietf-quic-address-discovery OBSERVED_ADDRESS **frame** | quinn frame-extension API |
-//! | `PEER_REFLEXIVE` capsule `0x15` | none (straw-specific relay-assist) | retire — its only consumer, the `relay-assisted` strategy, does not port to native traversal |
 //! | ~~CBOR `Candidate`/`Punch`/`Retire` on inner stream 0~~ | **done** — noq's NAT-traversal frames + `nat_traversal` transport param | — |
 //! | ~~race a second connection + app switchover~~ | **done** — path validation + promotion of the one inner connection | — |
 //! | token `v2` / `sc2_` | TBD if a standard token format emerges | — |
@@ -40,12 +39,6 @@ pub const CAPSULE_COMPRESSION_CLOSE: u64 = 0x13;
 /// (design §5.1). v1: vendor capsule `0x14`. v2: draft-ietf-quic-address-
 /// discovery `OBSERVED_ADDRESS` **frame**, once quinn exposes frame extensions.
 pub const CAPSULE_OBSERVED_ADDRESS: u64 = 0x14;
-
-/// A *peer-facing* source the on-path relay observed for the other peer
-/// (relay-assisted symmetric-NAT traversal, design §12); same address body as
-/// `OBSERVED_ADDRESS`. v1: vendor capsule `0x15`. Straw-specific — no standard
-/// target; kept or retired in v2 as relay-assist evolves.
-pub const CAPSULE_PEER_REFLEXIVE: u64 = 0x15;
 
 // --- inner protocol ---------------------------------------------------------
 
@@ -86,7 +79,6 @@ mod tests {
             CAPSULE_COMPRESSION_ACK,
             CAPSULE_COMPRESSION_CLOSE,
             CAPSULE_OBSERVED_ADDRESS,
-            CAPSULE_PEER_REFLEXIVE,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {

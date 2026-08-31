@@ -55,11 +55,35 @@ an allow. Per-session packet- and byte-rate caps
 
 ## What the relay is for
 
+## Locking the relay down to one peer
+
+While a session has an **uncompressed** context open, every datagram spells its
+remote address out — which is what lets a peer talk to many candidates during a
+punch, and also means the relay will forward whatever arrives at its public
+bind port. Once a direct path carries the traffic, neither is needed.
+
+The peer then registers a **compressed** context bound to the other peer's
+relay address and closes the uncompressed one (design §10.4). Two things follow.
+Datagrams on the relay path stop carrying an address at all — the context
+supplies it. And the relay becomes a firewall: with no uncompressed context and
+no compressed match, an inbound packet is dropped at its edge rather than
+forwarded as an inner-QUIC packet for the peer to parse.
+
+The relay path is **not** closed — it stays as the permanent fallback. Lockdown
+narrows what may travel it, so a later fallback still works. That ordering is
+load-bearing: the compressed context has to be *acknowledged* before the
+uncompressed one is closed, because a fallback landing in between would have no
+context able to carry it, and the relay path would blackhole silently rather
+than fail. If the relay never acknowledges, the peer keeps the uncompressed
+context: a wider attack surface is better than a broken tunnel.
+
 Two capabilities fall out of bind mode:
 
 1. **Rendezvous + fallback** for strawcat: peers meet here and, if they cannot
    punch a direct path, keep using the relay as a blind forwarder.
 2. **The seed for punching**: `OBSERVED_ADDRESS` gives each peer its reflexive
-   candidate, and — with `--udp-bind-observe` — the on-path relay can also
-   observe each peer's *peer-facing* source for
-   [relay-assisted traversal](ch-03-04-symmetric-nat.md).
+   candidate — the address it advertises to the other side. The relay once
+   also observed each peer's *peer-facing* source, for
+   [relay-assisted traversal](ch-03-04-symmetric-nat.md); that observer has
+   been removed, because probes stopped passing through the relay when the
+   punch moved into the QUIC layer.

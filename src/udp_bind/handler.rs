@@ -156,27 +156,13 @@ pub async fn handle_connect_udp_bind_stream(
     crate::metrics::Metrics::incr(&ctx.metrics.sessions_total);
     tracing::info!(session = %session_id, %bound_addr, "bind session established");
 
-    // Relay-assisted traversal: let the on-path observer report this peer's
-    // peer-facing sources so we can signal them to the peer (design §12).
-    let observer = ctx.udp_bind.observer().cloned();
-    let peer_ip = quinn_conn.remote_address().ip();
-    let reflexive_rx = observer.as_ref().map(|obs| {
-        let (tx, rx) = mpsc::channel::<std::net::SocketAddr>(16);
-        obs.register(peer_ip, tx);
-        rx
-    });
-
-    // 6. Capsule loop: compression-context registration on the stream, plus
-    // outbound PEER_REFLEXIVE signals from the observer.
-    let result = run_capsules(&mut stream, &contexts, reflexive_rx).await;
+    // 6. Capsule loop: compression-context registration on the stream.
+    let result = run_capsules(&mut stream, &contexts).await;
 
     // Teardown.
     egress.abort();
     socket_task.abort();
     ctx.udp_bind.unregister(session_id);
-    if let Some(obs) = &observer {
-        obs.unregister(&peer_ip);
-    }
     allocator.release(public_addr);
     tracing::info!(session = %session_id, "bind session closed");
     result
@@ -230,40 +216,20 @@ fn header_is(req: &Request<()>, name: &str, value: &str) -> bool {
 async fn run_capsules(
     stream: &mut ServerStream,
     contexts: &Arc<Mutex<ContextTable>>,
-    mut reflexive_rx: Option<mpsc::Receiver<std::net::SocketAddr>>,
 ) -> Result<(), ProxyError> {
     let mut buffer = CapsuleBuffer::new();
     loop {
-        tokio::select! {
-            data = stream.recv_data() => match data? {
-                Some(chunk) => {
-                    buffer.push(chunk);
-                    while let Some(capsule) = buffer.next_capsule()? {
-                        if let crate::capsule::Capsule::Unknown { type_id, data } = capsule {
-                            handle_context_capsule(stream, type_id, data, contexts).await?;
-                        }
+        match stream.recv_data().await? {
+            Some(chunk) => {
+                buffer.push(chunk);
+                while let Some(capsule) = buffer.next_capsule()? {
+                    if let crate::capsule::Capsule::Unknown { type_id, data } = capsule {
+                        handle_context_capsule(stream, type_id, data, contexts).await?;
                     }
                 }
-                None => return Ok(()),
-            },
-            // The observer saw the other peer's peer-facing source — signal it.
-            Some(src) = maybe_recv(&mut reflexive_rx) => {
-                let mut buf = BytesMut::new();
-                crate::udp_bind::context::encode_peer_reflexive(src, &mut buf);
-                stream.send_data(buf.freeze()).await?;
             }
+            None => return Ok(()),
         }
-    }
-}
-
-/// Await the next signal, or never (so `select!` ignores this branch when the
-/// observer is off).
-async fn maybe_recv(
-    rx: &mut Option<mpsc::Receiver<std::net::SocketAddr>>,
-) -> Option<std::net::SocketAddr> {
-    match rx {
-        Some(r) => r.recv().await,
-        None => std::future::pending().await,
     }
 }
 

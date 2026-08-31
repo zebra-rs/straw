@@ -27,6 +27,9 @@ pub enum PunchStrategy {
     /// mapping the far NAT created toward the other peer) and signal it, so both
     /// sides dial the real address. Traverses symmetric NATs when the relay
     /// routes between the peers.
+    /// Accepted for compatibility only: the relay-side observer it needed was
+    /// removed with the `PEER_REFLEXIVE` capsule, so this behaves as `basic`
+    /// and warns.
     RelayAssisted,
 }
 

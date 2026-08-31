@@ -25,13 +25,16 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, UdpSender};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
-use crate::udp_bind::context::encode_uncompressed_body;
+use crate::codepoints::CAPSULE_COMPRESSION_CLOSE;
+use crate::error::ProxyError;
+use crate::udp_bind::context::{Binding, CompressionAssign, ContextTable, encode_context_capsule};
 
 /// Aborts its task when dropped, so tearing down the socket ends the recv
 /// pump and drops the bind request stream (closing the relay session).
@@ -44,12 +47,29 @@ impl Drop for AbortOnDrop {
 }
 
 /// Encode one inner packet to `dst` as a bind datagram on session `qsid`.
-fn frame_bind(qsid: u64, uncompressed: u64, dst: SocketAddr, contents: &[u8]) -> Bytes {
-    let body = encode_uncompressed_body(uncompressed, dst, contents);
+///
+/// The framing is whatever the context table can carry: a compressed context
+/// bound to `dst` if one is active (the post-lockdown steady state, §10.4),
+/// otherwise the uncompressed context that spells the address out. `None`
+/// means neither exists — after lockdown that is the correct answer for any
+/// destination but the peer, and the packet is dropped rather than leaked.
+fn frame_bind(
+    qsid: u64,
+    contexts: &Mutex<ContextTable>,
+    dst: SocketAddr,
+    contents: &[u8],
+) -> Option<Bytes> {
+    let body = {
+        let table = contexts.lock().unwrap();
+        let id = table
+            .compressed_context_for(dst)
+            .or_else(|| table.uncompressed_context())?;
+        table.encode_datagram(id, dst, contents).ok()?
+    };
     let mut wire = bytes::BytesMut::with_capacity(8 + body.len());
     crate::capsule::codec::write_varint(&mut wire, qsid).expect("qsid fits varint");
     wire.extend_from_slice(&body);
-    wire.freeze()
+    Some(wire.freeze())
 }
 
 /// A QUIC socket whose datagrams ride a bind session (design §4).
@@ -59,7 +79,9 @@ pub struct RelaySocket {
     /// as CONNECT-UDP bind datagrams.
     conn: quinn::Connection,
     qsid: u64,
-    uncompressed: u64,
+    contexts: Arc<Mutex<ContextTable>>,
+    capsules: mpsc::Sender<Bytes>,
+    acked: Arc<Notify>,
     local: SocketAddr,
     inbound: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
     _recv: AbortOnDrop,
@@ -68,34 +90,32 @@ pub struct RelaySocket {
 impl RelaySocket {
     /// Wire up a relay socket from a bind session's parts. `recv_task` owns
     /// the request stream (keeping the session open) and feeds `inbound`.
-    pub(crate) fn new(
-        conn: quinn::Connection,
-        qsid: u64,
-        uncompressed: u64,
-        local: SocketAddr,
-        inbound: mpsc::Receiver<(SocketAddr, Bytes)>,
-        recv_task: tokio::task::JoinHandle<()>,
-    ) -> Self {
+    /// Build from the shared [`RelayParts`] seam.
+    pub(crate) fn from_parts(parts: RelayParts) -> Self {
         Self {
-            conn,
-            qsid,
-            uncompressed,
-            local,
-            inbound: Mutex::new(inbound),
-            _recv: AbortOnDrop(recv_task),
+            conn: parts.conn,
+            qsid: parts.qsid,
+            contexts: parts.contexts,
+            capsules: parts.capsules,
+            acked: parts.acked,
+            local: parts.local,
+            inbound: Mutex::new(parts.rx),
+            _recv: AbortOnDrop(parts.recv_task),
         }
     }
 
-    /// Build from the shared [`RelayParts`] seam.
-    pub(crate) fn from_parts(parts: RelayParts) -> Self {
-        Self::new(
-            parts.conn,
-            parts.qsid,
-            parts.uncompressed,
-            parts.local,
-            parts.rx,
-            parts.recv_task,
-        )
+    /// The §10.4 lockdown for this session, bound to `peer`.
+    ///
+    /// A relay-only socket talks to one peer as much as a mux does; the
+    /// difference is only that nothing here *learns* the address, so the
+    /// caller names it.
+    pub fn lockdown_for(&self, peer: SocketAddr) -> RelayLockdown {
+        RelayLockdown {
+            contexts: self.contexts.clone(),
+            capsules: self.capsules.clone(),
+            acked: self.acked.clone(),
+            relay_remotes: Arc::new(Mutex::new(std::iter::once(peer).collect())),
+        }
     }
 }
 
@@ -106,7 +126,15 @@ impl RelaySocket {
 pub struct RelayParts {
     pub conn: quinn::Connection,
     pub qsid: u64,
-    pub uncompressed: u64,
+    /// Shared with the session's receive pump: it decodes inbound datagrams
+    /// against this table and promotes a context when the relay ACKs it, while
+    /// the send half picks its framing from it (§10.4).
+    pub contexts: Arc<Mutex<ContextTable>>,
+    /// Outbound capsules for the pump to write on the request stream — how
+    /// the lockdown sends COMPRESSION_ASSIGN and COMPRESSION_CLOSE.
+    pub capsules: mpsc::Sender<Bytes>,
+    /// Signalled by the pump whenever a context is acknowledged.
+    pub acked: Arc<Notify>,
     pub local: SocketAddr,
     pub rx: mpsc::Receiver<(SocketAddr, Bytes)>,
     pub recv_task: tokio::task::JoinHandle<()>,
@@ -118,7 +146,7 @@ pub struct RelayParts {
 struct RelaySender {
     conn: quinn::Connection,
     qsid: u64,
-    uncompressed: u64,
+    contexts: Arc<Mutex<ContextTable>>,
 }
 
 impl UdpSender for RelaySender {
@@ -129,12 +157,16 @@ impl UdpSender for RelaySender {
     ) -> Poll<io::Result<()>> {
         // max_transmit_segments == 1, so a transmit is one datagram and
         // segment_size is None.
-        let wire = frame_bind(
+        let Some(wire) = frame_bind(
             self.qsid,
-            self.uncompressed,
+            &self.contexts,
             transmit.destination,
             transmit.contents,
-        );
+        ) else {
+            // No context can carry it: post-lockdown, to anyone but the peer.
+            tracing::trace!(dst = %transmit.destination, "no relay context; dropping");
+            return Poll::Ready(Ok(()));
+        };
         Poll::Ready(self.conn.send_datagram(wire).map_err(io::Error::other))
     }
 
@@ -148,7 +180,7 @@ impl AsyncUdpSocket for RelaySocket {
         Box::pin(RelaySender {
             conn: self.conn.clone(),
             qsid: self.qsid,
-            uncompressed: self.uncompressed,
+            contexts: self.contexts.clone(),
         })
     }
 
@@ -262,6 +294,7 @@ pub fn inner_endpoint(
 #[derive(Clone, Debug)]
 pub struct PathMuxHandle {
     direct_local: SocketAddr,
+    lockdown: Option<RelayLockdown>,
 }
 
 impl PathMuxHandle {
@@ -270,11 +303,119 @@ impl PathMuxHandle {
         self.direct_local
     }
 
+    /// The §10.4 relay lockdown for this session, if it has a relay path.
+    pub fn lockdown(&self) -> Option<&RelayLockdown> {
+        self.lockdown.as_ref()
+    }
+
     /// A handle with no socket behind it, so candidate assembly can be tested
     /// against a known port without standing up an endpoint.
     #[cfg(test)]
     pub(crate) fn for_test(direct_local: SocketAddr) -> Self {
-        Self { direct_local }
+        Self {
+            direct_local,
+            lockdown: None,
+        }
+    }
+}
+
+/// The §10.4 lockdown: once a direct path carries the traffic, bind the peer
+/// to a *compressed* context and close the uncompressed one.
+///
+/// The point is the relay's edge. Its bind port is public and forwards what
+/// arrives; while an uncompressed context is open, anything that reaches that
+/// port is forwarded to us as an inner-QUIC packet to parse. With only a
+/// compressed context registered, the relay drops everything that is not from
+/// the bound peer, before it ever reaches us.
+///
+/// The relay path itself is *not* closed — it stays as the permanent fallback
+/// (design G3). Lockdown only narrows what may travel it, so a later fallback
+/// still works, now with the address elided from every datagram.
+#[derive(Clone, Debug)]
+pub struct RelayLockdown {
+    contexts: Arc<Mutex<ContextTable>>,
+    capsules: mpsc::Sender<Bytes>,
+    acked: Arc<Notify>,
+    relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+}
+
+/// How long to wait for the relay's COMPRESSION_ACK before giving up and
+/// leaving the uncompressed context open.
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl RelayLockdown {
+    /// The peer's relay-facing address, once one is known.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.relay_remotes.lock().unwrap().iter().copied().next()
+    }
+
+    /// Engage the lockdown: register a compressed context for the peer, wait
+    /// for the relay to acknowledge it, then close the uncompressed one.
+    ///
+    /// Ordering matters and is not an accident: the compressed context has to
+    /// be *acknowledged* before the uncompressed one goes, or a fallback in
+    /// that window would have no context able to carry it and the relay path
+    /// would silently blackhole. On timeout it leaves everything as it was —
+    /// an open uncompressed context is a wider attack surface, not a broken
+    /// session.
+    pub async fn engage(&self) -> Result<SocketAddr, ProxyError> {
+        let Some(peer) = self.peer() else {
+            return Err(ProxyError::InvalidRequest(
+                "no relay remote learned; nothing to bind a context to".into(),
+            ));
+        };
+        let (assign_id, uncompressed) = {
+            let mut table = self.contexts.lock().unwrap();
+            if table.compressed_context_for(peer).is_some() {
+                return Ok(peer); // already engaged
+            }
+            let uncompressed = table.uncompressed_context().ok_or_else(|| {
+                ProxyError::InvalidRequest("uncompressed context already closed".into())
+            })?;
+            // Client-allocated ids are even (RFC 9297 §3.2).
+            let id = uncompressed + 2;
+            let assign = CompressionAssign {
+                context_id: id,
+                binding: Binding::Compressed(peer),
+            };
+            table
+                .register(assign.clone())
+                .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?;
+            let mut buf = bytes::BytesMut::new();
+            assign.encode(&mut buf);
+            self.capsules
+                .try_send(buf.freeze())
+                .map_err(|e| ProxyError::InvalidRequest(format!("capsule queue: {e}")))?;
+            (id, uncompressed)
+        };
+
+        // Wait for the pump to promote it on COMPRESSION_ACK.
+        let activated = tokio::time::timeout(ACK_TIMEOUT, async {
+            loop {
+                let wait = self.acked.notified();
+                if self.contexts.lock().unwrap().binding(assign_id).is_some() {
+                    return;
+                }
+                wait.await;
+            }
+        })
+        .await;
+        if activated.is_err() {
+            self.contexts.lock().unwrap().close(assign_id);
+            return Err(ProxyError::InvalidRequest(
+                "relay did not acknowledge the compressed context".into(),
+            ));
+        }
+
+        // Only now is it safe to drop the uncompressed context.
+        let mut buf = bytes::BytesMut::new();
+        encode_context_capsule(CAPSULE_COMPRESSION_CLOSE, uncompressed, &mut buf);
+        self.capsules
+            .try_send(buf.freeze())
+            .map_err(|e| ProxyError::InvalidRequest(format!("capsule queue: {e}")))?;
+        self.contexts.lock().unwrap().close(uncompressed);
+        tracing::info!(%peer, context = assign_id, "relay locked down to the peer (§10.4)");
+        Ok(peer)
     }
 }
 
@@ -283,7 +424,7 @@ impl PathMuxHandle {
 pub struct PathMuxSocket {
     relay: quinn::Connection,
     qsid: u64,
-    uncompressed: u64,
+    contexts: Arc<Mutex<ContextTable>>,
     local: SocketAddr,
     direct: Arc<tokio::net::UdpSocket>,
     direct_local: SocketAddr,
@@ -297,7 +438,7 @@ pub struct PathMuxSocket {
 struct PathMuxSender {
     relay: quinn::Connection,
     qsid: u64,
-    uncompressed: u64,
+    contexts: Arc<Mutex<ContextTable>>,
     direct: Arc<tokio::net::UdpSocket>,
     relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
 }
@@ -315,12 +456,15 @@ impl UdpSender for PathMuxSender {
             .contains(&transmit.destination);
         if via_relay {
             // Relay path: tunnel through the outer bind connection.
-            let wire = frame_bind(
+            let Some(wire) = frame_bind(
                 self.qsid,
-                self.uncompressed,
+                &self.contexts,
                 transmit.destination,
                 transmit.contents,
-            );
+            ) else {
+                tracing::trace!(dst = %transmit.destination, "no relay context; dropping");
+                return Poll::Ready(Ok(()));
+            };
             Poll::Ready(self.relay.send_datagram(wire).map_err(io::Error::other))
         } else {
             // Everything else — including NAT-traversal probes to peer
@@ -346,7 +490,7 @@ impl AsyncUdpSocket for PathMuxSocket {
         Box::pin(PathMuxSender {
             relay: self.relay.clone(),
             qsid: self.qsid,
-            uncompressed: self.uncompressed,
+            contexts: self.contexts.clone(),
             direct: self.direct.clone(),
             relay_remotes: self.relay_remotes.clone(),
         })
@@ -458,11 +602,11 @@ pub fn mux_endpoint(
     let socket = PathMuxSocket {
         relay: parts.conn,
         qsid: parts.qsid,
-        uncompressed: parts.uncompressed,
+        contexts: parts.contexts.clone(),
         local: parts.local,
         direct,
         direct_local,
-        relay_remotes,
+        relay_remotes: relay_remotes.clone(),
         relay_rx: Mutex::new(parts.rx),
         _recv: AbortOnDrop(parts.recv_task),
     };
@@ -472,12 +616,84 @@ pub fn mux_endpoint(
         Box::new(socket),
         Arc::new(noq::TokioRuntime),
     )?;
-    Ok((endpoint, PathMuxHandle { direct_local }))
+    Ok((
+        endpoint,
+        PathMuxHandle {
+            direct_local,
+            lockdown: Some(RelayLockdown {
+                contexts: parts.contexts,
+                capsules: parts.capsules,
+                acked: parts.acked,
+                relay_remotes,
+            }),
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table_with(uncompressed: u64, compressed: Option<(u64, SocketAddr)>) -> Mutex<ContextTable> {
+        let mut t = ContextTable::new();
+        t.register(CompressionAssign {
+            context_id: uncompressed,
+            binding: Binding::Uncompressed,
+        })
+        .unwrap();
+        t.ack(uncompressed).unwrap();
+        if let Some((id, peer)) = compressed {
+            t.register(CompressionAssign {
+                context_id: id,
+                binding: Binding::Compressed(peer),
+            })
+            .unwrap();
+            t.ack(id).unwrap();
+        }
+        Mutex::new(t)
+    }
+
+    /// Framing follows the table, and the choice is what §10.4 turns on: while
+    /// the uncompressed context is open every destination is reachable, and
+    /// once it is closed only the bound peer is — anything else must be
+    /// dropped rather than sent with a framing the relay would refuse.
+    #[test]
+    fn framing_prefers_the_compressed_context_and_stops_at_lockdown() {
+        let peer = addr("198.51.100.7:443");
+        let other = addr("203.0.113.9:443");
+
+        // Before lockdown: both destinations ride the uncompressed context,
+        // which spells the address out (so the body is longer than the input).
+        let open = table_with(2, None);
+        let to_peer = frame_bind(4, &open, peer, b"hello").expect("uncompressed carries the peer");
+        assert!(
+            frame_bind(4, &open, other, b"hello").is_some(),
+            "and anyone else"
+        );
+
+        // After the compressed context is acked, the peer's datagrams elide
+        // the address: same payload, strictly smaller wire.
+        let bound = table_with(2, Some((4, peer)));
+        let compressed = frame_bind(4, &bound, peer, b"hello").expect("compressed carries it");
+        assert!(
+            compressed.len() < to_peer.len(),
+            "compressed framing should be smaller: {} vs {}",
+            compressed.len(),
+            to_peer.len()
+        );
+
+        // After lockdown — uncompressed closed — only the peer is reachable.
+        let locked = table_with(2, Some((4, peer)));
+        locked.lock().unwrap().close(2);
+        assert!(
+            frame_bind(4, &locked, peer, b"hello").is_some(),
+            "the relay path must keep working for the peer (design G3)"
+        );
+        assert!(
+            frame_bind(4, &locked, other, b"hello").is_none(),
+            "no context can carry anyone else; the packet must be dropped"
+        );
+    }
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()

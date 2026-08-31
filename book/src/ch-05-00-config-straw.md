@@ -44,7 +44,6 @@ mirror the flags; see `straw.example.toml` in the repository.
 | `--udp-bind-port-lo <n>` / `--udp-bind-port-hi <n>` | Bind-session port range. |
 | `--udp-bind-allow-dest <cidrs>` | Destination prefixes the SSRF guard re-permits. |
 | `--udp-bind-max-pps` / `--udp-bind-max-bps` | Per-session egress caps. |
-| `--udp-bind-observe` | On-path punch observer for relay-assisted traversal (needs `CAP_NET_RAW`). |
 
 ## The RFC 5780 STUN server
 
@@ -73,6 +72,5 @@ straw \
     --udp-bind --udp-bind-public-ips 203.0.113.10 \
     --udp-bind-port-lo 30000 --udp-bind-port-hi 40000 \
     --auth-mode bearer --auth-token "$RELAY_TOKEN" \
-    --udp-bind-observe \
     --stun-addr 203.0.113.10:3478 --stun-alt-addr 203.0.113.11:3479
 ```

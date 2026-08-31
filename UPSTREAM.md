@@ -94,17 +94,18 @@ cargo search h3 --limit 1              # newer than 0.0.8?
 
 **What we carry.** Every provisional wire number lives in `src/codepoints.rs`:
 the connect-udp-listen compression capsules `0x11`–`0x13`, `OBSERVED_ADDRESS`
-`0x14`, the straw-specific `PEER_REFLEXIVE` `0x15`, the `strawcat/1` ALPN and
-the `sc2_` token marker.
+`0x14`, the `strawcat/1` ALPN and the `sc2_` token marker.
 
 **What lands it.** Publication of draft-ietf-masque-connect-udp-listen with
 final codepoints. Both endpoints are ours, so the interop cost of being early
 is only with our own older builds — and tokens carry a version, so a v1 and a
 v2 peer fail cleanly.
 
-`PEER_REFLEXIVE` is different: it is ours, not a draft's, and its only consumer
-was the `relay-assisted` punch strategy, which does not port to QUIC-native NAT
-traversal. It should be **retired** rather than migrated.
+`PEER_REFLEXIVE` (`0x15`) used to be listed here as a special case: ours rather
+than a draft's, with its only consumer — the `relay-assisted` punch strategy —
+unable to port to QUIC-native NAT traversal. It has since been **retired**
+rather than migrated, so it is no longer a gate: the capsule, its codec, the
+relay's `--udp-bind-observe` observer and the peer-side sink are all deleted.
 
 **Check:** the draft's status at
 <https://datatracker.ietf.org/doc/draft-ietf-masque-connect-udp-listen/>.

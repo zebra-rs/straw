@@ -94,12 +94,12 @@ if [ "$NAT_MODE" = cone ]; then
 else
     echo "  NAT_MODE=symmetric — MASQUERADE; punch best-effort (set NAT_MODE=cone for EIM)"
 fi
-# STRATEGY selects the peers' NAT-traversal strategy; relay-assisted also turns
-# on the relay's on-path observer.
+# STRATEGY selects the peers' NAT-traversal strategy. Only basic and predict
+# have an implementation; birthday and relay-assisted warn and fall back to
+# basic (relay-assisted's on-path observer was removed with the PEER_REFLEXIVE
+# capsule, since native-traversal probes never reach the relay).
 STRATEGY=${STRATEGY:-basic}
-OBSERVE_FLAG=""
-[ "$STRATEGY" = relay-assisted ] && OBSERVE_FLAG="--udp-bind-observe"
-echo "  STRATEGY=$STRATEGY${OBSERVE_FLAG:+ (relay observer on)}"
+echo "  STRATEGY=$STRATEGY"
 # PORTMAP=1 runs a PCP/NAT-PMP responder in each NAT that installs an explicit
 # 1:1 port-forward on request, and passes --port-map to the peers.
 # DIRECT picks which candidates the peers offer: reflexive (default) | full
@@ -128,7 +128,7 @@ log "relay: straw --udp-bind"
 ip netns exec natpunch_r env RUST_LOG=straw=info "$BIN/straw" \
     --listen 192.0.2.1:$PORT --udp-bind --udp-bind-public-ips 192.0.2.1 \
     --udp-bind-port-lo 30000 --udp-bind-port-hi 30999 --udp-bind-allow-dest 192.0.2.0/24 \
-    --auth-mode bearer --auth-token s3cret $OBSERVE_FLAG >"$OUT/np_relay.log" 2>&1 &
+    --auth-mode bearer --auth-token s3cret >"$OUT/np_relay.log" 2>&1 &
 for _ in $(seq 100); do grep -q listening "$OUT/np_relay.log" && break; sleep 0.1; done
 grep -q listening "$OUT/np_relay.log" || { cat "$OUT/np_relay.log"; fail "relay start"; exit 1; }
 

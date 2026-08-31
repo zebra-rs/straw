@@ -42,8 +42,8 @@ choosing:
 |----------|---------|------|
 | `basic` | cone | Advertise the reflexive candidate. (default) |
 | `predict` | sequential-symmetric | Sample the NAT's port allocation with a few aux bind sessions; predict the peer-facing port for a sequential allocator. **Live.** |
-| `birthday` | narrow-range random symmetric | Open several sockets and scan a window around every candidate; a fixed-dial birthday attack. |
-| `relay-assisted` | address-dependent-filtering, on-path relay | The relay (`--udp-bind-observe`) reads each peer's peer-facing source off the forwarded packets and signals it. |
+| `birthday` | narrow-range random symmetric | Open several sockets and scan a window around every candidate; a fixed-dial birthday attack. **Deleted.** |
+| `relay-assisted` | address-dependent-filtering, on-path relay | An on-path relay observer read each peer's peer-facing source off the forwarded packets and signalled it. **Deleted.** |
 
 Since the punch moved into the QUIC layer
 ([Hole Punching](ch-03-03-hole-punching.md)), the frame exchange carries a
@@ -58,8 +58,15 @@ works as it always did.
 `birthday` and `relay-assisted` cannot. Birthday needs several sockets to punch
 from, and there is now one. Relay-assisted needs the relay to *observe* the
 probes in flight, and the probes now go out the direct socket and never pass
-through it. Both log a warning and fall back to `basic`; their code and the
-analysis are kept for whoever takes this up again.
+through it.
+
+Their code is **gone** — the peer halves with the v1 punch, and relay-assisted's
+relay half (the `AF_PACKET` observer, the `--udp-bind-observe` flag, and the
+`PEER_REFLEXIVE` capsule it signalled with) once it was clear nothing would ever
+consume what it emitted. Keeping a relay that still observed and signalled would
+have implied a capability that did not exist. Both names are still accepted on
+`--punch-strategy`, warn, and behave as `basic`; the analysis below is the
+record, and the implementations are in git history.
 
 That costs less than it sounds, because the honest result was already that
 **none of these traverses the random, address-and-port-dependent symmetric

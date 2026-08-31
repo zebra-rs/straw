@@ -161,13 +161,23 @@ unbounded learned set would let a spoofed source claim the tunnel route, and a
 probe aimed at the peer's own candidate would then ride the relay instead of
 the real socket, capturing the punch. Unit-tested in `relay_socket`.
 
-The **full §10.4 lockdown is still open**: after a direct path is stable the
-peer should register a *compressed* context for its peer and close the
-uncompressed one, so the relay drops all other inbound at the edge. The relay
-half is already built (`udp_bind::socket` firewalls unregistered remotes when
-no uncompressed context is open, and the handler serves
-COMPRESSION_ASSIGN/ACK/CLOSE); what is missing is the peer side — the client
-only ever opens the uncompressed context.
+The **§10.4 lockdown is done, both halves**. Once the punch promotes a direct
+path, `p2p::session` calls `RelayLockdown::engage` (`p2p/relay_socket.rs`):
+register a *compressed* context bound to the peer's relay address, wait for the
+relay's COMPRESSION_ACK, then close the uncompressed one. Order matters — the
+compressed context must be **acknowledged before** the uncompressed one goes,
+or a fallback in that window would have no context able to carry it and the
+relay path would silently blackhole. It is best-effort: a relay that will not
+ACK leaves a wider attack surface, not a broken session, so it never fails the
+punch. The relay path itself is never closed (G3); lockdown only narrows what
+may travel it, and `frame_bind` then elides the address from every datagram.
+The relay half was already built (`udp_bind::socket` firewalls unregistered
+remotes when no uncompressed context is open; the handler serves
+ASSIGN/ACK/CLOSE). Guarded by `after_lockdown_only_the_bound_peer_reaches_the_session`
+(the relay's edge — the property that makes this worth doing),
+`framing_prefers_the_compressed_context_and_stops_at_lockdown` (the encode
+choice), and `lockdown_binds_the_relay_to_one_peer_and_keeps_carrying_it` (the
+real ASSIGN/ACK exchange against a real relay, and delivery afterwards).
 
 `p2p/native_punch` drives the punch over noq's **NAT-traversal frames**
 (`add_nat_traversal_address` / `initiate_nat_traversal_round`, enabled by
@@ -286,13 +296,15 @@ exactly when its idea is expressible as "this is another address of mine":
   allocation, and for a *sequential* allocator advertises the port it will use
   toward the peer plus a ±6 window. That is a claim about its own address, so
   the frames carry it. `MAX_NAT_ADDRESSES` is 32 to leave room for the window.
-- `birthday` / `relay-assisted` — **not portable, and warn**. Birthday needs
-  several sockets to punch from; the mux has one. Relay-assisted needs the
-  on-path relay to *observe* the probes, and native probes go out the direct
-  socket and never reach it. The v1 implementation is **deleted** — the notes
-  below are the record of what it did and why it failed. The relay half of
-  relay-assisted (`--udp-bind-observe`, PEER_REFLEXIVE `0x15`) still exists and
-  still emits; nothing on the peer side consumes it.
+- `birthday` / `relay-assisted` — **no implementation, accepted but warn**.
+  Birthday needs several sockets to punch from; the mux has one. Relay-assisted
+  needs the on-path relay to *observe* the probes, and native probes go out the
+  direct socket and never reach it. Both halves are now **deleted**: the peer
+  side went with the v1 punch, and the relay side (`--udp-bind-observe`, the
+  `AF_PACKET` observer, and the `PEER_REFLEXIVE` `0x15` capsule) followed once
+  it was clear nothing would ever consume it. The two names remain accepted on
+  `--punch-strategy` and behave as `basic`. `symmetric-nat-traversal.md` is the
+  record of what they did and why they failed; the code is in git history.
 
 The v1 app-level punch modules (`holepunch`, `punch`, `candidates`, `wire`) are
 **gone**. They were unreachable from the moment the punch moved to QUIC frames;
@@ -305,10 +317,11 @@ keeping them implied a fallback that did not exist. Their history is in git.
   peer candidate (`scan_around`), first mutually-open pair wins. A fixed-dial
   birthday attack; feasible only for a narrow external-port range with enough
   sockets, so best-effort.
-- `relay-assisted` — needs `--udp-bind-observe` on the relay (`CAP_NET_RAW`).
-  An on-path `AF_PACKET` observer (`udp_bind::observe`) reads each peer's
-  *peer-facing* source off the forwarded punch packets and signals it to the
-  other peer as a PEER_REFLEXIVE capsule (0x15), which dials it.
+- `relay-assisted` — *(deleted; described here as the record)* needed
+  `--udp-bind-observe` on the relay (`CAP_NET_RAW`). An on-path `AF_PACKET`
+  observer read each peer's *peer-facing* source off the forwarded punch
+  packets and signalled it to the other peer as a `PEER_REFLEXIVE` capsule
+  (`0x15`), which dialled it.
 
 `strawcat --port-map` (orthogonal to the strategy) asks the router for an
 explicit PCP (RFC 6887) / NAT-PMP (RFC 6886) UDP forward (`p2p/portmap.rs`) and
@@ -334,8 +347,8 @@ are a *moving target* — each new dial makes a new mapping, and Linux's strict
 textbook reason symmetric↔symmetric is the unsolved case and the relay carries
 it. Each strategy targets an *easier* symmetric class (sequential allocation /
 narrow port range / address-dependent filtering) that a real router may have.
-Harness: `STRATEGY=<name>` (relay-assisted also sets `--udp-bind-observe`);
-the punch stays best-effort in `symmetric` mode and asserted only in `cone`.
+Harness: `STRATEGY=<name>`; the punch stays best-effort in `symmetric` mode and
+asserted only in `cone`.
 
 The standards-codepoint swap (§9) is **done for the NAT-traversal half**: the
 app-level CBOR candidate exchange and the raced second connection are gone,
@@ -343,7 +356,7 @@ replaced by noq's frames, the `nat_traversal` transport param and multipath.
 What remains gated is RFC publication of the listen-draft codepoints, and the
 OBSERVED_ADDRESS capsule (the outer session is still upstream quinn). **Every
 provisional codepoint now lives in one registry, `src/codepoints.rs`** — bind
-capsule types 0x11–0x15, the `strawcat/1` ALPN, the `sc2_` token marker,
+capsule types 0x11–0x14, the `strawcat/1` ALPN, the `sc2_` token marker,
 and the documented v2 NAT-traversal frame target — each annotated with its v2
 standard and the gate; `udp_bind::context`, `p2p::token`, `p2p::inner_tls`
 re-export from it, so the swap is a one-file edit. See

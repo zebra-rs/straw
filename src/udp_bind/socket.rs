@@ -388,6 +388,64 @@ mod tests {
         assert_eq!(&dg.payload[..], b"ping");
     }
 
+    /// The §10.4 lockdown's actual security property, at the only place it can
+    /// be observed: with the uncompressed context closed, the relay forwards
+    /// inbound only for the *bound* peer and drops everything else at its edge,
+    /// before it ever becomes an inner-QUIC packet for the peer to parse.
+    #[tokio::test]
+    async fn after_lockdown_only_the_bound_peer_reaches_the_session() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // A locked-down table: one compressed context, no uncompressed one.
+        let contexts = Arc::new(Mutex::new(ContextTable::new()));
+        {
+            let mut t = contexts.lock().unwrap();
+            t.register(CompressionAssign {
+                context_id: 4,
+                binding: Binding::Compressed(peer_addr),
+            })
+            .unwrap();
+            t.ack(4).unwrap();
+        }
+
+        let bind = BindSocket::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            contexts.clone(),
+            DestinationPolicy::default(),
+            unlimited(),
+        )
+        .await
+        .unwrap();
+        let relay_addr = bind.public_addr();
+        let (_to_net_tx, to_net_rx) = mpsc::channel(8);
+        let (from_net_tx, mut from_net_rx) = mpsc::channel(8);
+        tokio::spawn(bind.run(to_net_rx, from_net_tx));
+
+        // The stranger is dropped at the edge...
+        stranger.send_to(b"unsolicited", relay_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), from_net_rx.recv())
+                .await
+                .is_err(),
+            "an unregistered remote must not be forwarded once the uncompressed \
+             context is closed"
+        );
+
+        // ...while the bound peer still gets through, on its compressed
+        // context. Dropping everything would be a broken relay, not a firewall.
+        peer.send_to(b"from-the-peer", relay_addr).await.unwrap();
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(2), from_net_rx.recv())
+            .await
+            .expect("the bound peer is still forwarded")
+            .expect("a datagram");
+        let dg = contexts.lock().unwrap().decode_datagram(wire).unwrap();
+        assert_eq!(dg.context_id, 4, "carried on the compressed context");
+        assert_eq!(dg.remote, peer_addr);
+        assert_eq!(&dg.payload[..], b"from-the-peer");
+    }
+
     #[tokio::test]
     async fn egress_to_a_denied_destination_is_dropped() {
         // Default policy denies loopback, so nothing reaches the echo.
