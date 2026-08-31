@@ -59,6 +59,12 @@ would report `0.0.0.0`. It comes from a *connected* UDP socket aimed at the
 relay: connecting performs the route lookup and fixes the source address
 without sending a packet.
 
+The direct socket binds in the **same address family as the relay path**, so an
+IPv6 session punches exactly like an IPv4 one. That is forced rather than
+chosen: QUIC fixes a connection's address family from the paths it already has
+and rejects a remote in the other family, so a direct path can only ever match
+the relay path it joins.
+
 This exchange used to be a CBOR message on an application stream. Moving it
 into the QUIC layer is what lets [VPN mode](ch-03-05-vpn-mode.md) punch at all:
 its inner protocol is HTTP/3, which would have read a stray application stream
