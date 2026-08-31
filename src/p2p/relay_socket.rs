@@ -245,17 +245,21 @@ pub fn inner_endpoint(
 // both sources are merged, each tagged with its local IP so noq sees two
 // distinct paths of one connection.
 //
-// Trust note: the learned set is fed by whatever sources the relay forwards
-// (the public bind socket accepts UDP from anyone). A spoofed source can
-// therefore pin an address to the tunnel route; the punch to that one
-// candidate then rides the relay instead of the socket — a mis-route, never a
-// confidentiality loss (inner packets are ciphertext either way, design G1).
-// The set is capped so it cannot grow without bound.
+// A bind session serves exactly **one** peer, so there is exactly one relay
+// remote: that peer's paddr. The route table is sized to say so — the dialer
+// presets it and learns nothing further, the acceptor learns the one source it
+// is answering and then stops listening.
+//
+// That bound is the security property, not an optimisation. The relay's bind
+// socket is a public UDP port that accepts from anyone, and it forwards what
+// arrives. Without the bound, any spoofed source would be added to the tunnel
+// route, and a later NAT-traversal probe aimed at that address would ride the
+// relay instead of the real socket — the peer's own candidate could be
+// captured this way, wasting the punch. Learning one address closes that: an
+// attacker would have to beat the real peer's first packet, on a session whose
+// paddr they must already know, and the result is still only inner-QUIC
+// ciphertext they cannot read (design G1).
 // ─────────────────────────────────────────────────────────────────────────
-
-/// At most this many relay-routed remotes are remembered (the legitimate
-/// peer contributes exactly one — its paddr; the rest is noise tolerance).
-const RELAY_REMOTE_CAP: usize = 64;
 
 /// A handle to a [`PathMuxSocket`] owned by the noq endpoint: read the local
 /// direct socket's bound address (for candidate gathering by the punch).
@@ -384,8 +388,10 @@ impl AsyncUdpSocket for PathMuxSocket {
                     // Reply to a tunnelled source through the tunnel. The
                     // acceptor learns the dialer's paddr this way, before it
                     // ever has to send (its first send answers this packet).
+                    // Only the first source is learned — see the note above.
                     let mut relay_remotes = self.relay_remotes.lock().unwrap();
-                    if relay_remotes.len() < RELAY_REMOTE_CAP {
+                    if relay_remotes.is_empty() {
+                        tracing::debug!(%src, "relay path bound to peer");
                         relay_remotes.insert(src);
                     }
                     drop(relay_remotes);
@@ -471,4 +477,66 @@ pub fn mux_endpoint(
         Arc::new(noq::TokioRuntime),
     )?;
     Ok((endpoint, PathMuxHandle { direct_local }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// The routing decision under test, isolated from the socket: a
+    /// destination in the relay set is tunnelled, everything else is sent
+    /// direct.
+    fn routes_via_relay(set: &Mutex<HashSet<SocketAddr>>, dst: SocketAddr) -> bool {
+        set.lock().unwrap().contains(&dst)
+    }
+
+    /// What `poll_recv` does when a datagram arrives from the relay pump.
+    fn learn(set: &Mutex<HashSet<SocketAddr>>, src: SocketAddr) {
+        let mut set = set.lock().unwrap();
+        if set.is_empty() {
+            set.insert(src);
+        }
+    }
+
+    #[test]
+    fn a_dialer_presets_its_peer_and_learns_nothing_more() {
+        let peer = addr("198.51.100.1:30001");
+        let set = Mutex::new(HashSet::from([peer]));
+
+        // The preset peer is tunnelled; a candidate address is not.
+        assert!(routes_via_relay(&set, peer));
+        assert!(!routes_via_relay(&set, addr("203.0.113.9:41000")));
+
+        // Anything the relay forwards afterwards leaves the route untouched.
+        learn(&set, addr("203.0.113.9:41000"));
+        assert!(!routes_via_relay(&set, addr("203.0.113.9:41000")));
+        assert_eq!(set.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_acceptor_learns_one_source_and_a_spoof_cannot_capture_a_candidate() {
+        // The acceptor starts empty and binds to the first source it hears,
+        // which is the dialer answering through the relay.
+        let set = Mutex::new(HashSet::new());
+        let peer = addr("198.51.100.1:30001");
+        learn(&set, peer);
+        assert!(routes_via_relay(&set, peer));
+
+        // The relay's bind port is public, so anyone may send to it. A spoofed
+        // source arriving later must NOT become a tunnel route: if it did, and
+        // it named the peer's own direct candidate, the punch to that address
+        // would be tunnelled back through the relay instead of going out the
+        // real socket — capturing the direct path.
+        let peer_candidate = addr("203.0.113.9:41000");
+        learn(&set, peer_candidate);
+        assert!(
+            !routes_via_relay(&set, peer_candidate),
+            "a later source must not capture the route"
+        );
+        assert_eq!(set.lock().unwrap().len(), 1, "exactly one relay remote");
+    }
 }
