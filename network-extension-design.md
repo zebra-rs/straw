@@ -153,7 +153,9 @@ device testing.
 
 ## 5. Open questions
 
-- **UniFFI or a hand-rolled C ABI?** Probably both, split by traffic shape.
+- ~~**UniFFI or a hand-rolled C ABI?**~~ **Decided: both, split by traffic
+  shape** — UniFFI for control and settings, a narrow `extern "C"` pair for
+  packets. Reasoning:
   Three things cross the boundary and they could not be less alike: *control*
   (start/stop/status — rare, rich types, wants real error mapping), *settings*
   (the `DesiredInterface` — rare, structured), and *packets* (hot, and just
@@ -163,9 +165,11 @@ device testing.
   delivers an *array* and `writePackets` takes one, so the boundary is crossed
   per **batch**, not per packet. At 900 Mbit/s of 1400-byte packets — ~80k
   pps — batches of 32 mean ~2.5k crossings/s, where even a microsecond of
-  per-call overhead is under 0.3% of a core. Keep the packet path as a narrow
-  `extern "C"` pair anyway, so it can be tuned without regenerating bindings,
-  and measure before assuming either way.
+  per-call overhead is under 0.3% of a core. The packet path stays a narrow
+  `extern "C"` pair so it can be tuned without regenerating bindings. What is
+  worth measuring is not call overhead but **copies**: a packet crossing as
+  `Data` → `RustBuffer` → `Bytes` can be copied twice, and at 80k pps that is
+  real memory bandwidth inside a memory-capped process.
 - **Where do credentials live?** Smaller than it first looked: the *library* is
   already storage-agnostic. `Identity::from_pem(&str)`, `TokenV2::decode(&str)`
   and `TlsMode::Ca(CertificateDer)` all take values, not paths — the only
@@ -177,10 +181,13 @@ device testing.
   on-demand tunnel cannot start after a reboot until the user unlocks the
   device. The container app and the extension are separate processes, so the
   item also needs a shared access group (App Groups entitlement).
-  Key hygiene is the one real gap: `Identity` holds an rcgen `KeyPair` and
-  nothing in the path zeroizes, so private key bytes sit in ordinary heap
-  allocations that may be reallocated. Worth a `zeroize` pass before shipping,
-  independent of Apple.
+  Key hygiene *was* the one real gap; the `zeroize` pass is **done**. See
+  `Identity`'s `Drop` for how far it reaches, which is deliberately documented
+  as partial: rcgen clears its serialized DER, ring's live signing key is
+  beyond reach. Credentials are also redacted from `Debug` on `TokenV2` and
+  `ClientAuth`, with tests. `ProxyConfig::auth_token` is the one left; it is
+  proxy-side and so Linux-only, and wants a redacting newtype rather than a
+  hand-written `Debug` over forty fields.
 - **Does the tokio runtime fit the extension's threading model?** The provider
   is callback-driven; straw's stack is `tokio`-native throughout. Almost
   certainly fine with a multi-thread runtime owned by the FFI layer, but worth
