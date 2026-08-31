@@ -32,7 +32,9 @@ rev. The branch is two commits ahead of the tag, and we want both:
   transfer. straw's per-session tunnel MTU tracks quinn's live path MTU, so a
   connection stuck at the floor drags the tunnel MTU down with it — and neither
   the benchmarks nor the BDD suite would show it, since both run over lossless
-  links.
+  links. **Measured**, not assumed: `bench/mtu-recovery.sh` reproduces it —
+  the release build pins at 1200 with 2463 black-hole detections and never
+  recovers, the branch build never leaves 1452. See `bench/MTU-RECOVERY.md`.
 
 **Why not `main`.** `main` is version **0.12.0**. quinn 0.11.11 requires
 `^0.11`, so cargo *silently drops* the patch — `warning: patch ... was not used

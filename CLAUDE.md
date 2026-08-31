@@ -102,7 +102,14 @@ parallel streams don't help, and **parallel QUIC connections don't either** —
 two tunnels on two connections aggregate to the same ~4.2 Gbit/s while no
 process is at a single-core wall and 8 of 12 cores idle, so the ceiling is
 neither per-connection crypto nor CPU; the shared proxy-side TUN device is the
-untested next suspect, see bench/BASELINE.md). The TUN device uses IFF_VNET_HDR: every read/write
+untested next suspect, see bench/BASELINE.md). `sudo -E env PATH="$PATH" bench/mtu-recovery.sh` is a separate A/B: it builds
+`bench/mtuprobe` against both the quinn-proto release and the `0.11.x` branch
+this repo pins, and drives each through clean → real-black-hole → 3%-loss
+phases. The release pins at `min_mtu` for good (2463 black-hole detections and
+counting); the branch never leaves 1452. `bench/tunnel-mtu-recovery.sh` is the
+same profile through a real tunnel — noisier, since TCP's own RTO backoff
+stalls it for ~100s in any build. Numbers and caveats in `bench/MTU-RECOVERY.md`.
+The TUN device uses IFF_VNET_HDR: every read/write
 carries a 10-byte virtio-net header, GSO aggregates are re-segmented in
 `forwarding/vnet.rs`. `quinn-proto` is patched to upstream's **`0.11.x`
 branch** rather than the 0.11.17 release: the release double-counts dropped

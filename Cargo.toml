@@ -1,5 +1,9 @@
 [workspace]
 members = ["bdd"]
+# A standalone probe used only by bench/mtu-recovery.sh, which builds it twice
+# against different quinn-proto revisions. Not part of this workspace, so a
+# plain `cargo build` never pulls it in.
+exclude = ["bench/mtuprobe"]
 
 [package]
 name = "straw"

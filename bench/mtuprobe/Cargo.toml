@@ -1,0 +1,16 @@
+# Standalone: not a workspace member (see `exclude` in the root Cargo.toml).
+# Deliberately UNPATCHED, so a plain build links the quinn-proto release and
+# `bench/mtu-recovery.sh` can add the 0.11.x patch through `--config` for the
+# other half of the A/B.
+[package]
+name = "mtuprobe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio = { version = "1", features = ["full"] }
+
+[workspace]
