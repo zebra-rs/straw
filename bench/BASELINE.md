@@ -102,10 +102,48 @@ work per byte, remove two tasks from the pipeline, and are fully covered
 by tests, but further single-tunnel throughput needs parallel QUIC
 connections or hardware-offloaded crypto, not more datapath surgery.
 
+## Parallel QUIC connections do not help — the floor is not per-connection
+
+The previous section concluded that "further single-tunnel throughput needs
+parallel QUIC connections", and listed that as the top remaining idea. **That
+was wrong, and the experiment that would have been built on it is now
+unnecessary.**
+
+`iperf-baseline.sh` runs a second `strawc` — its own QUIC connection, its own
+tunnel address, its own TUN device, reached by a policy route so its traffic
+genuinely leaves through it — and drives both tunnels concurrently:
+
+| | uplink |
+|---|---|
+| one tunnel, one connection | 4.14–4.29 Gbit/s |
+| one connection, 4 iperf streams | 4.25–4.29 Gbit/s |
+| **two tunnels, two connections (aggregate)** | **4.16–4.19 Gbit/s** |
+
+Two connections carry what one carries. Whatever the ceiling is, it is not a
+per-connection limit, so spreading traffic across connections cannot lift it.
+
+The CPU sample taken across the same run rules out the other easy explanation:
+
+```
+straw 242%   strawc 68%   strawc2 57%      (of one core; 12 cores available)
+```
+
+Nothing is pinned at a single-threaded 100% wall — `straw` is already using
+about 2.4 cores — and the box as a whole is using roughly 3.7 of 12. So this is
+neither a per-connection crypto floor nor CPU exhaustion.
+
+**What that leaves is what the two tunnels share**: one proxy process, one
+proxy-side TUN device (`straw0`), one NAT path, one origin. The proxy's single
+TUN device is the obvious next suspect — every session's packets funnel through
+that one fd — but that is a **hypothesis, not a measurement**. Confirming it
+means instrumenting the proxy datapath (or testing two proxy instances on
+separate TUN devices) rather than reasoning from these numbers.
+
 ## Remaining optimization ideas
 
-1. Parallelism across QUIC connections (the per-connection floor is the
-   binding constraint; multiple tunnels already work via `open_tunnel`).
-2. GRO on the write side (coalesce tunnel→kernel TCP segments into
+1. ~~Parallelism across QUIC connections~~ — **refuted above**, do not build it.
+2. Find the real serialization point: instrument the proxy datapath, starting
+   with the shared TUN device, before optimizing anything.
+3. GRO on the write side (coalesce tunnel→kernel TCP segments into
    aggregates) — reduces kernel-side receive cost, not tunnel throughput.
-3. io_uring, DSCP copy: only after a workload shows they matter.
+4. io_uring, DSCP copy: only after a workload shows they matter.
