@@ -144,7 +144,15 @@ parallel streams don't help, and **parallel QUIC connections don't either** —
 two tunnels on two connections aggregate to the same ~4.2 Gbit/s while no
 process is at a single-core wall and 8 of 12 cores idle, so the ceiling is
 neither per-connection crypto nor CPU; the shared proxy-side TUN device is the
-untested next suspect, see bench/BASELINE.md). `sudo -E env PATH="$PATH" bench/mtu-recovery.sh` is a separate A/B: it builds
+untested next suspect, see bench/BASELINE.md). `sudo bench/wireguard-vs-straw.sh [secs]` brings straw and kernel WireGuard up
+in the *same* three namespaces back to back and runs the same iperf3 profile
+over each, plus skb counters on the inner and outer devices; `MTU_SWEEP=1` adds
+the packet-rate diagnosis. On this arm64 host straw wins ~2× (4.3 vs 2.1
+Gbit/s) — **not** a protocol result: WireGuard is packet-rate-bound on one
+softirq core, and quinn's UDP GSO plus the TSO TUN mean straw puts ~8.6× fewer
+skbs through the kernel per bit. Analysis, caveats, and the protocol-level
+pros/cons are in `wireguard-comparison.md`.
+`sudo -E env PATH="$PATH" bench/mtu-recovery.sh` is a separate A/B: it builds
 `bench/mtuprobe` against both the quinn-proto release and the `0.11.x` branch
 this repo pins, and drives each through clean → real-black-hole → 3%-loss
 phases. The release pins at `min_mtu` for good (2463 black-hole detections and

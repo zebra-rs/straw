@@ -37,6 +37,10 @@ See [`book/README.md`](book/README.md) for more. Other in-repo references:
   design document.
 - [`symmetric-nat-traversal.md`](symmetric-nat-traversal.md) — the NAT taxonomy
   and why symmetric↔symmetric is the hard case.
+- [`wireguard-comparison.md`](wireguard-comparison.md) — WireGuard versus
+  MASQUE CONNECT-IP, including a measured throughput A/B on one host.
+- [`iroh-comparison.md`](iroh-comparison.md) — how straw's peer-to-peer path
+  relates to iroh, with which it shares a QUIC implementation.
 - [`CLAUDE.md`](CLAUDE.md) — a dense orientation for working in the codebase.
 
 ## Building
