@@ -924,10 +924,10 @@ impl BindClient {
         self._endpoint.clone()
     }
 
-    pub fn into_relay_socket(
+    pub(crate) fn into_relay_parts(
         self,
         peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> crate::p2p::relay_socket::RelaySocket {
+    ) -> crate::p2p::relay_socket::RelayParts {
         use crate::capsule::Capsule;
         use crate::capsule::codec::read_varint;
         use crate::udp_bind::context::{
@@ -994,7 +994,22 @@ impl BindClient {
                 }
             }
         });
-        crate::p2p::relay_socket::RelaySocket::new(conn, qsid, uncompressed, public_addr, rx, recv)
+        crate::p2p::relay_socket::RelayParts {
+            conn,
+            qsid,
+            uncompressed,
+            local: public_addr,
+            rx,
+            recv_task: recv,
+        }
+    }
+
+    /// Turn this bind session into a relay-only inner-QUIC socket.
+    pub fn into_relay_socket(
+        self,
+        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
+    ) -> crate::p2p::relay_socket::RelaySocket {
+        crate::p2p::relay_socket::RelaySocket::from_parts(self.into_relay_parts(peer_reflexive_sink))
     }
 }
 

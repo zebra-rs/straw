@@ -16,7 +16,7 @@ use crate::client::{BindClient, ClientAuth, TlsMode};
 use crate::error::ProxyError;
 use crate::p2p::identity::{Identity, SpkiPin};
 use crate::p2p::inner_tls;
-use crate::p2p::relay_socket::inner_endpoint;
+use crate::p2p::relay_socket::{PathMuxHandle, mux_endpoint};
 use crate::p2p::token::TokenV2;
 
 /// How to reach and authenticate to the relay (the outer connection).
@@ -36,6 +36,9 @@ pub struct Listener {
     pub reflexive: Option<SocketAddr>,
     /// The outer bind socket, reused for the hole punch (design §5.3, §12).
     pub punch_endpoint: quinn::Endpoint,
+    /// Drives the native-multipath punch: registers direct remotes and reports
+    /// the direct socket's local address (Stage 3).
+    pub mux: PathMuxHandle,
     endpoint: noq::Endpoint,
 }
 
@@ -62,6 +65,8 @@ pub struct PeerConnection {
     pub relay_paddr: SocketAddr,
     /// The outer bind socket, reused for the hole punch (design §5.3, §12).
     pub punch_endpoint: quinn::Endpoint,
+    /// Drives the native-multipath punch (Stage 3).
+    pub mux: PathMuxHandle,
     _endpoint: noq::Endpoint,
 }
 
@@ -107,12 +112,20 @@ pub async fn listen(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let endpoint = inner_endpoint(bind.into_relay_socket(peer_reflexive_sink), Some(quic))
-        .map_err(|e| ProxyError::Quic(e.to_string()))?;
+    let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(ProxyError::Io)?;
+    let (endpoint, mux) = mux_endpoint(
+        bind.into_relay_parts(peer_reflexive_sink),
+        direct,
+        Some(quic),
+    )
+    .map_err(|e| ProxyError::Quic(e.to_string()))?;
     Ok(Listener {
         paddr,
         reflexive,
         punch_endpoint,
+        mux,
         endpoint,
     })
 }
@@ -141,7 +154,10 @@ pub async fn connect(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let endpoint = inner_endpoint(bind.into_relay_socket(peer_reflexive_sink), None)
+    let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(ProxyError::Io)?;
+    let (endpoint, mux) = mux_endpoint(bind.into_relay_parts(peer_reflexive_sink), direct, None)
         .map_err(|e| ProxyError::Quic(e.to_string()))?;
     let conn = endpoint
         .connect_with(quic, issuer, "peer")
@@ -153,6 +169,7 @@ pub async fn connect(
         reflexive,
         relay_paddr,
         punch_endpoint,
+        mux,
         _endpoint: endpoint,
     })
 }

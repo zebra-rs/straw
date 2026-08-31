@@ -18,8 +18,9 @@
 //! session ([`conn`](RelaySocket::conn)) remains upstream quinn (it is an
 //! HTTP/3 CONNECT-UDP connection). This type is the bridge between the two.
 
+use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,31 @@ impl RelaySocket {
             _recv: AbortOnDrop(recv_task),
         }
     }
+
+    /// Build from the shared [`RelayParts`] seam.
+    pub(crate) fn from_parts(parts: RelayParts) -> Self {
+        Self::new(
+            parts.conn,
+            parts.qsid,
+            parts.uncompressed,
+            parts.local,
+            parts.rx,
+            parts.recv_task,
+        )
+    }
+}
+
+/// The pieces a bind session hands to an inner-QUIC socket: the outer bind
+/// connection, its framing params, our relay-public address, and the relay
+/// receive pump (channel + its task). Shared by [`RelaySocket`] (relay only)
+/// and [`PathMuxSocket`] (relay + direct).
+pub struct RelayParts {
+    pub conn: quinn::Connection,
+    pub qsid: u64,
+    pub uncompressed: u64,
+    pub local: SocketAddr,
+    pub rx: mpsc::Receiver<(SocketAddr, Bytes)>,
+    pub recv_task: tokio::task::JoinHandle<()>,
 }
 
 /// The send half noq asks for via [`AsyncUdpSocket::create_sender`]. A bind
@@ -202,4 +228,218 @@ pub fn inner_endpoint(
         Box::new(socket),
         Arc::new(noq::TokioRuntime),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Combined-transport socket (Stage 3): one AsyncUdpSocket carrying both the
+// relay path (through the outer bind tunnel) and a direct path (a real UDP
+// socket), so a single noq connection holds both and migrates relay→direct
+// natively via `Connection::open_path`. Sends are routed by destination: an
+// address explicitly registered as a direct remote goes out the real socket;
+// everything else (the peer's relay-paddr) is tunnelled. Receives from both
+// sources are merged, each tagged with its local IP so noq sees two paths.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A handle to drive the punch on a [`PathMuxSocket`] owned by the noq
+/// endpoint: register a peer's direct address before `open_path`, and read the
+/// local direct socket's bound address (for candidate gathering).
+#[derive(Clone, Debug)]
+pub struct PathMuxHandle {
+    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    direct_local: SocketAddr,
+}
+
+impl PathMuxHandle {
+    /// Route future sends to `addr` out the real socket (call before
+    /// `open_path` to that address).
+    pub fn register_direct_remote(&self, addr: SocketAddr) {
+        self.direct_remotes.lock().unwrap().insert(addr);
+    }
+
+    /// The direct socket's local bound address.
+    pub fn direct_local(&self) -> SocketAddr {
+        self.direct_local
+    }
+}
+
+/// A noq socket that multiplexes a relay tunnel and a real UDP socket.
+#[derive(Debug)]
+pub struct PathMuxSocket {
+    relay: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+    local: SocketAddr,
+    direct: Arc<tokio::net::UdpSocket>,
+    direct_local: SocketAddr,
+    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    relay_rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
+    _recv: AbortOnDrop,
+}
+
+/// The send half of a [`PathMuxSocket`]: routes by destination.
+#[derive(Debug)]
+struct PathMuxSender {
+    relay: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+    direct: Arc<tokio::net::UdpSocket>,
+    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+}
+
+impl UdpSender for PathMuxSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let is_direct = self
+            .direct_remotes
+            .lock()
+            .unwrap()
+            .contains(&transmit.destination);
+        if is_direct {
+            // Direct path: raw UDP on the real socket.
+            match self
+                .direct
+                .poll_send_to(cx, transmit.contents, transmit.destination)
+            {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            // Relay path: tunnel through the outer bind connection.
+            let wire = frame_bind(
+                self.qsid,
+                self.uncompressed,
+                transmit.destination,
+                transmit.contents,
+            );
+            Poll::Ready(self.relay.send_datagram(wire).map_err(io::Error::other))
+        }
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+}
+
+impl AsyncUdpSocket for PathMuxSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(PathMuxSender {
+            relay: self.relay.clone(),
+            qsid: self.qsid,
+            uncompressed: self.uncompressed,
+            direct: self.direct.clone(),
+            direct_remotes: self.direct_remotes.clone(),
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let mut n = 0;
+        // 1. Direct socket (real UDP): drain what is ready.
+        while n < bufs.len() {
+            let mut rb = tokio::io::ReadBuf::new(&mut bufs[n]);
+            match self.direct.poll_recv_from(cx, &mut rb) {
+                Poll::Ready(Ok(src)) => {
+                    let len = rb.filled().len();
+                    meta[n] = mk_meta(src, len, self.direct_local.ip());
+                    n += 1;
+                }
+                // A direct-socket error must not tear down the connection (the
+                // relay path may still be fine); stop draining it this round.
+                Poll::Ready(Err(_)) | Poll::Pending => break,
+            }
+        }
+        // 2. Relay tunnel: drain the pump channel.
+        let rx = self.relay_rx.get_mut().unwrap();
+        while n < bufs.len() {
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some((src, payload))) => {
+                    let len = payload.len().min(bufs[n].len());
+                    bufs[n][..len].copy_from_slice(&payload[..len]);
+                    meta[n] = mk_meta(src, len, self.local.ip());
+                    n += 1;
+                }
+                Poll::Ready(None) => {
+                    return if n == 0 {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "relay session closed",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(n))
+                    };
+                }
+                Poll::Pending => break,
+            }
+        }
+        if n > 0 {
+            Poll::Ready(Ok(n))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+}
+
+fn mk_meta(addr: SocketAddr, len: usize, dst_ip: IpAddr) -> RecvMeta {
+    let mut m = RecvMeta::default();
+    m.addr = addr;
+    m.len = len;
+    m.stride = len;
+    m.ecn = None;
+    m.dst_ip = Some(dst_ip);
+    m
+}
+
+/// Build an inner-QUIC endpoint over a **combined-transport** socket: the relay
+/// tunnel (`parts`) plus `direct` (a bound real UDP socket for direct paths).
+/// Returns the endpoint and a [`PathMuxHandle`] to drive the punch.
+pub fn mux_endpoint(
+    parts: RelayParts,
+    direct: tokio::net::UdpSocket,
+    server_config: Option<noq::ServerConfig>,
+) -> io::Result<(noq::Endpoint, PathMuxHandle)> {
+    let direct_local = direct.local_addr()?;
+    let direct = Arc::new(direct);
+    let direct_remotes: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let socket = PathMuxSocket {
+        relay: parts.conn,
+        qsid: parts.qsid,
+        uncompressed: parts.uncompressed,
+        local: parts.local,
+        direct,
+        direct_local,
+        direct_remotes: direct_remotes.clone(),
+        relay_rx: Mutex::new(parts.rx),
+        _recv: AbortOnDrop(parts.recv_task),
+    };
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
+        server_config,
+        Box::new(socket),
+        Arc::new(noq::TokioRuntime),
+    )?;
+    let handle = PathMuxHandle {
+        direct_remotes,
+        direct_local,
+    };
+    Ok((endpoint, handle))
 }
