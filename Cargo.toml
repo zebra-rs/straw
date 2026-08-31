@@ -17,6 +17,7 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
 ipnet = { version = "2.12.1", features = ["serde"] }
+noq = { version = "1.2.0", default-features = false, features = ["runtime-tokio", "rustls", "ring", "platform-verifier"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log", "platform-verifier"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 ring = "0.17.14"

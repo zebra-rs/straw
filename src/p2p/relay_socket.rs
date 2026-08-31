@@ -1,7 +1,7 @@
 //! An inner-QUIC transport that runs over a CONNECT-UDP bind session
 //! (design §4, Phase B).
 //!
-//! [`RelaySocket`] implements [`quinn::AsyncUdpSocket`], so a whole QUIC
+//! [`RelaySocket`] implements [`noq::AsyncUdpSocket`], so a whole QUIC
 //! endpoint — the peer-to-peer inner connection — can run on top of a bind
 //! session instead of a real UDP socket. Each inner-QUIC packet is sent as a
 //! bind datagram addressed to the far peer's relay-public address (`paddr`);
@@ -12,16 +12,22 @@
 //! The inner endpoint sees its own `paddr` as the local address and the far
 //! peer's `paddr` as the remote — an ordinary UDP path, ~40–60 bytes smaller
 //! MTU (the bind framing).
+//!
+//! The inner QUIC stack is **noq** (the n0/iroh quinn fork), which straw
+//! adopts for its native multipath + NAT-traversal support; the *outer* bind
+//! session ([`conn`](RelaySocket::conn)) remains upstream quinn (it is an
+//! HTTP/3 CONNECT-UDP connection). This type is the bridge between the two.
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use noq::udp::{RecvMeta, Transmit};
+use noq::{AsyncUdpSocket, UdpSender};
 use tokio::sync::mpsc;
 
 use crate::udp_bind::context::encode_uncompressed_body;
@@ -36,9 +42,20 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Encode one inner packet to `dst` as a bind datagram on session `qsid`.
+fn frame_bind(qsid: u64, uncompressed: u64, dst: SocketAddr, contents: &[u8]) -> Bytes {
+    let body = encode_uncompressed_body(uncompressed, dst, contents);
+    let mut wire = bytes::BytesMut::with_capacity(8 + body.len());
+    crate::capsule::codec::write_varint(&mut wire, qsid).expect("qsid fits varint");
+    wire.extend_from_slice(&body);
+    wire.freeze()
+}
+
 /// A QUIC socket whose datagrams ride a bind session (design §4).
 #[derive(Debug)]
 pub struct RelaySocket {
+    /// The *outer* bind session (upstream quinn), over which inner packets ride
+    /// as CONNECT-UDP bind datagrams.
     conn: quinn::Connection,
     qsid: u64,
     uncompressed: u64,
@@ -57,71 +74,83 @@ impl RelaySocket {
         local: SocketAddr,
         inbound: mpsc::Receiver<(SocketAddr, Bytes)>,
         recv_task: tokio::task::JoinHandle<()>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             conn,
             qsid,
             uncompressed,
             local,
             inbound: Mutex::new(inbound),
             _recv: AbortOnDrop(recv_task),
-        })
-    }
-
-    /// Encode one inner packet to `dst` as a bind datagram on this session.
-    fn frame(&self, dst: SocketAddr, contents: &[u8]) -> Bytes {
-        let body = encode_uncompressed_body(self.uncompressed, dst, contents);
-        let mut wire = bytes::BytesMut::with_capacity(8 + body.len());
-        crate::capsule::codec::write_varint(&mut wire, self.qsid).expect("qsid fits varint");
-        wire.extend_from_slice(&body);
-        wire.freeze()
+        }
     }
 }
 
-/// A poller that reports the socket as always writable: a bind send is a
-/// synchronous `send_datagram`, which never returns `WouldBlock`.
+/// The send half noq asks for via [`AsyncUdpSocket::create_sender`]. A bind
+/// send is a synchronous `send_datagram`, so it is always immediately ready.
 #[derive(Debug)]
-struct AlwaysWritable;
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+struct RelaySender {
+    conn: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+}
+
+impl UdpSender for RelaySender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // max_transmit_segments == 1, so a transmit is one datagram and
+        // segment_size is None.
+        let wire = frame_bind(
+            self.qsid,
+            self.uncompressed,
+            transmit.destination,
+            transmit.contents,
+        );
+        Poll::Ready(
+            self.conn
+                .send_datagram(wire)
+                .map_err(io::Error::other),
+        )
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
     }
 }
 
 impl AsyncUdpSocket for RelaySocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // quinn is told max_transmit_segments == 1, so a transmit is one
-        // datagram; segment_size is therefore None.
-        let wire = self.frame(transmit.destination, transmit.contents);
-        self.conn
-            .send_datagram(wire)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(RelaySender {
+            conn: self.conn.clone(),
+            qsid: self.qsid,
+            uncompressed: self.uncompressed,
+        })
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut Context,
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut rx = self.inbound.lock().unwrap();
+        let rx = self.inbound.get_mut().unwrap();
         let mut n = 0;
         while n < bufs.len() {
             match rx.poll_recv(cx) {
                 Poll::Ready(Some((addr, payload))) => {
                     let len = payload.len().min(bufs[n].len());
                     bufs[n][..len].copy_from_slice(&payload[..len]);
-                    meta[n] = RecvMeta {
-                        addr,
-                        len,
-                        stride: len,
-                        ecn: None,
-                        dst_ip: Some(self.local.ip()),
-                    };
+                    // noq's RecvMeta is #[non_exhaustive]; build via Default.
+                    let mut m = RecvMeta::default();
+                    m.addr = addr;
+                    m.len = len;
+                    m.stride = len;
+                    m.ecn = None;
+                    m.dst_ip = Some(self.local.ip());
+                    meta[n] = m;
                     n += 1;
                 }
                 // Deliver whatever is ready; only block when nothing is.
@@ -155,12 +184,8 @@ impl AsyncUdpSocket for RelaySocket {
         false
     }
 
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
     }
 }
 
@@ -168,13 +193,13 @@ impl AsyncUdpSocket for RelaySocket {
 /// Pass `server_config` to accept inner connections (the peer whose role is
 /// inner-QUIC *server*, design §2.1); omit it for a dial-only endpoint.
 pub fn inner_endpoint(
-    socket: Arc<RelaySocket>,
-    server_config: Option<quinn::ServerConfig>,
-) -> io::Result<quinn::Endpoint> {
-    quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+    socket: RelaySocket,
+    server_config: Option<noq::ServerConfig>,
+) -> io::Result<noq::Endpoint> {
+    noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
         server_config,
-        socket,
-        Arc::new(quinn::TokioRuntime),
+        Box::new(socket),
+        Arc::new(noq::TokioRuntime),
     )
 }

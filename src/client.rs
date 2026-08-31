@@ -794,7 +794,7 @@ impl BindClient {
     pub fn into_relay_socket(
         self,
         peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> Arc<crate::p2p::relay_socket::RelaySocket> {
+    ) -> crate::p2p::relay_socket::RelaySocket {
         use crate::capsule::Capsule;
         use crate::capsule::codec::read_varint;
         use crate::udp_bind::context::{

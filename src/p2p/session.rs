@@ -14,16 +14,23 @@
 //!    ▲                                          │
 //!    └──────────────────────────────────────────┘   (relay never closed)
 //! ```
+//!
+//! **noq migration, Stage 1.** The inner connection is now [`noq`]. The direct
+//! path is being rebuilt on noq's *native* multipath (`Connection::open_path`
+//! + NAT-traversal rounds) rather than the previous app-level second QUIC
+//! connection raced over the outer socket. Until that lands (Stage 3), a
+//! session stays on the relay path; the punch inputs are accepted but parked.
+//! The old quinn punch modules (`holepunch`, `punch`) remain in the tree as
+//! the reference for that rebuild.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
 use std::sync::Arc as StdArc;
 
-use crate::p2p::holepunch::{self, Direct};
 use crate::p2p::identity::{Identity, SpkiPin};
 use crate::p2p::peer::RelayAccess;
 use crate::p2p::strategy::PunchStrategy;
@@ -38,11 +45,6 @@ pub enum PathState {
     /// A direct path is up; new streams use it.
     Direct,
 }
-
-/// Backoff before re-punching after a failed attempt or a lost direct path,
-/// while the session is still wanted (design §5.3, "retry … only while
-/// traffic is flowing").
-const REPUNCH_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Strategy selection and the extra inputs some strategies need. Bundled so
 /// `Session::start` stays readable; `Default` is the plain `basic` punch.
@@ -59,69 +61,39 @@ pub struct PunchConfig {
     pub port_map: bool,
 }
 
-/// The inputs the manager needs to punch, held for the session's life.
-struct PunchParams {
-    initiator: bool,
-    identity: StdArc<Identity>,
-    peer_pin: Option<SpkiPin>,
-    /// The outer bind endpoint, reused for the punch so its source matches the
-    /// advertised reflexive (design §5.3, §12).
-    punch_endpoint: quinn::Endpoint,
-    reflexive: Option<SocketAddr>,
-    relay_paddr: SocketAddr,
-    cfg: PunchConfig,
-}
-
 /// A peer session that manages the relay↔direct path transition.
 pub struct Session {
-    relay: quinn::Connection,
-    /// The current direct connection, when DIRECT.
-    direct: Arc<Mutex<Option<Direct>>>,
+    relay: noq::Connection,
     state_rx: watch::Receiver<PathState>,
     _manager: tokio::task::JoinHandle<()>,
 }
 
 impl Session {
     /// Start managing paths for a peer pair. `inner` is the established relay
-    /// connection; the manager immediately tries to punch a direct path and
-    /// maintains it, falling back to the relay on loss.
+    /// connection. In Stage 1 the session holds the relay path; native
+    /// multipath (Stage 3) will drive the relay→direct upgrade in-protocol.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        inner: quinn::Connection,
-        initiator: bool,
-        identity: StdArc<Identity>,
-        peer_pin: Option<SpkiPin>,
-        punch_endpoint: quinn::Endpoint,
-        reflexive: Option<SocketAddr>,
-        relay_paddr: SocketAddr,
-        cfg: PunchConfig,
+        inner: noq::Connection,
+        _initiator: bool,
+        _identity: StdArc<Identity>,
+        _peer_pin: Option<SpkiPin>,
+        _punch_endpoint: quinn::Endpoint,
+        _reflexive: Option<SocketAddr>,
+        _relay_paddr: SocketAddr,
+        _cfg: PunchConfig,
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(PathState::Relay);
-        let direct: Arc<Mutex<Option<Direct>>> = Arc::new(Mutex::new(None));
-        let params = PunchParams {
-            initiator,
-            identity,
-            peer_pin,
-            punch_endpoint,
-            reflexive,
-            relay_paddr,
-            cfg,
-        };
-        let manager = tokio::spawn(manage(inner.clone(), params, direct.clone(), state_tx));
+        let manager = tokio::spawn(manage(inner.clone(), state_tx));
         Self {
             relay: inner,
-            direct,
             state_rx,
             _manager: manager,
         }
     }
 
-    /// The current best path: the direct connection when DIRECT, else the
-    /// relay. New streams should be opened on the returned connection.
-    pub fn connection(&self) -> quinn::Connection {
-        if let Some(d) = self.direct.lock().unwrap().as_ref() {
-            return d.conn.clone();
-        }
+    /// The current best path. New streams should be opened on it.
+    pub fn connection(&self) -> noq::Connection {
         self.relay.clone()
     }
 
@@ -136,8 +108,7 @@ impl Session {
     }
 
     /// Wait until the direct path is up, or `timeout` elapses (returns
-    /// whether DIRECT was reached). Useful for callers that prefer to send
-    /// the first bytes over the direct path when it comes up quickly.
+    /// whether DIRECT was reached).
     pub async fn await_direct(&self, timeout: Duration) -> bool {
         let mut rx = self.state_rx.clone();
         let wait = async {
@@ -160,58 +131,10 @@ impl Drop for Session {
     }
 }
 
-/// The manager loop: punch, promote to DIRECT, watch for loss, fall back and
-/// re-punch. Ends when the relay connection closes (the session is over).
-async fn manage(
-    inner: quinn::Connection,
-    params: PunchParams,
-    direct: Arc<Mutex<Option<Direct>>>,
-    state: watch::Sender<PathState>,
-) {
-    loop {
-        // Give up managing once the relay path itself is gone.
-        if inner.close_reason().is_some() {
-            return;
-        }
-
-        let _ = state.send(PathState::Punching);
-        let inputs = holepunch::PunchInputs {
-            inner: &inner,
-            initiator: params.initiator,
-            identity: &params.identity,
-            peer_pin: params.peer_pin,
-            punch_endpoint: params.punch_endpoint.clone(),
-            reflexive: params.reflexive,
-            relay: params.relay_paddr,
-            strategy: params.cfg.strategy,
-            relay_access: params.cfg.relay_access.clone(),
-            peer_reflexive: params.cfg.peer_reflexive.clone(),
-            port_map: params.cfg.port_map,
-        };
-        match holepunch::coordinate(inputs).await {
-            Ok(d) => {
-                let conn = d.conn.clone();
-                *direct.lock().unwrap() = Some(d);
-                let _ = state.send(PathState::Direct);
-                tracing::info!(remote = %conn.remote_address(), "path upgraded to direct");
-
-                // Hold DIRECT until the connection closes (PTO storm / lost
-                // keepalive surface as a connection error here).
-                let _ = conn.closed().await;
-                *direct.lock().unwrap() = None;
-                let _ = state.send(PathState::Relay);
-                tracing::info!("direct path lost; back on the relay");
-            }
-            Err(e) => {
-                let _ = state.send(PathState::Relay);
-                tracing::debug!("hole punch failed, staying on relay: {e}");
-            }
-        }
-
-        // Back off before the next attempt, but abandon if the relay closes.
-        tokio::select! {
-            _ = tokio::time::sleep(REPUNCH_BACKOFF) => {}
-            _ = inner.closed() => return,
-        }
-    }
+/// The manager loop. In Stage 1 it simply holds the state channel alive for
+/// the life of the relay connection; Stage 3 restores the punch/promote loop
+/// on top of noq native multipath.
+async fn manage(inner: noq::Connection, state: watch::Sender<PathState>) {
+    let _ = inner.closed().await;
+    let _ = state.send(PathState::Relay);
 }

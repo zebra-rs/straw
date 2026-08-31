@@ -186,7 +186,9 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     );
 
     let conn = listener.accept().await?;
-    eprintln!("peer connected via relay: {}", conn.remote_address());
+    // noq's established Connection exposes remotes per-Path, not as one address
+    // (multipath); the relay peer's address is the listener's advertised paddr.
+    eprintln!("peer connected via relay at {}", listener.paddr);
     let session = Session::start(
         conn,
         false,
@@ -199,13 +201,11 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
-        return straw::p2p::vpn::run_server(
-            best,
-            args.vpn_subnet,
-            args.vpn_tun.clone(),
-            args.vpn_mtu.unwrap_or(1400),
-        )
-        .await;
+        // Parked during the noq migration: VPN mode runs CONNECT-IP/h3 over the
+        // peer connection, which now needs an h3-over-noq adapter (Stage 2).
+        return Err(ProxyError::Config(
+            "P2P VPN mode is being ported to noq (Stage 2: h3-over-noq adapter);              pipe mode works over the noq relay path".into(),
+        ));
     }
     // The connecting peer opens the stream; accept it on the chosen path.
     let (send, recv) = best
@@ -237,14 +237,10 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
-        return straw::p2p::vpn::run_client(
-            best,
-            args.vpn_tun.clone(),
-            args.vpn_mtu,
-            !args.vpn_no_routes,
-            Some(args.vpn_subnet.to_string()),
-        )
-        .await;
+        // Parked during the noq migration (see run/listen above): Stage 2.
+        return Err(ProxyError::Config(
+            "P2P VPN mode is being ported to noq (Stage 2: h3-over-noq adapter);              pipe mode works over the noq relay path".into(),
+        ));
     }
     let (send, recv) = best
         .open_bi()
@@ -255,7 +251,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
 
 /// Wait briefly for a direct path, then return the connection to pipe over,
 /// reporting which path won.
-async fn best_path(session: &Session, wait_secs: u64) -> quinn::Connection {
+async fn best_path(session: &Session, wait_secs: u64) -> noq::Connection {
     let direct = session.await_direct(Duration::from_secs(wait_secs)).await;
     match session.state() {
         PathState::Direct if direct => eprintln!("path: direct (hole punched)"),
@@ -272,8 +268,8 @@ async fn best_path(session: &Session, wait_secs: u64) -> quinn::Connection {
 /// So we always let the upload reach stdin EOF and call `finish()`, matching a
 /// half-close pipe: the process exits once both halves are done.
 async fn pipe_stdio(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: noq::SendStream,
+    mut recv: noq::RecvStream,
 ) -> Result<(), ProxyError> {
     use tokio::io::{AsyncWriteExt, copy};
 

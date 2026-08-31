@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use noq::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 
 use crate::client::{BindClient, ClientAuth, TlsMode};
 use crate::error::ProxyError;
@@ -36,12 +36,12 @@ pub struct Listener {
     pub reflexive: Option<SocketAddr>,
     /// The outer bind socket, reused for the hole punch (design §5.3, §12).
     pub punch_endpoint: quinn::Endpoint,
-    endpoint: quinn::Endpoint,
+    endpoint: noq::Endpoint,
 }
 
 impl Listener {
     /// Accept the next inner connection (already mutually pin-verified).
-    pub async fn accept(&self) -> Result<quinn::Connection, ProxyError> {
+    pub async fn accept(&self) -> Result<noq::Connection, ProxyError> {
         let incoming = self
             .endpoint
             .accept()
@@ -55,14 +55,14 @@ impl Listener {
 
 /// An established inner connection to a peer; holds its endpoint alive.
 pub struct PeerConnection {
-    pub conn: quinn::Connection,
+    pub conn: noq::Connection,
     /// This peer's reflexive candidate (the relay's view of its outer source).
     pub reflexive: Option<SocketAddr>,
     /// This peer's own relay-allocated public address (its relay candidate).
     pub relay_paddr: SocketAddr,
     /// The outer bind socket, reused for the hole punch (design §5.3, §12).
     pub punch_endpoint: quinn::Endpoint,
-    _endpoint: quinn::Endpoint,
+    _endpoint: noq::Endpoint,
 }
 
 /// Transport config for inner QUIC that runs *inside* the relay's bind
@@ -72,8 +72,8 @@ pub struct PeerConnection {
 /// oversize packets fail `send_datagram`, stalling the connection after the
 /// handshake. Pin the inner MTU at quinn's 1200-byte floor and disable
 /// discovery so inner packets always fit; a keepalive holds the idle pipe open.
-fn relay_transport() -> std::sync::Arc<quinn::TransportConfig> {
-    let mut t = quinn::TransportConfig::default();
+fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
+    let mut t = noq::TransportConfig::default();
     t.mtu_discovery_config(None);
     t.initial_mtu(1200);
     t.min_mtu(1200);
@@ -95,7 +95,7 @@ pub async fn listen(
     let reflexive = bind.observed_addr;
     let punch_endpoint = bind.endpoint();
     let (server_tls, _verifier) = inner_tls::server_config(identity, expected_peer)?;
-    let mut quic = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut quic = noq::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
@@ -129,7 +129,7 @@ pub async fn connect(
     let relay_paddr = bind.public_addr;
     let punch_endpoint = bind.endpoint();
     let (client_tls, _verifier) = inner_tls::client_config(identity, Some(token.peer_pin()))?;
-    let mut quic = quinn::ClientConfig::new(Arc::new(
+    let mut quic = noq::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
