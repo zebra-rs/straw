@@ -98,9 +98,11 @@ policy doubles as its ingress filter, so it only hears from within its scope.
 `sudo bench/iperf-baseline.sh [secs]` measures raw-veth vs through-tunnel
 iperf3 throughput across three namespaces; numbers and analysis live in
 `bench/BASELINE.md` (baseline: ~4–5 Gbit/s TCP through the tunnel, CPU-bound,
-parallel streams don't help; TUN TSO offload engages — 64 KB reads — but
-throughput sits at the single-connection QUIC crypto floor, see
-bench/BASELINE.md). The TUN device uses IFF_VNET_HDR: every read/write
+parallel streams don't help, and **parallel QUIC connections don't either** —
+two tunnels on two connections aggregate to the same ~4.2 Gbit/s while no
+process is at a single-core wall and 8 of 12 cores idle, so the ceiling is
+neither per-connection crypto nor CPU; the shared proxy-side TUN device is the
+untested next suspect, see bench/BASELINE.md). The TUN device uses IFF_VNET_HDR: every read/write
 carries a 10-byte virtio-net header, GSO aggregates are re-segmented in
 `forwarding/vnet.rs`. `vendor/quinn-proto` is 0.11.17 with a one-line
 fix for an upstream datagram-accounting bug that panicked the tunnel under

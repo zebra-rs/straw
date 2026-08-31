@@ -36,10 +36,10 @@ fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 command -v iperf3 >/dev/null || fail "iperf3 not found"
 command -v jq >/dev/null || fail "jq not found"
 
-STRAWC_PID=; STRAW_PID=; IPERF_O_PID=; IPERF_P_PID=
+STRAWC_PID=; STRAWC2_PID=; STRAW_PID=; IPERF_O_PID=; IPERF_P_PID=
 cleanup() {
     set +e
-    for p in $STRAWC_PID $STRAW_PID $IPERF_O_PID $IPERF_P_PID; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    for p in $STRAWC_PID $STRAWC2_PID $STRAW_PID $IPERF_O_PID $IPERF_P_PID; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     for _ in $(seq 20); do ip netns pids $NS_C 2>/dev/null | grep -q . || break; sleep 0.1; done
     for ns in $NS_C $NS_P $NS_O; do ip netns del $ns 2>/dev/null; done
     set -e
@@ -84,6 +84,25 @@ ip netns exec $NS_C ip link show strawc0 >/dev/null 2>&1 || { cat "$OUT/strawc.l
 sleep 3
 CLIENT_TUN_MTU=$(ip netns exec $NS_C cat /sys/class/net/strawc0/mtu)
 
+# A SECOND client daemon: its own QUIC connection, its own tunnel address, its
+# own TUN device. This is the experiment that decides whether the ~4-5 Gbit/s
+# ceiling is a *per-connection* limit (as the single-connection QUIC-crypto
+# hypothesis predicts) or a whole-box CPU limit. If two connections carrying
+# concurrent flows sum to appreciably more than one, the ceiling is
+# per-connection and parallel connections are worth building; if they simply
+# split it, they are not.
+log "second client (strawc2, a separate QUIC connection)"
+ip netns exec $NS_C env RUST_LOG=straw=info "$BIN/strawc" \
+    --server-addr 172.31.0.1:4433 --insecure --tun-name strawc1 --no-routes >"$OUT/strawc2.log" 2>&1 &
+STRAWC2_PID=$!
+for _ in $(seq 100); do ip netns exec $NS_C ip link show strawc1 >/dev/null 2>&1 && break; sleep 0.1; done
+if ip netns exec $NS_C ip link show strawc1 >/dev/null 2>&1; then
+    PARALLEL_OK=1
+else
+    PARALLEL_OK=0
+    echo "  second tunnel did not come up; skipping the parallel-connection case"
+fi
+
 # KEEP=1: leave the topology and daemons up for manual poking; no runs.
 if [ "${KEEP:-}" = 1 ]; then
     trap - EXIT
@@ -127,6 +146,49 @@ log "TCP: through the tunnel, 4 parallel streams (one QUIC connection)"
 run tun_up4   $NS_O 10.99.0.2 $NS_C -P 4
 run tun_down4 $NS_O 10.99.0.2 $NS_C -R -P 4
 
+# Two flows over two *connections*, run concurrently, versus the single-tunnel
+# number above. The second tunnel has --no-routes, so its traffic is sourced
+# from its own tunnel address explicitly rather than by the routing table.
+if [ "$PARALLEL_OK" = 1 ]; then
+    log "TCP: two tunnels on two QUIC connections, concurrently"
+    TUN2_ADDR=$(ip netns exec $NS_C ip -4 -o addr show strawc1 | awk '{print $4}' | cut -d/ -f1)
+    # strawc2 runs with --no-routes so it cannot fight the first tunnel for the
+    # default route. Give it a policy route instead: anything sourced from its
+    # tunnel address leaves by its device, so flow B really rides the second
+    # QUIC connection rather than silently falling back to the first.
+    ip netns exec $NS_C ip rule add from "$TUN2_ADDR" table 100 2>/dev/null || true
+    ip netns exec $NS_C ip route replace default dev strawc1 table 100 2>/dev/null || true
+    ip netns exec $NS_O iperf3 -s -1 -p 5301 -B 10.99.0.2 >/dev/null 2>&1 &
+    P1=$!
+    ip netns exec $NS_O iperf3 -s -1 -p 5302 -B 10.99.0.2 >/dev/null 2>&1 &
+    P2=$!
+    sleep 0.3
+    ip netns exec $NS_C iperf3 -c 10.99.0.2 -p 5301 -t "$DUR" -J \
+        >"$OUT/par_a.json" 2>"$OUT/par_a.err" &
+    A=$!
+    ip netns exec $NS_C iperf3 -c 10.99.0.2 -p 5302 -t "$DUR" -J -B "$TUN2_ADDR" \
+        >"$OUT/par_b.json" 2>"$OUT/par_b.err" &
+    B=$!
+    # Sample per-process CPU across the run. If the aggregate does not beat a
+    # single tunnel, this says which process is the wall: a proxy pinned near
+    # one core means the limit is its single datapath, not per-connection QUIC
+    # crypto — and parallel connections would not help.
+    cpu_ticks() { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+    T0_STRAW=$(cpu_ticks $STRAW_PID)
+    T0_C1=$(cpu_ticks $STRAWC_PID)
+    T0_C2=$(cpu_ticks $STRAWC2_PID)
+    wait $A 2>/dev/null || true
+    wait $B 2>/dev/null || true
+    HZ=$(getconf CLK_TCK)
+    CPU_STRAW=$(awk -v a="$T0_STRAW" -v b="$(cpu_ticks $STRAW_PID)" -v hz="$HZ" -v d="$DUR" \
+        'BEGIN{printf "%.0f", (b-a)/hz/d*100}')
+    CPU_C1=$(awk -v a="$T0_C1" -v b="$(cpu_ticks $STRAWC_PID)" -v hz="$HZ" -v d="$DUR" \
+        'BEGIN{printf "%.0f", (b-a)/hz/d*100}')
+    CPU_C2=$(awk -v a="$T0_C2" -v b="$(cpu_ticks $STRAWC2_PID)" -v hz="$HZ" -v d="$DUR" \
+        'BEGIN{printf "%.0f", (b-a)/hz/d*100}')
+    kill $P1 $P2 2>/dev/null || true
+fi
+
 log "UDP: through the tunnel, loss-knee sweep"
 for rate in 1G 2G 4G 8G; do
     run "tun_udp_$rate" $NS_O 10.99.0.2 $NS_C -u -b "$rate"
@@ -139,6 +201,20 @@ printf '  %-28s %s\n' "tunnel    uplink:"        "$(fmt_tcp "$OUT/tun_up.json")"
 printf '  %-28s %s\n' "tunnel    downlink (-R):" "$(fmt_tcp "$OUT/tun_down.json")"
 printf '  %-28s %s\n' "tunnel    uplink   x4:"    "$(fmt_tcp "$OUT/tun_up4.json")"
 printf '  %-28s %s\n' "tunnel    downlink x4:"    "$(fmt_tcp "$OUT/tun_down4.json")"
+if [ "$PARALLEL_OK" = 1 ]; then
+    A_G=$(jq -r '.end.sum_received.bits_per_second/1e9' "$OUT/par_a.json" 2>/dev/null || echo 0)
+    B_G=$(jq -r '.end.sum_received.bits_per_second/1e9' "$OUT/par_b.json" 2>/dev/null || echo 0)
+    printf '  %-28s %s\n' "2 conns   flow A:" "$(fmt_tcp "$OUT/par_a.json")"
+    printf '  %-28s %s\n' "2 conns   flow B:" "$(fmt_tcp "$OUT/par_b.json")"
+    printf '  %-28s %s Gbit/s\n' "2 conns   AGGREGATE:" \
+        "$(awk -v a="$A_G" -v b="$B_G" 'BEGIN{printf "%.2f", a+b}')"
+    echo "    (compare with the single-tunnel uplink above: appreciably higher"
+    echo "     means the ceiling is per-connection, so parallel connections pay)"
+    printf '  %-28s straw %s%%  strawc %s%%  strawc2 %s%%  (of one core)\n' \
+        "2 conns   CPU:" "$CPU_STRAW" "$CPU_C1" "$CPU_C2"
+    NCPU=$(nproc)
+    echo "    ($NCPU cores available; a process near 100% is a single-threaded wall)"
+fi
 for rate in 1G 2G 4G 8G; do
     printf '  %-28s %s\n' "tunnel    UDP @ $rate:" "$(fmt_udp "$OUT/tun_udp_$rate.json")"
 done
