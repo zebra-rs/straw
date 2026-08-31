@@ -11,7 +11,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -939,8 +939,10 @@ impl BindClient {
     }
 
     pub(crate) fn into_relay_parts(self) -> crate::p2p::relay_socket::RelayParts {
+        use crate::capsule::Capsule;
         use crate::capsule::codec::read_varint;
-        use crate::udp_bind::context::decode_uncompressed_body;
+        use crate::codepoints::CAPSULE_COMPRESSION_ACK;
+        use crate::udp_bind::context::decode_context_capsule;
 
         let BindClient {
             _endpoint,
@@ -948,19 +950,27 @@ impl BindClient {
             conn,
             mut stream,
             qsid,
-            uncompressed,
+            uncompressed: _,
             public_addr,
             observed_addr: _,
-            contexts: _,
+            contexts,
         } = self;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
+        // The pump owns the stream, so anything that wants to *write* a
+        // capsule — the §10.4 lockdown — hands it over here.
+        let (capsule_tx, mut capsule_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        // Shared with the send half: it picks its framing from this table, the
+        // pump decodes inbound against it and promotes a context on ACK.
+        let contexts = Arc::new(Mutex::new(contexts));
+        let acked = Arc::new(tokio::sync::Notify::new());
         let conn_rx = conn.clone();
+        let pump_contexts = contexts.clone();
+        let pump_acked = acked.clone();
         let recv = tokio::spawn(async move {
-            // Hold the session's resources open for the socket's lifetime,
-            // deliver inner-QUIC datagrams to the relay socket, and notice when
-            // the capsule stream ends — that is how the session reports closure.
+            // Hold the session's resources open for the socket's lifetime.
             let _endpoint = _endpoint;
             let _send_request = _send_request;
+            let mut capsules = crate::capsule::CapsuleBuffer::new();
             loop {
                 tokio::select! {
                     dg = conn_rx.read_datagram() => {
@@ -971,15 +981,45 @@ impl BindClient {
                             continue;
                         }
                         let body = wire.slice(wire.len() - cursor.remaining()..);
-                        if let Ok((_, remote, payload)) = decode_uncompressed_body(body) {
-                            let _ = tx.try_send((remote, payload));
+                        // Decoded against the table, so a compressed context
+                        // (post-lockdown) supplies the remote the wire omits.
+                        let decoded = pump_contexts.lock().unwrap().decode_datagram(body);
+                        match decoded {
+                            Ok(dg) => { let _ = tx.try_send((dg.remote, dg.payload)); }
+                            Err(e) => tracing::trace!("relay pump dropped datagram: {e}"),
+                        }
+                    }
+                    Some(out) = capsule_rx.recv() => {
+                        if stream.send_data(out).await.is_err() {
+                            return;
                         }
                     }
                     data = stream.recv_data() => {
                         match data {
-                            // Nothing on this stream is consumed today; it is
-                            // read only so that its end is noticed.
-                            Ok(Some(_)) => {}
+                            Ok(Some(chunk)) => {
+                                capsules.push(chunk);
+                                while let Ok(Some(Capsule::Unknown { type_id, data })) =
+                                    capsules.next_capsule()
+                                {
+                                    // The relay acknowledging a context we
+                                    // proposed is what makes it usable.
+                                    if type_id == CAPSULE_COMPRESSION_ACK
+                                        && let Ok(id) = decode_context_capsule(data)
+                                    {
+                                        match pump_contexts.lock().unwrap().ack(id) {
+                                            Ok(()) => tracing::debug!(
+                                                context = id,
+                                                "relay acknowledged compression context"
+                                            ),
+                                            Err(e) => tracing::debug!(
+                                                context = id,
+                                                "unexpected COMPRESSION_ACK: {e}"
+                                            ),
+                                        }
+                                        pump_acked.notify_waiters();
+                                    }
+                                }
+                            }
                             // Stream closed or errored: the session is over.
                             _ => return,
                         }
@@ -990,7 +1030,9 @@ impl BindClient {
         crate::p2p::relay_socket::RelayParts {
             conn,
             qsid,
-            uncompressed,
+            contexts,
+            capsules: capsule_tx,
+            acked,
             local: public_addr,
             rx,
             recv_task: recv,

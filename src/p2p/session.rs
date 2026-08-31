@@ -281,6 +281,16 @@ async fn manage(
                 promote(&conn, direct);
                 *direct_path.lock().unwrap() = Some(direct);
                 let _ = state.send(PathState::Direct);
+                // §10.4: with the data on the direct path, narrow the relay to
+                // this peer alone. Best-effort — a relay that will not
+                // acknowledge the context leaves a wider attack surface, not a
+                // broken session, so it must never fail the punch.
+                if let Some(lockdown) = inputs.mux.lockdown() {
+                    match lockdown.engage().await {
+                        Ok(peer) => tracing::debug!(%peer, "relay locked down to the peer"),
+                        Err(e) => tracing::warn!("relay lockdown skipped: {e}"),
+                    }
+                }
                 await_path_lost(&conn, direct).await;
                 tracing::info!(?direct, "direct path lost; falling back to the relay");
                 *direct_path.lock().unwrap() = None;

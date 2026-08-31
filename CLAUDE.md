@@ -161,13 +161,23 @@ unbounded learned set would let a spoofed source claim the tunnel route, and a
 probe aimed at the peer's own candidate would then ride the relay instead of
 the real socket, capturing the punch. Unit-tested in `relay_socket`.
 
-The **full §10.4 lockdown is still open**: after a direct path is stable the
-peer should register a *compressed* context for its peer and close the
-uncompressed one, so the relay drops all other inbound at the edge. The relay
-half is already built (`udp_bind::socket` firewalls unregistered remotes when
-no uncompressed context is open, and the handler serves
-COMPRESSION_ASSIGN/ACK/CLOSE); what is missing is the peer side — the client
-only ever opens the uncompressed context.
+The **§10.4 lockdown is done, both halves**. Once the punch promotes a direct
+path, `p2p::session` calls `RelayLockdown::engage` (`p2p/relay_socket.rs`):
+register a *compressed* context bound to the peer's relay address, wait for the
+relay's COMPRESSION_ACK, then close the uncompressed one. Order matters — the
+compressed context must be **acknowledged before** the uncompressed one goes,
+or a fallback in that window would have no context able to carry it and the
+relay path would silently blackhole. It is best-effort: a relay that will not
+ACK leaves a wider attack surface, not a broken session, so it never fails the
+punch. The relay path itself is never closed (G3); lockdown only narrows what
+may travel it, and `frame_bind` then elides the address from every datagram.
+The relay half was already built (`udp_bind::socket` firewalls unregistered
+remotes when no uncompressed context is open; the handler serves
+ASSIGN/ACK/CLOSE). Guarded by `after_lockdown_only_the_bound_peer_reaches_the_session`
+(the relay's edge — the property that makes this worth doing),
+`framing_prefers_the_compressed_context_and_stops_at_lockdown` (the encode
+choice), and `lockdown_binds_the_relay_to_one_peer_and_keeps_carrying_it` (the
+real ASSIGN/ACK exchange against a real relay, and delivery afterwards).
 
 `p2p/native_punch` drives the punch over noq's **NAT-traversal frames**
 (`add_nat_traversal_address` / `initiate_nat_traversal_round`, enabled by
