@@ -67,6 +67,25 @@ binaries into `bdd/.stage/bin` and the harness prepends that to PATH, so a run
 never tests a stale build. Steps live in `bdd/tests/cucumber.rs`; an unmatched
 step fails the scenario rather than being skipped.
 
+## Platforms
+
+Linux is the primary target. The TUN datapath is split per platform in
+`src/forwarding/tun/`: `linux.rs` uses `IFF_VNET_HDR` with TSO/GSO and
+re-segments aggregates through `forwarding/vnet.rs`; `macos.rs` drives utun,
+which has neither a virtio-net header nor TSO, so it reads one plain IP packet
+per syscall (the `tun` crate adds and strips utun's 4-byte address family
+itself). Both satisfy one `spawn_tun` contract and return the device's **actual**
+name in `TunChannels::name` — macOS names utun devices itself unless asked for a
+literal `utun<N>`, so callers must configure by that name, not the requested one.
+
+What is *not* ported: `iface.rs` still shells out to `ip(8)`, so anything that
+adds addresses or routes after device creation (`strawc`, `strawcat --vpn`, and
+IPv6 on the proxy's TUN) is Linux-only; `nat.rs` needs pf rather than iptables.
+`straw` as a relay and `strawcat` in pipe mode need none of that and are clean
+on macOS (check, clippy, fmt, and the unit + integration suites all pass there).
+The netns harnesses — the BDD suite, `scripts/*.sh`, `bench/*.sh` — are Linux-only
+by construction.
+
 ## Privileges
 
 Neither `straw` nor `strawc` needs root — both need **ambient**

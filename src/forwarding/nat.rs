@@ -100,7 +100,9 @@ pub fn setup_nat(pools: &[IpNet], interface: &str) -> Result<NatGuard, ProxyErro
     Ok(NatGuard { rules })
 }
 
-/// NAT is Linux-only, like the TUN device it serves.
+/// NAT is Linux-only. The TUN device it serves now has a macOS backend, but
+/// masquerading there means pf (`pfctl` anchors, `net.inet.ip.forwarding`),
+/// which is stateful in a way `iptables -D` is not — separate work.
 #[cfg(not(target_os = "linux"))]
 pub fn setup_nat(_pools: &[IpNet], _interface: &str) -> Result<NatGuard, ProxyError> {
     Err(ProxyError::Config(
