@@ -185,6 +185,14 @@ PUNCHED=0
 echo "$B_PATH$A_PATH" | grep -q "hole punched" && PUNCHED=1
 if [ "$PUNCHED" = 1 ]; then
     ok "direct path established — both peers punched through the NAT"
+    # Each peer must name the *other peer's* public address (192.0.2.2 /
+    # 192.0.2.6), not the relay's 192.0.2.1 — that is what makes it direct.
+    if echo "$A_PATH" | grep -q "peer 192.0.2.6:" && echo "$B_PATH" | grep -q "peer 192.0.2.2:"; then
+        ok "each direct path targets the peer's public address, not the relay"
+    else
+        fail "a direct path does not lead to the peer's public address"
+        DATA_OK=0
+    fi
 elif [ "$NAT_MODE" = cone ]; then
     fail "cone (EIM) NAT must allow the punch, but a peer stayed on the relay"
     DATA_OK=0
@@ -194,7 +202,8 @@ elif [ "$PORTMAP" = 1 ]; then
 else
     echo "  no direct path — both peers stayed on the relay (symmetric NAT blocked the punch)"
     echo "  holder punch trace:"
-    grep -iE "punch: (local|remote|dialing)|hole punch (failed|timed out)" "$OUT/np_connect.err" \
+    grep -iE "advertising direct-path|NAT traversal round|hole punch timed out|no direct path" \
+        "$OUT/np_connect.err" \
         | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9T:.-]+Z +[A-Z]+ +[a-z_:]+: //' | head -4 | sed 's/^/    /'
 fi
 

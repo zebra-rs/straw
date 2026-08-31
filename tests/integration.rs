@@ -22,6 +22,7 @@ use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::relay_socket::inner_endpoint;
+use straw::p2p::session::{PunchConfig, PunchInputs, Session};
 use straw::p2p::token::TokenV2;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
@@ -1425,10 +1426,10 @@ async fn peers_open_a_direct_path_over_the_mux() {
     );
 
     // The inner *client* (holder) drives path opening; the server (issuer)
-    // cannot open paths (ServerSideNotAllowed) — it just registers the direct
-    // remote so it routes its PATH_RESPONSEs out the real socket.
-    issuer_mux.register_direct_remote(holder_direct);
-    holder_side.mux.register_direct_remote(issuer_direct);
+    // cannot open paths (ServerSideNotAllowed) — it just answers the challenge,
+    // which the mux sends out the real socket because only the relay paddr is
+    // routed through the tunnel.
+    let _ = (issuer_mux, holder_direct);
 
     // Let the server issue spare connection IDs before opening a new path
     // (noq needs a remote CID per path, issued shortly after the handshake).
@@ -1461,6 +1462,98 @@ async fn peers_open_a_direct_path_over_the_mux() {
     s.write_all(b"direct-path").await.unwrap();
     s.finish().unwrap();
     assert_eq!(&r.read_to_end(64).await.unwrap()[..], b"direct-path");
+    drop(echo);
+}
+
+#[tokio::test]
+async fn a_session_punches_and_promotes_the_direct_path() {
+    // Stage 3 end to end: two peers meet through the relay, then their Sessions
+    // drive the punch by themselves — candidates advertised as NAT-traversal
+    // frames, probed by noq, the validated path promoted over the relay one.
+    // Both sides must reach DIRECT, and the path each one holds must lead to
+    // the *other peer's* socket rather than the relay.
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+        .await
+        .unwrap();
+    let issuer_inputs = PunchInputs {
+        mux: listener.mux.clone(),
+        reflexive: listener.reflexive,
+    };
+    let issuer_direct = listener.mux.direct_local().port();
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "relay-bearer".into(),
+        issuer.pin(),
+        vec![listener.paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+        .await
+        .unwrap();
+    let holder_direct = holder_side.mux.direct_local().port();
+    let issuer_conn = accept.await.unwrap().unwrap();
+
+    let issuer_session = Session::start(
+        issuer_conn.clone(),
+        false,
+        issuer_inputs,
+        PunchConfig::default(),
+    );
+    let holder_session = Session::start(
+        holder_side.conn.clone(),
+        true,
+        PunchInputs {
+            mux: holder_side.mux.clone(),
+            reflexive: holder_side.reflexive,
+        },
+        PunchConfig::default(),
+    );
+
+    let wait = Duration::from_secs(15);
+    assert!(
+        holder_session.await_direct(wait).await,
+        "the holder (inner client) reaches the direct path"
+    );
+    assert!(
+        issuer_session.await_direct(wait).await,
+        "the issuer (inner server) sees the direct path too"
+    );
+
+    // Each side's direct path targets the other's real socket. On loopback the
+    // relay-observed reflexive IP is 127.0.0.1, so the candidate is exactly the
+    // peer's direct port — the same mechanism a cone NAT gives a real peer.
+    assert_eq!(
+        holder_session.direct_remote().map(|a| a.port()),
+        Some(issuer_direct),
+        "the holder's direct path reaches the issuer's socket, not the relay"
+    );
+    assert_eq!(
+        issuer_session.direct_remote().map(|a| a.port()),
+        Some(holder_direct),
+        "the issuer's direct path reaches the holder's socket, not the relay"
+    );
+
+    // The application connection is unchanged by the migration: streams opened
+    // after it work, and they now ride the direct path.
+    let echo = tokio::spawn(async move {
+        let (mut s, mut r) = issuer_conn.accept_bi().await.unwrap();
+        let m = r.read_to_end(64).await.unwrap();
+        s.write_all(&m).await.unwrap();
+        s.finish().unwrap();
+        issuer_conn.closed().await;
+    });
+    let (mut s, mut r) = holder_session.connection().open_bi().await.unwrap();
+    s.write_all(b"promoted").await.unwrap();
+    s.finish().unwrap();
+    assert_eq!(&r.read_to_end(64).await.unwrap()[..], b"promoted");
     drop(echo);
 }
 

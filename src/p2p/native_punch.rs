@@ -1,161 +1,205 @@
 //! The native-multipath punch (design §0 Stage 3): upgrade the single inner
-//! noq connection from the relay path to a **direct** path, in-protocol, via
-//! `Connection::open_path` over the combined-transport socket
-//! ([`PathMuxSocket`](crate::p2p::relay_socket::PathMuxSocket)) — replacing the
-//! app-level second-connection race of the v1 design (§5.3).
+//! noq connection from the relay path to a **direct** path, in-protocol —
+//! replacing the app-level second-connection race of the v1 design (§5.3).
 //!
-//! Flow: gather this peer's direct-socket candidate, exchange candidates with
-//! the peer over the inner connection, register the peer's candidates on the
-//! mux (so sends there go out the real socket), then:
+//! Candidates are exchanged by noq's own NAT-traversal frames
+//! (draft-seemann-quic-nat-traversal, enabled by
+//! `TransportConfig::max_remote_nat_traversal_addresses`), not by an
+//! application message. That matters beyond tidiness: an app-level exchange
+//! needs a stream, and in VPN mode the inner protocol is h3, which would read
+//! that stream as a request. At the QUIC layer the exchange is invisible to
+//! the application, so one punch driver serves both inner protocols.
 //!
-//! - the inner-QUIC **client** opens a path to each peer candidate (only the
-//!   client may `open_path`; the server gets `ServerSideNotAllowed`);
-//! - the **server** just registers and waits — QUIC answers the client's
-//!   PATH_CHALLENGE out the real socket automatically.
+//! Roles follow the draft's asymmetry:
 //!
-//! Both sides watch `path_events()` for an `Established` event on a non-zero
-//! path id — noq has validated the direct path and migrates to it.
+//! - the inner **server** advertises its candidates in ADD_ADDRESS frames
+//!   ([`advertise`]), and answers probes;
+//! - the inner **client** learns them, advertises its own in REACH_OUT frames
+//!   and probes the server's ([`Connection::initiate_nat_traversal_round`]).
+//!   On a probe response noq opens the validated path itself.
 //!
-//! **Status / caveat.** This app-level candidate exchange (a dedicated bidi
-//! stream) works for raw-stream apps (pipe mode) but would collide with h3 in
-//! VPN mode — h3 would see the exchange stream as a request. The correct, mode-
-//! agnostic mechanism is noq's own NAT-traversal *frames*
-//! (`Connection::add_nat_traversal_address` on the server +
-//! `initiate_nat_traversal_round` on the client, enabled by
-//! `TransportConfig::max_remote_nat_traversal_addresses`): control traffic at
-//! the QUIC layer, invisible to the app. The proven building block —
-//! `open_path` validating over the combined socket — is shared by both; the
-//! session wiring will move to the frame-based exchange.
+//! Both sides then see `PathEvent::Established` for a non-zero path id — noq
+//! has validated a direct path. Promotion to the *preferred* path is the
+//! caller's job ([`crate::p2p::session`]): a traversal-opened path arrives with
+//! `PathStatus::Backup`, so until it is marked available the relay path (0,
+//! `Available` by default) keeps carrying the data.
+//!
+//! Both roles' probes leave over the real UDP socket without any registration
+//! step, because [`PathMuxSocket`] sends direct by default and tunnels only
+//! addresses known to be relay-side.
+//!
+//! [`PathMuxSocket`]: crate::p2p::relay_socket::PathMuxSocket
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use futures::StreamExt;
-use noq::{FourTuple, PathEvent, PathId, PathStatus};
+use noq::{PathEvent, PathId};
+
 use crate::error::ProxyError;
 use crate::p2p::relay_socket::PathMuxHandle;
-use crate::p2p::wire::{Candidate, CandidateKind, Control};
 
-/// noq needs a spare remote connection ID per path, issued shortly after the
-/// handshake; opening a path before then fails `RemoteCidsExhausted`.
-const CID_SETTLE: Duration = Duration::from_millis(300);
+/// How long to wait for the peer's ADD_ADDRESS before initiating a round. The
+/// server advertises as soon as it has the connection, so this only covers the
+/// flight; giving up early would waste the whole punch window.
+const ADDRESS_WAIT: Duration = Duration::from_secs(3);
 
-/// Run the punch on an established inner connection. `client` is true for the
-/// inner-QUIC client (the token holder / connector). `reflexive_ip` is this
-/// peer's public IP as the relay observed it (from the bind session's
-/// OBSERVED_ADDRESS); the direct socket's reflexive candidate is that IP with
-/// the direct socket's port — exact for a port-preserving (NETMAP / full-cone)
-/// NAT and for same-host tests. Returns the established direct [`PathId`].
+/// A round's probes are retried with backoff for ~4s (noq's
+/// `MAX_NAT_PROBE_ATTEMPTS`); re-initiate at a slightly longer interval so a
+/// new round never cancels probes that are still live.
+const ROUND_INTERVAL: Duration = Duration::from_secs(5);
+
+/// This peer's direct-path candidates, in the order they are advertised.
+///
+/// `reflexive_ip` is the peer's public IP as the relay observed it on the outer
+/// bind session; paired with the *direct* socket's port it is the address a
+/// port-preserving (full-cone / NETMAP / explicitly forwarded) NAT presents to
+/// the other peer. `mapped` is an address a PCP/NAT-PMP forward made reachable
+/// (`--port-map`), which holds even on a symmetric NAT.
+pub fn candidates(
+    mux: &PathMuxHandle,
+    reflexive_ip: Option<IpAddr>,
+    mapped: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let port = mux.direct_local().port();
+    let mut out = Vec::new();
+    // The explicit forward first: it is the one that survives a symmetric NAT.
+    if let Some(m) = mapped {
+        out.push(m);
+    }
+    if let Some(ip) = reflexive_ip {
+        let reflexive = SocketAddr::new(ip, port);
+        if !out.contains(&reflexive) {
+            out.push(reflexive);
+        }
+    }
+    out
+}
+
+/// Offer `addrs` to the peer as addresses this endpoint may be reached at.
+///
+/// On the inner server these go out as ADD_ADDRESS frames immediately; on the
+/// inner client they are held until a round is initiated, then sent as
+/// REACH_OUT. Both sides call this — the draft's exchange is symmetric in
+/// content, asymmetric only in framing.
+pub fn advertise(conn: &noq::Connection, addrs: &[SocketAddr]) -> Result<(), ProxyError> {
+    for &addr in addrs {
+        conn.add_nat_traversal_address(addr)
+            .map_err(|e| ProxyError::Quic(format!("advertising {addr}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Run the punch to completion on an established inner connection, returning
+/// the direct [`PathId`] noq validated.
+///
+/// `client` is true for the inner-QUIC client (the token holder / connector),
+/// which is the side that initiates traversal rounds; the server only answers.
+/// The caller must have called [`advertise`] with this peer's candidates first.
 pub async fn punch(
     conn: &noq::Connection,
-    mux: &PathMuxHandle,
     client: bool,
-    reflexive_ip: Option<IpAddr>,
     timeout: Duration,
 ) -> Result<PathId, ProxyError> {
-    // 1. This peer's direct-socket candidate. On a port-preserving NAT the
-    //    reflexive is (observed public IP, direct port); on loopback the
-    //    observed IP is the loopback address, so this degenerates to the host
-    //    candidate. (A PAT cone NAT would need STUN on the direct socket to
-    //    learn the translated port — a follow-on.)
-    let direct_port = mux.direct_local().port();
-    let mut local = Vec::new();
-    if let Some(ip) = reflexive_ip {
-        local.push(Candidate {
-            seq: 0,
-            addr: SocketAddr::new(ip, direct_port),
-            kind: CandidateKind::Reflexive,
-        });
-    }
-
-    // 2. Exchange candidates over the inner connection (a dedicated control
-    //    stream, opened before the application opens its streams).
-    let remote = exchange(conn, &local, client).await?;
-    if remote.is_empty() {
-        return Err(ProxyError::Quic("peer sent no punch candidates".into()));
-    }
-
-    // 3. Route sends to the peer's candidates out the real socket.
-    for c in &remote {
-        mux.register_direct_remote(c.addr);
-    }
-
-    // 4. Watch for an established direct path (both roles).
+    // Subscribe before anything can fire: path events are a broadcast stream,
+    // and an Established we are not yet listening for is simply lost.
     let mut events = conn.path_events();
 
-    // 5. The client drives path opening; the server only responds.
-    if client {
-        tokio::time::sleep(CID_SETTLE).await;
-        for c in &remote {
-            let conn = conn.clone();
-            let addr = c.addr;
-            tokio::spawn(async move {
-                if let Err(e) = conn
-                    .open_path_ensure(FourTuple::from_remote(addr), PathStatus::Available)
-                    .await
-                {
-                    tracing::debug!(%addr, "open_path failed: {e:?}");
-                }
-            });
-        }
-    }
-
-    // 6. First non-relay path to establish wins.
-    let wait = async {
+    let established = async {
         while let Some(ev) = events.next().await {
-            if let Ok(PathEvent::Established { id, .. }) = ev
-                && id != PathId::ZERO
-            {
-                return Some(id);
+            match ev {
+                Ok(PathEvent::Established { id, .. }) if id != PathId::ZERO => return Ok(id),
+                // A lagged broadcast may have dropped an Established. The path
+                // is still there, so keep watching rather than failing: a later
+                // event, or the timeout, decides.
+                Err(lag) => tracing::debug!(%lag, "path events lagged during the punch"),
+                _ => {}
             }
         }
-        None
+        Err(ProxyError::Quic("path event stream ended".into()))
     };
-    match tokio::time::timeout(timeout, wait).await {
-        Ok(Some(id)) => {
-            tracing::info!(?id, "direct path established (native multipath)");
+
+    // The round driver runs *inside* this future rather than as a spawned
+    // task, so it stops probing the moment the punch ends — whether it
+    // succeeded or timed out. It never resolves, so only the event watch or
+    // the timeout can end the punch.
+    let driver = async {
+        if client {
+            tokio::select! {
+                outcome = established => outcome,
+                _ = drive_rounds(conn.clone()) => unreachable!("the round driver never resolves"),
+            }
+        } else {
+            established.await
+        }
+    };
+
+    match tokio::time::timeout(timeout, driver).await {
+        Ok(Ok(id)) => {
+            tracing::info!(?id, "direct path established (native NAT traversal)");
             Ok(id)
         }
-        Ok(None) => Err(ProxyError::Quic("path event stream ended".into())),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(ProxyError::Quic("hole punch timed out".into())),
     }
 }
 
-/// Exchange candidate lists on a dedicated bidirectional stream: the client
-/// opens it, the server accepts it; each side writes its length-delimited
-/// `Control::Candidate` messages, finishes, and reads the peer's.
-async fn exchange(
-    conn: &noq::Connection,
-    local: &[Candidate],
-    client: bool,
-) -> Result<Vec<Candidate>, ProxyError> {
-    let (mut send, mut recv) = if client {
-        conn.open_bi().await.map_err(|e| ProxyError::Quic(e.to_string()))?
-    } else {
-        conn.accept_bi().await.map_err(|e| ProxyError::Quic(e.to_string()))?
-    };
-
-    for c in local {
-        send.write_all(&Control::Candidate(*c).encode())
-            .await
-            .map_err(|e| ProxyError::Quic(e.to_string()))?;
-    }
-    send.finish().map_err(|e| ProxyError::Quic(e.to_string()))?;
-
-    let buf = recv
-        .read_to_end(64 * 1024)
-        .await
-        .map_err(|e| ProxyError::Quic(e.to_string()))?;
-
-    let mut off = 0;
-    let mut remote = Vec::new();
-    while let Some((msg, n)) = Control::decode(&buf[off..])
-        .map_err(|_| ProxyError::InvalidRequest("malformed candidate".into()))?
-    {
-        if let Control::Candidate(c) = msg {
-            remote.push(c);
+/// Client side: initiate a traversal round as soon as the server has advertised
+/// an address, then keep re-initiating until the punch ends and drops this
+/// future. Retrying matters on a NAT whose binding only opens once *both* sides
+/// have sent outward.
+///
+/// Never resolves. When there is nothing left to drive it goes pending rather
+/// than returning, because it is raced against the path-event watch: finishing
+/// would cancel the watch and lose an `Established` that an earlier round had
+/// already set in motion.
+async fn drive_rounds(conn: noq::Connection) {
+    if wait_for_peer_address(&conn).await {
+        loop {
+            match conn.initiate_nat_traversal_round() {
+                Ok(probed) => tracing::debug!(?probed, "NAT traversal round initiated"),
+                // NotEnoughAddresses (no candidate of our own) or a closed
+                // connection: another round will not help.
+                Err(e) => {
+                    tracing::debug!("NAT traversal round refused: {e}");
+                    break;
+                }
+            }
+            tokio::time::sleep(ROUND_INTERVAL).await;
         }
-        off += n;
+    } else {
+        tracing::debug!("peer advertised no NAT-traversal candidates; staying on the relay");
     }
-    Ok(remote)
+    std::future::pending::<()>().await
+}
+
+/// Wait until the server's ADD_ADDRESS has landed. Returns whether there is at
+/// least one remote candidate to probe.
+///
+/// The update stream carries an ADD_ADDRESS / REMOVE_ADDRESS enum that noq does
+/// not re-export from its root, so each update is a signal to re-read the
+/// authoritative set rather than something to match on. That also absorbs a
+/// removal following an addition.
+async fn wait_for_peer_address(conn: &noq::Connection) -> bool {
+    let mut updates = conn.nat_traversal_updates();
+    let known = |conn: &noq::Connection| {
+        conn.get_remote_nat_traversal_addresses()
+            .is_ok_and(|a| !a.is_empty())
+    };
+    // Subscribing races the frame: check what is already known first.
+    if known(conn) {
+        return true;
+    }
+    let first = async {
+        while updates.next().await.is_some() {
+            if known(conn) {
+                tracing::debug!("peer advertised a NAT-traversal candidate");
+                return true;
+            }
+        }
+        false
+    };
+    tokio::time::timeout(ADDRESS_WAIT, first)
+        .await
+        .unwrap_or(false)
 }

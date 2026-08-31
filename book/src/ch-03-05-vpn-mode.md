@@ -21,8 +21,11 @@ the strawcat roles onto it:
   already-open `noq::Connection` — receives its address, stands up its own TUN, and pumps
   packets, exactly like [`strawc`](ch-02-00-strawc.md).
 
-The tunnel rides whichever path the [`Session`](ch-03-03-hole-punching.md) picked:
-the relay, or a punched direct path.
+The tunnel rides whichever path the [`Session`](ch-03-03-hole-punching.md)
+picked — normally the direct one. VPN mode is in fact the case that forced the
+punch's candidate exchange into the QUIC layer: the inner protocol here is
+HTTP/3, and the earlier application-level exchange stream would have arrived at
+the h3 server as a malformed request.
 
 ## The scoping trap
 
@@ -50,8 +53,9 @@ strawcat connect <token> --relay <relay>:4433 --insecure --bearer-token s3cret \
 
 Now `ping 10.9.0.1` from peer B travels through the tunnel to peer A and back.
 The repository's `scripts/vpn-test.sh` is exactly this, three network namespaces
-(`peerA ─ relay ─ peerB`) with a ping asserted across the tunnel — over a punched
-direct path.
+(`peerA ─ relay ─ peerB`). It asserts both halves: that each peer's path leads
+to the *other peer's* address rather than the relay's, and that the ping crosses
+the tunnel over it.
 
 ## What it is and isn't
 

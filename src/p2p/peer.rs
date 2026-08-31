@@ -32,12 +32,16 @@ pub struct RelayAccess {
 /// token, and an inner endpoint that accepts one SPKI-pinned connection.
 pub struct Listener {
     pub paddr: SocketAddr,
-    /// The relay's view of this peer's outer source (its reflexive candidate).
+    /// The relay's view of this peer's outer source. Only its *IP* is this
+    /// peer's public address; the port belongs to the outer bind socket, so the
+    /// punch pairs the IP with the direct socket's port instead.
     pub reflexive: Option<SocketAddr>,
-    /// The outer bind socket, reused for the hole punch (design §5.3, §12).
+    /// The outer bind socket. The v1 app-level punch dialled from it; the
+    /// native punch uses the mux's direct socket, so this is only kept for the
+    /// parked [`holepunch`](crate::p2p::holepunch) path.
     pub punch_endpoint: quinn::Endpoint,
-    /// Drives the native-multipath punch: registers direct remotes and reports
-    /// the direct socket's local address (Stage 3).
+    /// The combined-transport socket's handle: the direct socket's local
+    /// address, which is half of this peer's candidate (Stage 3).
     pub mux: PathMuxHandle,
     endpoint: noq::Endpoint,
 }
@@ -59,13 +63,15 @@ impl Listener {
 /// An established inner connection to a peer; holds its endpoint alive.
 pub struct PeerConnection {
     pub conn: noq::Connection,
-    /// This peer's reflexive candidate (the relay's view of its outer source).
+    /// The relay's view of this peer's outer source; the punch reuses its IP
+    /// (see [`Listener::reflexive`]).
     pub reflexive: Option<SocketAddr>,
     /// This peer's own relay-allocated public address (its relay candidate).
     pub relay_paddr: SocketAddr,
-    /// The outer bind socket, reused for the hole punch (design §5.3, §12).
+    /// The outer bind socket, kept for the parked v1 punch
+    /// (see [`Listener::punch_endpoint`]).
     pub punch_endpoint: quinn::Endpoint,
-    /// Drives the native-multipath punch (Stage 3).
+    /// The combined-transport socket's handle (Stage 3).
     pub mux: PathMuxHandle,
     _endpoint: noq::Endpoint,
 }
@@ -78,11 +84,17 @@ pub struct PeerConnection {
 /// handshake. Pin the inner MTU at the 1200-byte floor and disable discovery so
 /// inner packets always fit; a keepalive holds the idle pipe open.
 ///
-/// **Multipath is enabled** (Stage 3): the connection starts on the relay path
-/// and can add a direct path (`Connection::open_path`) that noq migrates to
-/// natively, replacing the app-level second-connection race. The MTU pin is a
-/// per-path property that stays with the relay path; a direct path over a real
-/// socket runs its own discovery.
+/// **Multipath and NAT traversal are enabled** (Stage 3): the connection starts
+/// on the relay path and adds a *direct* path that noq validates and migrates
+/// to natively — driven by the QUIC-layer NAT-traversal extension
+/// (ADD_ADDRESS / REACH_OUT probes), replacing the app-level second-connection
+/// race. Candidate exchange at the QUIC layer is invisible to the application,
+/// so it works identically for raw-stream and h3/VPN inner protocols.
+///
+/// The MTU pin applies to every path here, not just the relay one: MTU
+/// discovery is a connection-wide setting in noq, and the relay path cannot
+/// survive discovery (each inner packet must fit one outer datagram). A direct
+/// path therefore also runs at 1200 — correct, if conservative.
 fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
     let mut t = noq::TransportConfig::default();
     t.mtu_discovery_config(None);
@@ -91,8 +103,19 @@ fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
     t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     // Allow a relay path + a direct path on one connection (Stage 3).
     t.max_concurrent_multipath_paths(8);
+    // Enable n0's NAT-traversal extension (draft-seemann-quic-nat-traversal):
+    // the peer may advertise this many candidate addresses to probe.
+    t.max_remote_nat_traversal_addresses(MAX_NAT_ADDRESSES);
+    // Keep an idle direct path alive so it stays the preferred path and its
+    // NAT binding does not lapse while the pipe is quiet (design G3).
+    t.default_path_keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     std::sync::Arc::new(t)
 }
+
+/// How many candidate addresses each side may advertise to the other. A peer
+/// offers its reflexive candidate and, with `--port-map`, a mapped one; the
+/// headroom covers host candidates and future strategies.
+pub const MAX_NAT_ADDRESSES: u8 = 8;
 
 /// Open a bind session and stand up the inner *server* endpoint over it.
 /// `expected_peer` pins the connecting holder's key when known out of band,
@@ -115,10 +138,13 @@ pub async fn listen(
     let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(ProxyError::Io)?;
+    // No relay peer to preset: the dialer's paddr is learned from the packet
+    // this endpoint answers.
     let (endpoint, mux) = mux_endpoint(
         bind.into_relay_parts(peer_reflexive_sink),
         direct,
         Some(quic),
+        None,
     )
     .map_err(|e| ProxyError::Quic(e.to_string()))?;
     Ok(Listener {
@@ -157,8 +183,14 @@ pub async fn connect(
     let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(ProxyError::Io)?;
-    let (endpoint, mux) = mux_endpoint(bind.into_relay_parts(peer_reflexive_sink), direct, None)
-        .map_err(|e| ProxyError::Quic(e.to_string()))?;
+    // The issuer's paddr must be tunnelled from the very first packet.
+    let (endpoint, mux) = mux_endpoint(
+        bind.into_relay_parts(peer_reflexive_sink),
+        direct,
+        None,
+        Some(issuer),
+    )
+    .map_err(|e| ProxyError::Quic(e.to_string()))?;
     let conn = endpoint
         .connect_with(quic, issuer, "peer")
         .map_err(|e| ProxyError::Quic(e.to_string()))?

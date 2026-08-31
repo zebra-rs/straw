@@ -28,7 +28,7 @@ use straw::error::ProxyError;
 use straw::p2p::identity::Identity;
 
 use straw::p2p::peer::{self, RelayAccess};
-use straw::p2p::session::{PathState, PunchConfig, Session};
+use straw::p2p::session::{PathState, PunchConfig, PunchInputs, Session};
 use straw::p2p::strategy::PunchStrategy;
 use straw::p2p::token::TokenV2;
 
@@ -87,6 +87,8 @@ struct RelayArgs {
     punch_wait: u64,
 
     /// NAT-traversal strategy: basic | predict | birthday | relay-assisted.
+    /// Only `basic` is live since the punch moved to QUIC-native NAT traversal;
+    /// the others warn and fall back to it. Use --port-map for a symmetric NAT.
     #[arg(long, default_value = "basic")]
     punch_strategy: PunchStrategy,
 
@@ -161,9 +163,10 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let identity = Arc::new(load_identity(&args.identity)?);
     let sink = peer_reflexive_sink(&args);
     let listener = peer::listen(relay_access(&args)?, &identity, None, sink.clone()).await?;
-    let reflexive = listener.reflexive;
-    let relay_paddr = listener.paddr;
-    let punch_endpoint = listener.punch_endpoint.clone();
+    let inputs = PunchInputs {
+        mux: listener.mux.clone(),
+        reflexive: listener.reflexive,
+    };
 
     // Mint and print a token the other peer connects with. The relay pin and
     // credential are placeholders in v1 (the holder reaches the relay with
@@ -189,16 +192,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     // noq's established Connection exposes remotes per-Path, not as one address
     // (multipath); the relay peer's address is the listener's advertised paddr.
     eprintln!("peer connected via relay at {}", listener.paddr);
-    let session = Session::start(
-        conn,
-        false,
-        identity,
-        None,
-        punch_endpoint,
-        reflexive,
-        relay_paddr,
-        punch_config(&args, sink)?,
-    );
+    let session = Session::start(conn, false, inputs, punch_config(&args, sink)?);
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
         return straw::p2p::vpn::run_server(
@@ -227,16 +221,11 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     let sink = peer_reflexive_sink(&args);
     let peer_conn = peer::connect(relay_access(&args)?, &identity, &token, sink.clone()).await?;
     eprintln!("connected to peer {} via relay", hex(&token.peer_pin()));
-    let session = Session::start(
-        peer_conn.conn,
-        true,
-        identity,
-        Some(token.peer_pin()),
-        peer_conn.punch_endpoint,
-        peer_conn.reflexive,
-        peer_conn.relay_paddr,
-        punch_config(&args, sink)?,
-    );
+    let inputs = PunchInputs {
+        mux: peer_conn.mux.clone(),
+        reflexive: peer_conn.reflexive,
+    };
+    let session = Session::start(peer_conn.conn, true, inputs, punch_config(&args, sink)?);
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
         return straw::p2p::vpn::run_client(
@@ -260,7 +249,12 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
 async fn best_path(session: &Session, wait_secs: u64) -> noq::Connection {
     let direct = session.await_direct(Duration::from_secs(wait_secs)).await;
     match session.state() {
-        PathState::Direct if direct => eprintln!("path: direct (hole punched)"),
+        PathState::Direct if direct => match session.direct_remote() {
+            // The peer's own address, not the relay's — that is what makes it
+            // a direct path, so name it.
+            Some(peer) => eprintln!("path: direct (hole punched, peer {peer})"),
+            None => eprintln!("path: direct (hole punched)"),
+        },
         _ => eprintln!("path: relay (no direct path)"),
     }
     session.connection()

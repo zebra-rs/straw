@@ -50,12 +50,17 @@ outer datagram. Those oversize packets fail `send_datagram`; the handshake — w
 packets are ≤1200 bytes — completes, and then the connection goes dark the moment
 real traffic needs a full-size packet.
 
-straw pins the relay-path inner MTU to **1200 with discovery off**
+straw pins the inner MTU to **1200 with discovery off**
 (`p2p::peer::relay_transport`, on both inner client and server configs), plus a
 keepalive to hold the idle connection open. A 256 KiB regression transfer
 (`relay_path_carries_a_large_transfer`) guards it — small-payload tests never
-probe past 1200 and would miss the bug entirely. The **direct** (punched) path
-runs over a real socket and has no such limit.
+probe past 1200 and would miss the bug entirely.
+
+MTU discovery is a connection-wide setting, and the relay path and the
+[direct path](ch-03-03-hole-punching.md) are two paths of the *same*
+connection — so the direct path is capped at 1200 as well, even though a real
+socket could carry more. Conservative, but correct; lifting it needs per-path
+discovery.
 
 ## Piping over the connection
 

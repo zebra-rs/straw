@@ -234,28 +234,37 @@ pub fn inner_endpoint(
 // Combined-transport socket (Stage 3): one AsyncUdpSocket carrying both the
 // relay path (through the outer bind tunnel) and a direct path (a real UDP
 // socket), so a single noq connection holds both and migrates relay→direct
-// natively via `Connection::open_path`. Sends are routed by destination: an
-// address explicitly registered as a direct remote goes out the real socket;
-// everything else (the peer's relay-paddr) is tunnelled. Receives from both
-// sources are merged, each tagged with its local IP so noq sees two paths.
+// natively. Sends are routed by destination: an address known to be a *relay*
+// remote — the peer's relay-paddr, preset by the dialer and learned from
+// relay-pump receives by the acceptor — is tunnelled; **everything else goes
+// out the real socket**. Direct-by-default is what makes noq's frame-based
+// NAT traversal work unmodified: its probes target peer candidates the
+// application never sees (the server learns them from REACH_OUT frames inside
+// the QUIC layer), so they cannot be registered ahead of time — but they are
+// never a relay-paddr, so the default routes them correctly. Receives from
+// both sources are merged, each tagged with its local IP so noq sees two
+// distinct paths of one connection.
+//
+// Trust note: the learned set is fed by whatever sources the relay forwards
+// (the public bind socket accepts UDP from anyone). A spoofed source can
+// therefore pin an address to the tunnel route; the punch to that one
+// candidate then rides the relay instead of the socket — a mis-route, never a
+// confidentiality loss (inner packets are ciphertext either way, design G1).
+// The set is capped so it cannot grow without bound.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A handle to drive the punch on a [`PathMuxSocket`] owned by the noq
-/// endpoint: register a peer's direct address before `open_path`, and read the
-/// local direct socket's bound address (for candidate gathering).
+/// At most this many relay-routed remotes are remembered (the legitimate
+/// peer contributes exactly one — its paddr; the rest is noise tolerance).
+const RELAY_REMOTE_CAP: usize = 64;
+
+/// A handle to a [`PathMuxSocket`] owned by the noq endpoint: read the local
+/// direct socket's bound address (for candidate gathering by the punch).
 #[derive(Clone, Debug)]
 pub struct PathMuxHandle {
-    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
     direct_local: SocketAddr,
 }
 
 impl PathMuxHandle {
-    /// Route future sends to `addr` out the real socket (call before
-    /// `open_path` to that address).
-    pub fn register_direct_remote(&self, addr: SocketAddr) {
-        self.direct_remotes.lock().unwrap().insert(addr);
-    }
-
     /// The direct socket's local bound address.
     pub fn direct_local(&self) -> SocketAddr {
         self.direct_local
@@ -271,7 +280,7 @@ pub struct PathMuxSocket {
     local: SocketAddr,
     direct: Arc<tokio::net::UdpSocket>,
     direct_local: SocketAddr,
-    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
     relay_rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
     _recv: AbortOnDrop,
 }
@@ -283,7 +292,7 @@ struct PathMuxSender {
     qsid: u64,
     uncompressed: u64,
     direct: Arc<tokio::net::UdpSocket>,
-    direct_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
 }
 
 impl UdpSender for PathMuxSender {
@@ -292,22 +301,12 @@ impl UdpSender for PathMuxSender {
         transmit: &Transmit<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        let is_direct = self
-            .direct_remotes
+        let via_relay = self
+            .relay_remotes
             .lock()
             .unwrap()
             .contains(&transmit.destination);
-        if is_direct {
-            // Direct path: raw UDP on the real socket.
-            match self
-                .direct
-                .poll_send_to(cx, transmit.contents, transmit.destination)
-            {
-                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
+        if via_relay {
             // Relay path: tunnel through the outer bind connection.
             let wire = frame_bind(
                 self.qsid,
@@ -316,6 +315,17 @@ impl UdpSender for PathMuxSender {
                 transmit.contents,
             );
             Poll::Ready(self.relay.send_datagram(wire).map_err(io::Error::other))
+        } else {
+            // Everything else — including NAT-traversal probes to peer
+            // candidates the application never sees — is a direct send.
+            match self
+                .direct
+                .poll_send_to(cx, transmit.contents, transmit.destination)
+            {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
         }
     }
 
@@ -331,7 +341,7 @@ impl AsyncUdpSocket for PathMuxSocket {
             qsid: self.qsid,
             uncompressed: self.uncompressed,
             direct: self.direct.clone(),
-            direct_remotes: self.direct_remotes.clone(),
+            relay_remotes: self.relay_remotes.clone(),
         })
     }
 
@@ -364,6 +374,14 @@ impl AsyncUdpSocket for PathMuxSocket {
                     let len = payload.len().min(bufs[n].len());
                     bufs[n][..len].copy_from_slice(&payload[..len]);
                     meta[n] = mk_meta(src, len, self.local.ip());
+                    // Reply to a tunnelled source through the tunnel. The
+                    // acceptor learns the dialer's paddr this way, before it
+                    // ever has to send (its first send answers this packet).
+                    let mut relay_remotes = self.relay_remotes.lock().unwrap();
+                    if relay_remotes.len() < RELAY_REMOTE_CAP {
+                        relay_remotes.insert(src);
+                    }
+                    drop(relay_remotes);
                     n += 1;
                 }
                 Poll::Ready(None) => {
@@ -411,15 +429,23 @@ fn mk_meta(addr: SocketAddr, len: usize, dst_ip: IpAddr) -> RecvMeta {
 
 /// Build an inner-QUIC endpoint over a **combined-transport** socket: the relay
 /// tunnel (`parts`) plus `direct` (a bound real UDP socket for direct paths).
-/// Returns the endpoint and a [`PathMuxHandle`] to drive the punch.
+///
+/// `relay_peer` is the far peer's relay-public address for a *dialing*
+/// endpoint: its first packet has to be tunnelled, and nothing has arrived yet
+/// to learn that from. An accepting endpoint passes `None` — it learns the
+/// dialer's paddr from the packet it is answering.
+///
+/// Returns the endpoint and a [`PathMuxHandle`] for candidate gathering.
 pub fn mux_endpoint(
     parts: RelayParts,
     direct: tokio::net::UdpSocket,
     server_config: Option<noq::ServerConfig>,
+    relay_peer: Option<SocketAddr>,
 ) -> io::Result<(noq::Endpoint, PathMuxHandle)> {
     let direct_local = direct.local_addr()?;
     let direct = Arc::new(direct);
-    let direct_remotes: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+    let relay_remotes: Arc<Mutex<HashSet<SocketAddr>>> =
+        Arc::new(Mutex::new(relay_peer.into_iter().collect()));
     let socket = PathMuxSocket {
         relay: parts.conn,
         qsid: parts.qsid,
@@ -427,7 +453,7 @@ pub fn mux_endpoint(
         local: parts.local,
         direct,
         direct_local,
-        direct_remotes: direct_remotes.clone(),
+        relay_remotes,
         relay_rx: Mutex::new(parts.rx),
         _recv: AbortOnDrop(parts.recv_task),
     };
@@ -437,9 +463,5 @@ pub fn mux_endpoint(
         Box::new(socket),
         Arc::new(noq::TokioRuntime),
     )?;
-    let handle = PathMuxHandle {
-        direct_remotes,
-        direct_local,
-    };
-    Ok((endpoint, handle))
+    Ok((endpoint, PathMuxHandle { direct_local }))
 }

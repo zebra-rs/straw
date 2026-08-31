@@ -113,10 +113,12 @@ n0/iroh quinn fork), adopted for its native NAT traversal + multipath +
 extension-frame APIs (branch `feature/adopt-iroh-quinn`; see
 `p2p-direct-path-design.md` §0). The **outer** bind session, the proxy, and
 CONNECT-UDP stay on upstream quinn + h3-quinn; `RelaySocket` bridges the two.
-Stage 1 (inner conn on noq) and Stage 2 (VPN over noq via the `p2p/h3_noq`
-adapter + a transport-agnostic CONNECT-IP data plane) are done; Stage 3 (direct
-path on noq native multipath, replacing the app-level punch) is in progress, so
-the punch modules (`holepunch`, `punch`) are currently parked.
+All three stages are done: Stage 1 (inner conn on noq), Stage 2 (VPN over noq
+via the `p2p/h3_noq` adapter + a transport-agnostic CONNECT-IP data plane) and
+Stage 3 (the direct path on noq native multipath, replacing the app-level
+punch). The v1 punch modules (`holepunch`, `punch`, and `candidates`/`wire`'s
+control messages) are off the data path — kept as the reference for the
+symmetric-NAT strategies, which are not ported (see below).
 
 `strawcat` peers form a mutually SPKI-pinned inner QUIC connection through a
 straw relay running CONNECT-UDP **bind mode** (`--udp-bind`, off by default,
@@ -130,23 +132,46 @@ bind session (holding the outer `quinn::Connection` — the bridge); `p2p/inner_
 loopback/RFC1918/etc.; `--udp-bind-allow-dest` re-permits ranges for
 private/single-host relays (design §10.1).
 
-P2 hole punching is implemented: `p2p/candidates` + `p2p/wire` gather and
-exchange host/reflexive/relay candidates over the inner control stream,
-`p2p/punch` does the simultaneous-open DCUtR punch with the §5.3.4 tie-break,
-and `p2p/session` is the `Relay→Punching→Direct` path state machine that
-promotes on success, reverts + re-punches on loss. On a duplicate success both
-sides converge on the connection whose *client* is the lower-pinned peer; a
-lone success (asymmetric NAT) is kept regardless of role — never reject the
-only working path.
+**The direct path is a second path of the *same* connection** (Stage 3), not a
+second connection. `p2p/relay_socket::PathMuxSocket` is one
+`noq::AsyncUdpSocket` carrying both: sends whose destination is a known *relay*
+remote are tunnelled through the outer bind session, and **everything else goes
+out a real UDP socket**. Direct-by-default is what lets noq's own NAT-traversal
+probes work — they target candidates the application never sees, so they cannot
+be registered in advance, but they are never a relay-paddr. The dialer presets
+the peer's paddr (its first packet must be tunnelled); the acceptor learns it
+from the packet it answers.
 
-**Relay-path inner MTU is pinned to 1200 with MTU discovery OFF**
-(`p2p/peer::relay_transport`). Each inner QUIC packet is re-wrapped as one
-outer QUIC DATAGRAM, so the inner MTU must fit inside it; quinn's own path-MTU
-discovery would probe the inner connection past that ceiling and those oversize
-packets fail `send_datagram`, stalling the connection *after* the handshake.
-This only bites once packets exceed ~1200 B, so small-payload tests miss it —
-`relay_path_carries_a_large_transfer` guards it with a 256 KiB transfer. The
-direct (punched) path has no such limit; it runs over a real socket.
+`p2p/native_punch` drives the punch over noq's **NAT-traversal frames**
+(`add_nat_traversal_address` / `initiate_nat_traversal_round`, enabled by
+`max_remote_nat_traversal_addresses`): the inner server advertises its
+candidates in ADD_ADDRESS, the client advertises its own in REACH_OUT and
+probes, and noq opens the validated path itself. Candidate exchange at the QUIC
+layer — not on an application stream — is what makes **VPN mode punch**: its
+inner protocol is h3, which would read an app-level exchange stream as a
+request. This was the reason the v1 exchange had to go.
+
+`p2p/session` is the `Relay→Punching→Direct` state machine. A traversal-opened
+path arrives as `PathStatus::Backup`, so the session **promotes** it to
+`Available` and demotes path 0 — after which noq schedules data on the direct
+path and holds the relay path idle as the permanent fallback (G3, never
+closed). On `PathEvent::Abandoned` it restores path 0 and re-punches after 30 s.
+Nothing above the connection moves across the transition, so streams in flight
+keep working. `Session::direct_remote()` reports the peer address that won,
+which `strawcat` prints (`path: direct (hole punched, peer <addr>)`) and both
+netns harnesses assert on — a relay address there would mean the path is not
+direct.
+
+**Inner MTU is pinned to 1200 with MTU discovery OFF**
+(`p2p/peer::relay_transport`). Each inner QUIC packet on the *relay* path is
+re-wrapped as one outer QUIC DATAGRAM, so the inner MTU must fit inside it;
+path-MTU discovery would probe past that ceiling and those oversize packets
+fail `send_datagram`, stalling the connection *after* the handshake. This only
+bites once packets exceed ~1200 B, so small-payload tests miss it —
+`relay_path_carries_a_large_transfer` guards it with a 256 KiB transfer. MTU
+discovery is a connection-wide setting in noq, so the *direct* path is capped
+at 1200 too even though a real socket could carry more — correct but
+conservative, and worth revisiting if per-path discovery lands.
 
 `pipe_stdio` in `strawcat` awaits **both** directions (never aborts the
 upload): aborting drops the `SendStream` unfinished, which quinn turns into a
@@ -165,40 +190,42 @@ adapter + its own datagram demux, assigns from `--vpn-subnet`, default
 netns by `scripts/vpn-test.sh`. The client **scopes the tunnel to the VPN subnet**
 (`--vpn-subnet` as the flow scope, §8.3) so the server advertises only that
 route — a full/default tunnel would capture the peer connection's own transport
-and dead-lock it. It rides whichever path the `Session` picked (relay or
-punched). `scripts/vpn-test.sh` is the netns proof: two peers, relay in the
-middle, ping across the tunnel.
+and dead-lock it. It rides whichever path the `Session` picked, and since
+Stage 3 that is normally the **direct** one — `scripts/vpn-test.sh` asserts the
+tunnel runs over a path to the peer's own address, then pings across it.
 
-**The punch reuses the outer bind socket** (`peer::listen`/`connect` expose
-`punch_endpoint`, the real UDP socket whose NAT mapping the relay observed as
-this peer's reflexive; `coordinate` sets the pinned punch server config on it
-and dials the peer from it). So the punch source equals the advertised
-reflexive on an endpoint-independent (cone) NAT — no more port prediction. A
-fresh socket got a different, unadvertised mapping; the outer socket does not,
-because endpoint-independent NATs keep one external port per socket across
-destinations.
+**This peer's candidate is (relay-observed public IP, direct socket port).**
+The relay observes the *outer* bind socket's source, so only its IP is reused;
+the port comes from the mux's direct socket. That is exact on a port-preserving
+(full-cone / NETMAP / explicitly forwarded) NAT, which is the class the punch
+targets. `--port-map` adds a PCP/NAT-PMP-forwarded address as a second
+candidate, and that one holds even on a symmetric NAT.
 
 `scripts/nat-punch-test.sh` is the netns double-NAT harness
 (`peerA─natA══relay══natB─peerB`) with two NAT modes, both asserting payload
 crosses the double NAT both ways:
 - `NAT_MODE=symmetric` (default) — MASQUERADE. Linux's PAT is endpoint-
-  DEPENDENT here: it maps the one outer socket to a different external port per
-  destination, so the punch is blocked and the relay carries the data
-  (best-effort, not asserted). Confirmed by tcpdump.
+  DEPENDENT here: it maps a socket to a different external port per
+  destination, so the advertised candidate is wrong and the relay carries the
+  data (best-effort, not asserted).
 - `NAT_MODE=cone` (`sudo NAT_MODE=cone …`) — a stateless 1:1 NETMAP:
-  endpoint-independent (full-cone) mapping, so the outer-socket punch source
-  equals the advertised reflexive and a **direct path is asserted**. The direct
-  connection's remote is the peer's *public* address (not the relay), proving
-  it bypasses the relay. NETMAP is the reliable way to get EIM in netns —
-  conntrack PAT will not preserve a port across destinations even for a fixed
-  source port; NETMAP, being stateless, bypasses it.
+  endpoint-independent (full-cone) mapping, so the advertised candidate is
+  reachable and a **direct path is asserted**, including that each side's path
+  leads to the peer's *public* address (not the relay) — the proof it bypasses
+  the relay. NETMAP is the reliable way to get EIM in netns — conntrack PAT
+  will not preserve a port across destinations even for a fixed source port;
+  NETMAP, being stateless, bypasses it.
 
-So real cone NATs (most home routers) punch with the outer-socket reuse alone.
+So real cone NATs (most home routers) punch with the reflexive candidate alone.
 
-**Symmetric-NAT strategies are selectable** with `strawcat --punch-strategy`
-(`p2p::strategy::PunchStrategy`, threaded through `Session::start`'s
-`PunchConfig` into `holepunch::coordinate`, which dispatches):
-- `basic` (default) — outer-socket reuse; cone NATs.
+**Symmetric-NAT strategies are NOT ported to the native punch.**
+`--punch-strategy` other than `basic` logs a warning and punches basically.
+They worked by dialling extra addresses from extra sockets, and the frame
+exchange only carries a peer's *own* candidates — a peer cannot inject a
+predicted port range, a scan window, or a source the relay observed for the
+*other* peer. `--port-map` is orthogonal and unaffected. The v1 code and the
+notes below are kept for whoever revisits this:
+- `basic` (default) — advertise the reflexive candidate; cone NATs.
 - `predict` — sample the NAT by opening a few back-to-back aux bind sessions,
   classify the allocation (`classify`), and for a *sequential* allocator
   advertise a predicted peer-facing port range. Sequential-symmetric NATs only;
@@ -239,10 +266,11 @@ narrow port range / address-dependent filtering) that a real router may have.
 Harness: `STRATEGY=<name>` (relay-assisted also sets `--udp-bind-observe`);
 the punch stays best-effort in `symmetric` mode and asserted only in `cone`.
 
-The standards-codepoint swap (§9) is **no longer gated on upstream quinn** —
-noq ships the NAT-traversal frames, the `nat_traversal` transport param, and
-multipath; it now rides on completing Stage 3 (native multipath) and RFC
-publication. **Every
+The standards-codepoint swap (§9) is **done for the NAT-traversal half**: the
+app-level CBOR candidate exchange and the raced second connection are gone,
+replaced by noq's frames, the `nat_traversal` transport param and multipath.
+What remains gated is RFC publication of the listen-draft codepoints, and the
+OBSERVED_ADDRESS capsule (the outer session is still upstream quinn). **Every
 provisional codepoint now lives in one registry, `src/codepoints.rs`** — bind
 capsule types 0x11–0x15, the `strawcat/1` ALPN, the `sc2_` token marker,
 and the documented v2 NAT-traversal frame target — each annotated with its v2
