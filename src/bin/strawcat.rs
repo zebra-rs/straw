@@ -30,6 +30,7 @@ use straw::p2p::identity::Identity;
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::session::{PathState, PunchConfig, PunchInputs, Session};
 use straw::p2p::strategy::{DirectMode, PunchStrategy};
+use straw::p2p::stun::NatMapping;
 use straw::p2p::token::TokenV2;
 
 #[derive(Debug, Parser)]
@@ -167,7 +168,7 @@ async fn run() -> Result<(), ProxyError> {
 }
 
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
-    report_nat_mapping(&args).await;
+    let nat_mapping = report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
     let sink = peer_reflexive_sink(&args);
     let listener = peer::listen(relay_access(&args)?, &identity, None, sink.clone()).await?;
@@ -201,7 +202,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     // noq's established Connection exposes remotes per-Path, not as one address
     // (multipath); the relay peer's address is the listener's advertised paddr.
     eprintln!("peer connected via relay at {}", listener.paddr);
-    let session = Session::start(conn, false, inputs, punch_config(&args, sink)?);
+    let session = Session::start(conn, false, inputs, punch_config(&args, sink, nat_mapping)?);
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
         return straw::p2p::vpn::run_server(
@@ -221,7 +222,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
 }
 
 async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
-    report_nat_mapping(&args).await;
+    let nat_mapping = report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
     let token = TokenV2::decode(&token)?;
     if token.is_expired(now()) {
@@ -235,7 +236,12 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         reflexive: peer_conn.reflexive,
         relay_addr: args.relay,
     };
-    let session = Session::start(peer_conn.conn, true, inputs, punch_config(&args, sink)?);
+    let session = Session::start(
+        peer_conn.conn,
+        true,
+        inputs,
+        punch_config(&args, sink, nat_mapping)?,
+    );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
         return straw::p2p::vpn::run_client(
@@ -299,22 +305,26 @@ async fn pipe_stdio(
 }
 
 /// Detect and report the NAT's mapping behaviour (RFC 5780), if a STUN server
-/// was given, before establishing the connection.
-async fn report_nat_mapping(args: &RelayArgs) {
-    let Some(server) = args.stun_detect else {
-        return;
-    };
+/// was given, before establishing the connection. The verdict is returned as
+/// well as printed: the session uses it to skip a punch it already knows
+/// cannot work (`session::punch_is_futile`).
+async fn report_nat_mapping(args: &RelayArgs) -> Option<NatMapping> {
+    let server = args.stun_detect?;
     match straw::p2p::stun::detect_mapping(server).await {
         Ok(m) => {
             eprintln!("NAT mapping: {}", m.as_str());
             if !m.is_punchable() {
                 eprintln!(
-                    "  -> symmetric NAT: the basic punch will not traverse it; \
-                     use --port-map or expect relay fallback"
+                    "  -> symmetric NAT: the reflexive candidate will not traverse it; \
+                     use --port-map, --punch-strategy predict, or expect relay fallback"
                 );
             }
+            Some(m)
         }
-        Err(e) => eprintln!("NAT detection failed: {e}"),
+        Err(e) => {
+            eprintln!("NAT detection failed: {e}");
+            None
+        }
     }
 }
 
@@ -324,6 +334,7 @@ async fn report_nat_mapping(args: &RelayArgs) {
 fn punch_config(
     args: &RelayArgs,
     peer_reflexive: Option<Arc<Mutex<Vec<std::net::SocketAddr>>>>,
+    nat_mapping: Option<NatMapping>,
 ) -> Result<PunchConfig, ProxyError> {
     let relay_access = match args.punch_strategy {
         PunchStrategy::Predict | PunchStrategy::Birthday => Some(Arc::new(relay_access(args)?)),
@@ -335,6 +346,7 @@ fn punch_config(
         peer_reflexive,
         port_map: args.port_map,
         direct: args.direct,
+        nat_mapping,
     })
 }
 
