@@ -81,6 +81,23 @@ echo "  peerA sc0: ${A_ADDR:-<none>}"
 echo "  peerB sc0: ${B_ADDR:-<none>}"
 [ -n "$A_ADDR" ] && [ -n "$B_ADDR" ] || { fail "tunnel addresses not assigned"; tail -8 "$OUT/a.err" "$OUT/b.err"; exit 1; }
 
+log "path in use"
+# No NAT between these peers, so the native punch must reach a direct path —
+# and this is the case that proves the Stage 3 candidate exchange is at the
+# QUIC layer: the inner protocol here is h3, which an app-level exchange
+# stream would have collided with. The address named must be the *peer's*
+# (10.10.0.2 / 10.10.1.2), never the relay's 10.10.x.1.
+A_PATH=$(grep -oE 'path: .*' "$OUT/a.err" | head -1)
+B_PATH=$(grep -oE 'path: .*' "$OUT/b.err" | head -1)
+echo "  peerA $A_PATH"
+echo "  peerB $B_PATH"
+if echo "$A_PATH" | grep -q "peer 10.10.1.2:" && echo "$B_PATH" | grep -q "peer 10.10.0.2:"; then
+    ok "VPN runs over a direct path to the peer, bypassing the relay"
+else
+    fail "VPN did not reach a direct path to the peer (h3 over native NAT traversal)"
+    exit 1
+fi
+
 log "ping across the tunnel (peerB → peerA's 10.9.0.1)"
 if ip netns exec vpn_pb ping -c3 -W2 10.9.0.1 >"$OUT/ping.out" 2>&1; then
     ok "peerB reached peerA's tunnel address across the VPN"

@@ -49,12 +49,16 @@ modes where it must succeed:
 ```bash
 sudo scripts/nat-punch-test.sh                     # symmetric MASQUERADE; punch best-effort
 sudo NAT_MODE=cone scripts/nat-punch-test.sh       # 1:1 NETMAP (cone); direct punch asserted
-sudo STRATEGY=relay-assisted scripts/nat-punch-test.sh
 sudo PORTMAP=1 scripts/nat-punch-test.sh           # PCP/NAT-PMP forward; direct punch asserted
 ```
 
+Where the punch is asserted, so is its *destination*: each peer's direct path
+must lead to the other peer's public address, never the relay's — otherwise
+"direct" would not mean what it says.
+
 `scripts/vpn-test.sh` is the [VPN-mode](ch-03-05-vpn-mode.md) proof:
-`peerA ─ relay ─ peerB`, both in `--vpn`, with a ping asserted across the tunnel.
+`peerA ─ relay ─ peerB`, both in `--vpn`, asserting a direct path to the peer
+and a ping across the tunnel over it.
 `scripts/natpmp-stub.py` is the harness's PCP/NAT-PMP responder, which installs
 the 1:1 iptables forward that makes the symmetric-NAT punch succeed.
 

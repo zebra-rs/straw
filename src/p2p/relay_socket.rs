@@ -1,7 +1,7 @@
 //! An inner-QUIC transport that runs over a CONNECT-UDP bind session
 //! (design §4, Phase B).
 //!
-//! [`RelaySocket`] implements [`quinn::AsyncUdpSocket`], so a whole QUIC
+//! [`RelaySocket`] implements [`noq::AsyncUdpSocket`], so a whole QUIC
 //! endpoint — the peer-to-peer inner connection — can run on top of a bind
 //! session instead of a real UDP socket. Each inner-QUIC packet is sent as a
 //! bind datagram addressed to the far peer's relay-public address (`paddr`);
@@ -12,16 +12,23 @@
 //! The inner endpoint sees its own `paddr` as the local address and the far
 //! peer's `paddr` as the remote — an ordinary UDP path, ~40–60 bytes smaller
 //! MTU (the bind framing).
+//!
+//! The inner QUIC stack is **noq** (the n0/iroh quinn fork), which straw
+//! adopts for its native multipath + NAT-traversal support; the *outer* bind
+//! session ([`conn`](RelaySocket::conn)) remains upstream quinn (it is an
+//! HTTP/3 CONNECT-UDP connection). This type is the bridge between the two.
 
+use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, UdpPoller};
+use noq::udp::{RecvMeta, Transmit};
+use noq::{AsyncUdpSocket, UdpSender};
 use tokio::sync::mpsc;
 
 use crate::udp_bind::context::encode_uncompressed_body;
@@ -36,9 +43,20 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Encode one inner packet to `dst` as a bind datagram on session `qsid`.
+fn frame_bind(qsid: u64, uncompressed: u64, dst: SocketAddr, contents: &[u8]) -> Bytes {
+    let body = encode_uncompressed_body(uncompressed, dst, contents);
+    let mut wire = bytes::BytesMut::with_capacity(8 + body.len());
+    crate::capsule::codec::write_varint(&mut wire, qsid).expect("qsid fits varint");
+    wire.extend_from_slice(&body);
+    wire.freeze()
+}
+
 /// A QUIC socket whose datagrams ride a bind session (design §4).
 #[derive(Debug)]
 pub struct RelaySocket {
+    /// The *outer* bind session (upstream quinn), over which inner packets ride
+    /// as CONNECT-UDP bind datagrams.
     conn: quinn::Connection,
     qsid: u64,
     uncompressed: u64,
@@ -57,71 +75,108 @@ impl RelaySocket {
         local: SocketAddr,
         inbound: mpsc::Receiver<(SocketAddr, Bytes)>,
         recv_task: tokio::task::JoinHandle<()>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> Self {
+        Self {
             conn,
             qsid,
             uncompressed,
             local,
             inbound: Mutex::new(inbound),
             _recv: AbortOnDrop(recv_task),
-        })
+        }
     }
 
-    /// Encode one inner packet to `dst` as a bind datagram on this session.
-    fn frame(&self, dst: SocketAddr, contents: &[u8]) -> Bytes {
-        let body = encode_uncompressed_body(self.uncompressed, dst, contents);
-        let mut wire = bytes::BytesMut::with_capacity(8 + body.len());
-        crate::capsule::codec::write_varint(&mut wire, self.qsid).expect("qsid fits varint");
-        wire.extend_from_slice(&body);
-        wire.freeze()
+    /// Build from the shared [`RelayParts`] seam.
+    pub(crate) fn from_parts(parts: RelayParts) -> Self {
+        Self::new(
+            parts.conn,
+            parts.qsid,
+            parts.uncompressed,
+            parts.local,
+            parts.rx,
+            parts.recv_task,
+        )
     }
 }
 
-/// A poller that reports the socket as always writable: a bind send is a
-/// synchronous `send_datagram`, which never returns `WouldBlock`.
+/// The pieces a bind session hands to an inner-QUIC socket: the outer bind
+/// connection, its framing params, our relay-public address, and the relay
+/// receive pump (channel + its task). Shared by [`RelaySocket`] (relay only)
+/// and [`PathMuxSocket`] (relay + direct).
+pub struct RelayParts {
+    pub conn: quinn::Connection,
+    pub qsid: u64,
+    pub uncompressed: u64,
+    pub local: SocketAddr,
+    pub rx: mpsc::Receiver<(SocketAddr, Bytes)>,
+    pub recv_task: tokio::task::JoinHandle<()>,
+}
+
+/// The send half noq asks for via [`AsyncUdpSocket::create_sender`]. A bind
+/// send is a synchronous `send_datagram`, so it is always immediately ready.
 #[derive(Debug)]
-struct AlwaysWritable;
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+struct RelaySender {
+    conn: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+}
+
+impl UdpSender for RelaySender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // max_transmit_segments == 1, so a transmit is one datagram and
+        // segment_size is None.
+        let wire = frame_bind(
+            self.qsid,
+            self.uncompressed,
+            transmit.destination,
+            transmit.contents,
+        );
+        Poll::Ready(
+            self.conn
+                .send_datagram(wire)
+                .map_err(io::Error::other),
+        )
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
     }
 }
 
 impl AsyncUdpSocket for RelaySocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
-    }
-
-    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // quinn is told max_transmit_segments == 1, so a transmit is one
-        // datagram; segment_size is therefore None.
-        let wire = self.frame(transmit.destination, transmit.contents);
-        self.conn
-            .send_datagram(wire)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(RelaySender {
+            conn: self.conn.clone(),
+            qsid: self.qsid,
+            uncompressed: self.uncompressed,
+        })
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut Context,
         bufs: &mut [io::IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let mut rx = self.inbound.lock().unwrap();
+        let rx = self.inbound.get_mut().unwrap();
         let mut n = 0;
         while n < bufs.len() {
             match rx.poll_recv(cx) {
                 Poll::Ready(Some((addr, payload))) => {
                     let len = payload.len().min(bufs[n].len());
                     bufs[n][..len].copy_from_slice(&payload[..len]);
-                    meta[n] = RecvMeta {
-                        addr,
-                        len,
-                        stride: len,
-                        ecn: None,
-                        dst_ip: Some(self.local.ip()),
-                    };
+                    // noq's RecvMeta is #[non_exhaustive]; build via Default.
+                    let mut m = RecvMeta::default();
+                    m.addr = addr;
+                    m.len = len;
+                    m.stride = len;
+                    m.ecn = None;
+                    m.dst_ip = Some(self.local.ip());
+                    meta[n] = m;
                     n += 1;
                 }
                 // Deliver whatever is ready; only block when nothing is.
@@ -155,12 +210,8 @@ impl AsyncUdpSocket for RelaySocket {
         false
     }
 
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
     }
 }
 
@@ -168,13 +219,249 @@ impl AsyncUdpSocket for RelaySocket {
 /// Pass `server_config` to accept inner connections (the peer whose role is
 /// inner-QUIC *server*, design §2.1); omit it for a dial-only endpoint.
 pub fn inner_endpoint(
-    socket: Arc<RelaySocket>,
-    server_config: Option<quinn::ServerConfig>,
-) -> io::Result<quinn::Endpoint> {
-    quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+    socket: RelaySocket,
+    server_config: Option<noq::ServerConfig>,
+) -> io::Result<noq::Endpoint> {
+    noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
         server_config,
-        socket,
-        Arc::new(quinn::TokioRuntime),
+        Box::new(socket),
+        Arc::new(noq::TokioRuntime),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Combined-transport socket (Stage 3): one AsyncUdpSocket carrying both the
+// relay path (through the outer bind tunnel) and a direct path (a real UDP
+// socket), so a single noq connection holds both and migrates relay→direct
+// natively. Sends are routed by destination: an address known to be a *relay*
+// remote — the peer's relay-paddr, preset by the dialer and learned from
+// relay-pump receives by the acceptor — is tunnelled; **everything else goes
+// out the real socket**. Direct-by-default is what makes noq's frame-based
+// NAT traversal work unmodified: its probes target peer candidates the
+// application never sees (the server learns them from REACH_OUT frames inside
+// the QUIC layer), so they cannot be registered ahead of time — but they are
+// never a relay-paddr, so the default routes them correctly. Receives from
+// both sources are merged, each tagged with its local IP so noq sees two
+// distinct paths of one connection.
+//
+// Trust note: the learned set is fed by whatever sources the relay forwards
+// (the public bind socket accepts UDP from anyone). A spoofed source can
+// therefore pin an address to the tunnel route; the punch to that one
+// candidate then rides the relay instead of the socket — a mis-route, never a
+// confidentiality loss (inner packets are ciphertext either way, design G1).
+// The set is capped so it cannot grow without bound.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// At most this many relay-routed remotes are remembered (the legitimate
+/// peer contributes exactly one — its paddr; the rest is noise tolerance).
+const RELAY_REMOTE_CAP: usize = 64;
+
+/// A handle to a [`PathMuxSocket`] owned by the noq endpoint: read the local
+/// direct socket's bound address (for candidate gathering by the punch).
+#[derive(Clone, Debug)]
+pub struct PathMuxHandle {
+    direct_local: SocketAddr,
+}
+
+impl PathMuxHandle {
+    /// The direct socket's local bound address.
+    pub fn direct_local(&self) -> SocketAddr {
+        self.direct_local
+    }
+}
+
+/// A noq socket that multiplexes a relay tunnel and a real UDP socket.
+#[derive(Debug)]
+pub struct PathMuxSocket {
+    relay: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+    local: SocketAddr,
+    direct: Arc<tokio::net::UdpSocket>,
+    direct_local: SocketAddr,
+    relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+    relay_rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
+    _recv: AbortOnDrop,
+}
+
+/// The send half of a [`PathMuxSocket`]: routes by destination.
+#[derive(Debug)]
+struct PathMuxSender {
+    relay: quinn::Connection,
+    qsid: u64,
+    uncompressed: u64,
+    direct: Arc<tokio::net::UdpSocket>,
+    relay_remotes: Arc<Mutex<HashSet<SocketAddr>>>,
+}
+
+impl UdpSender for PathMuxSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let via_relay = self
+            .relay_remotes
+            .lock()
+            .unwrap()
+            .contains(&transmit.destination);
+        if via_relay {
+            // Relay path: tunnel through the outer bind connection.
+            let wire = frame_bind(
+                self.qsid,
+                self.uncompressed,
+                transmit.destination,
+                transmit.contents,
+            );
+            Poll::Ready(self.relay.send_datagram(wire).map_err(io::Error::other))
+        } else {
+            // Everything else — including NAT-traversal probes to peer
+            // candidates the application never sees — is a direct send.
+            match self
+                .direct
+                .poll_send_to(cx, transmit.contents, transmit.destination)
+            {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+}
+
+impl AsyncUdpSocket for PathMuxSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(PathMuxSender {
+            relay: self.relay.clone(),
+            qsid: self.qsid,
+            uncompressed: self.uncompressed,
+            direct: self.direct.clone(),
+            relay_remotes: self.relay_remotes.clone(),
+        })
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let mut n = 0;
+        // 1. Direct socket (real UDP): drain what is ready.
+        while n < bufs.len() {
+            let mut rb = tokio::io::ReadBuf::new(&mut bufs[n]);
+            match self.direct.poll_recv_from(cx, &mut rb) {
+                Poll::Ready(Ok(src)) => {
+                    let len = rb.filled().len();
+                    meta[n] = mk_meta(src, len, self.direct_local.ip());
+                    n += 1;
+                }
+                // A direct-socket error must not tear down the connection (the
+                // relay path may still be fine); stop draining it this round.
+                Poll::Ready(Err(_)) | Poll::Pending => break,
+            }
+        }
+        // 2. Relay tunnel: drain the pump channel.
+        let rx = self.relay_rx.get_mut().unwrap();
+        while n < bufs.len() {
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some((src, payload))) => {
+                    let len = payload.len().min(bufs[n].len());
+                    bufs[n][..len].copy_from_slice(&payload[..len]);
+                    meta[n] = mk_meta(src, len, self.local.ip());
+                    // Reply to a tunnelled source through the tunnel. The
+                    // acceptor learns the dialer's paddr this way, before it
+                    // ever has to send (its first send answers this packet).
+                    let mut relay_remotes = self.relay_remotes.lock().unwrap();
+                    if relay_remotes.len() < RELAY_REMOTE_CAP {
+                        relay_remotes.insert(src);
+                    }
+                    drop(relay_remotes);
+                    n += 1;
+                }
+                Poll::Ready(None) => {
+                    return if n == 0 {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "relay session closed",
+                        )))
+                    } else {
+                        Poll::Ready(Ok(n))
+                    };
+                }
+                Poll::Pending => break,
+            }
+        }
+        if n > 0 {
+            Poll::Ready(Ok(n))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local)
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
+    }
+
+    fn max_receive_segments(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+}
+
+fn mk_meta(addr: SocketAddr, len: usize, dst_ip: IpAddr) -> RecvMeta {
+    let mut m = RecvMeta::default();
+    m.addr = addr;
+    m.len = len;
+    m.stride = len;
+    m.ecn = None;
+    m.dst_ip = Some(dst_ip);
+    m
+}
+
+/// Build an inner-QUIC endpoint over a **combined-transport** socket: the relay
+/// tunnel (`parts`) plus `direct` (a bound real UDP socket for direct paths).
+///
+/// `relay_peer` is the far peer's relay-public address for a *dialing*
+/// endpoint: its first packet has to be tunnelled, and nothing has arrived yet
+/// to learn that from. An accepting endpoint passes `None` — it learns the
+/// dialer's paddr from the packet it is answering.
+///
+/// Returns the endpoint and a [`PathMuxHandle`] for candidate gathering.
+pub fn mux_endpoint(
+    parts: RelayParts,
+    direct: tokio::net::UdpSocket,
+    server_config: Option<noq::ServerConfig>,
+    relay_peer: Option<SocketAddr>,
+) -> io::Result<(noq::Endpoint, PathMuxHandle)> {
+    let direct_local = direct.local_addr()?;
+    let direct = Arc::new(direct);
+    let relay_remotes: Arc<Mutex<HashSet<SocketAddr>>> =
+        Arc::new(Mutex::new(relay_peer.into_iter().collect()));
+    let socket = PathMuxSocket {
+        relay: parts.conn,
+        qsid: parts.qsid,
+        uncompressed: parts.uncompressed,
+        local: parts.local,
+        direct,
+        direct_local,
+        relay_remotes,
+        relay_rx: Mutex::new(parts.rx),
+        _recv: AbortOnDrop(parts.recv_task),
+    };
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
+        server_config,
+        Box::new(socket),
+        Arc::new(noq::TokioRuntime),
+    )?;
+    Ok((endpoint, PathMuxHandle { direct_local }))
 }

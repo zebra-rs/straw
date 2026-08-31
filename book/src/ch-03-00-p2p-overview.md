@@ -14,10 +14,10 @@ strawcat builds up in `src/p2p/` (peer side) and `src/udp_bind/` (relay side):
 | Identity | `p2p/identity` | An Ed25519 keypair and its **SPKI pin** (SHA-256 of the SubjectPublicKeyInfo) — the WireGuard-pubkey analogue. |
 | Token | `p2p/token` | The `sc2_` capability a listener hands a dialer: where the relay is, how to pin it, a scoped relay credential, and the issuer's peer pin and address. |
 | Relay bind | `udp_bind/` | The relay's CONNECT-UDP bind side: a public `(IP, port)` per session and ciphertext forwarding. |
-| Relay socket | `p2p/relay_socket` | A `quinn::AsyncUdpSocket` that runs an inner QUIC connection over a bind session. |
+| Relay socket | `p2p/relay_socket` | One `noq::AsyncUdpSocket` carrying both the relay tunnel and a direct UDP path, so a single connection can hold both. |
 | Inner TLS | `p2p/inner_tls` | RFC 7250 raw-public-key mTLS, mutually pinned by SPKI. |
 | Rendezvous | `p2p/peer` | `listen` / `connect`: open a bind session, form the inner connection. |
-| Direct path | `p2p/holepunch`, `p2p/punch`, `p2p/session` | Candidate exchange, the punch, and the RELAY → PUNCHING → DIRECT state machine. |
+| Direct path | `p2p/native_punch`, `p2p/session` | Candidate exchange as QUIC NAT-traversal frames, and the RELAY → PUNCHING → DIRECT state machine that promotes the validated path. |
 
 ## Identities and pins
 

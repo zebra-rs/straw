@@ -16,6 +16,51 @@
 
 pub mod context;
 
+/// A QUIC connection that can send HTTP Datagrams.
+///
+/// This object-safe seam lets the CONNECT-IP data plane — the forwarding
+/// engine's [`SessionSink`](crate::forwarding::SessionSink) and the client's
+/// [`PacketSender`](crate::client::PacketSender) — run over either the proxy's
+/// upstream-quinn connection or a strawcat peer's noq connection, without
+/// making [`ForwardingEngine`](crate::forwarding::ForwardingEngine) generic.
+/// Only the *send* side is abstracted; datagram receive/demux is transport-
+/// specific and stays concrete on each path.
+pub trait DatagramConn: Send + Sync + std::fmt::Debug {
+    /// Queue one datagram for sending (best-effort, like `quinn`/`noq`).
+    fn send_datagram(&self, data: Bytes) -> Result<(), crate::error::ProxyError>;
+    /// The largest datagram that currently fits, or `None` before the peer
+    /// enables QUIC DATAGRAMs.
+    fn max_datagram_size(&self) -> Option<usize>;
+    /// Close the connection with an application error code and reason.
+    fn close(&self, code: u64, reason: &[u8]);
+}
+
+impl DatagramConn for quinn::Connection {
+    fn send_datagram(&self, data: Bytes) -> Result<(), crate::error::ProxyError> {
+        quinn::Connection::send_datagram(self, data)?;
+        Ok(())
+    }
+    fn max_datagram_size(&self) -> Option<usize> {
+        quinn::Connection::max_datagram_size(self)
+    }
+    fn close(&self, code: u64, reason: &[u8]) {
+        quinn::Connection::close(self, quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX), reason);
+    }
+}
+
+impl DatagramConn for noq::Connection {
+    fn send_datagram(&self, data: Bytes) -> Result<(), crate::error::ProxyError> {
+        noq::Connection::send_datagram(self, data)?;
+        Ok(())
+    }
+    fn max_datagram_size(&self) -> Option<usize> {
+        noq::Connection::max_datagram_size(self)
+    }
+    fn close(&self, code: u64, reason: &[u8]) {
+        noq::Connection::close(self, noq::VarInt::from_u64(code).unwrap_or(noq::VarInt::MAX), reason);
+    }
+}
+
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::capsule::codec::{read_varint, varint_len, write_varint};

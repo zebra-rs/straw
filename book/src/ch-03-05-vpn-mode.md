@@ -13,16 +13,19 @@ the strawcat roles onto it:
 
 - The **listener** is the tunnel **server** (`run_server`). It builds a minimal
   `ProxyContext` — an address pool over `--vpn-subnet` (default `10.9.0.0/24`), a
-  TUN device, a forwarding engine — and runs the ordinary
-  `server::handle_connection` over the inner peer connection. It assigns the
-  connector an address and forwards.
+  TUN device, a forwarding engine — and serves CONNECT-IP/h3 over the inner
+  **noq** peer connection (via the `p2p::h3_noq` adapter, with its own datagram
+  demux). It assigns the connector an address and forwards.
 - The **connector** is the tunnel **client** (`run_client`). It runs
-  `TunnelClient::over_connection` — the h3 CONNECT-IP client over an already-open
-  `quinn::Connection` — receives its address, stands up its own TUN, and pumps
+  `TunnelClient::over_noq_connection` — the h3 CONNECT-IP client over the
+  already-open `noq::Connection` — receives its address, stands up its own TUN, and pumps
   packets, exactly like [`strawc`](ch-02-00-strawc.md).
 
-The tunnel rides whichever path the [`Session`](ch-03-03-hole-punching.md) picked:
-the relay, or a punched direct path.
+The tunnel rides whichever path the [`Session`](ch-03-03-hole-punching.md)
+picked — normally the direct one. VPN mode is in fact the case that forced the
+punch's candidate exchange into the QUIC layer: the inner protocol here is
+HTTP/3, and the earlier application-level exchange stream would have arrived at
+the h3 server as a malformed request.
 
 ## The scoping trap
 
@@ -50,8 +53,9 @@ strawcat connect <token> --relay <relay>:4433 --insecure --bearer-token s3cret \
 
 Now `ping 10.9.0.1` from peer B travels through the tunnel to peer A and back.
 The repository's `scripts/vpn-test.sh` is exactly this, three network namespaces
-(`peerA ─ relay ─ peerB`) with a ping asserted across the tunnel — over a punched
-direct path.
+(`peerA ─ relay ─ peerB`). It asserts both halves: that each peer's path leads
+to the *other peer's* address rather than the relay's, and that the ping crosses
+the tunnel over it.
 
 ## What it is and isn't
 

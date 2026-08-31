@@ -11,7 +11,7 @@ use crate::capsule::{
     AddressAssign, AssignedAddress, Capsule, CapsuleBuffer, IpAddressRange, RouteAdvertisement,
     encode_capsule, merge_ranges,
 };
-use crate::datagram::quarter_stream_id;
+use crate::datagram::{DatagramConn, quarter_stream_id};
 use crate::error::ProxyError;
 use crate::forwarding::EgressPolicy;
 use crate::forwarding::router::entries_from_client_ranges;
@@ -25,14 +25,26 @@ pub const CONNECT_IP_PROTOCOL: &str = "connect-ip";
 /// How often the forwarding loop re-reads the QUIC path MTU.
 const MTU_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
-type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+use h3::server::RequestStream;
+
+/// The h3 request-stream bound the CONNECT-IP handler needs, over any QUIC
+/// transport — h3-quinn for the proxy, h3-noq for a strawcat peer (VPN mode).
+pub trait IpStream:
+    h3::quic::SendStream<Bytes> + h3::quic::RecvStream<Buf = Bytes> + Send + 'static
+{
+}
+impl<T> IpStream for T where
+    T: h3::quic::SendStream<Bytes> + h3::quic::RecvStream<Buf = Bytes> + Send + 'static
+{
+}
 
 /// Validate and serve one CONNECT-IP request stream, blocking until the
 /// tunnel closes. Sends the appropriate HTTP error for invalid requests.
-pub async fn handle_connect_ip_stream(
+pub async fn handle_connect_ip_stream<S: IpStream>(
     req: Request<()>,
-    mut stream: ServerStream,
-    quinn_conn: quinn::Connection,
+    mut stream: RequestStream<S, Bytes>,
+    dgram: Arc<dyn DatagramConn>,
+    peer_cert: Option<rustls::pki_types::CertificateDer<'static>>,
     conn_seq: u64,
     ctx: Arc<ProxyContext>,
 ) -> Result<(), ProxyError> {
@@ -54,14 +66,8 @@ pub async fn handle_connect_ip_stream(
     };
 
     // 2. Authenticate (Step 24). The client certificate, when present, was
-    // already verified against --client-ca during the TLS handshake.
-    let peer_cert = quinn_conn
-        .peer_identity()
-        .and_then(|any| {
-            any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                .ok()
-        })
-        .and_then(|certs| certs.first().cloned());
+    // already verified against --client-ca during the TLS handshake; the
+    // caller extracts it from the concrete connection and passes it here.
     let auth_ctx = match ctx.auth.authenticate(req.headers(), peer_cert.as_ref()) {
         Ok(auth_ctx) => auth_ctx,
         Err(e) => {
@@ -119,7 +125,7 @@ pub async fn handle_connect_ip_stream(
     }
 
     // From here on, all exits must run teardown.
-    let result = run_tunnel(&mut stream, quinn_conn, session_id, qsid, routes, &ctx).await;
+    let result = run_tunnel(&mut stream, dgram, session_id, qsid, routes, &ctx).await;
 
     ctx.pool.release(session_id);
     ctx.engine.route_table().remove_session(session_id);
@@ -160,9 +166,9 @@ fn validate_request(req: &Request<()>) -> Result<crate::uri_template::RequestSco
     parse_connect_ip_path(req.uri().path())
 }
 
-async fn run_tunnel(
-    stream: &mut ServerStream,
-    quinn_conn: quinn::Connection,
+async fn run_tunnel<S: IpStream>(
+    stream: &mut RequestStream<S, Bytes>,
+    dgram: Arc<dyn DatagramConn>,
     session_id: SessionId,
     qsid: u64,
     routes: Vec<IpAddressRange>,
@@ -215,14 +221,14 @@ async fn run_tunnel(
     }
     // Live tunnel MTU: the smaller of the configured MTU and what one QUIC
     // DATAGRAM carries on this path, refreshed as discovery ramps (§7.2).
-    let mtu = Arc::new(AtomicUsize::new(effective_mtu(&quinn_conn, qsid, ctx)));
+    let mtu = Arc::new(AtomicUsize::new(effective_mtu(&dgram, qsid, ctx)));
     // Client-bound packets go straight from the forwarding engine to
     // `send_datagram` (Step 32); this task only serves capsules and is
     // woken by `closed` when the reaper unregisters the session.
     let closed = ctx.engine.register_session(
         session_id,
         crate::forwarding::SessionSink::Datagram {
-            conn: quinn_conn.clone(),
+            conn: dgram.clone(),
             qsid,
         },
         EgressPolicy::new(std::sync::Arc::new(routes.clone())),
@@ -246,7 +252,7 @@ async fn run_tunnel(
             // quinn raises the path MTU as discovery probes; follow it or
             // the tunnel stays pinned to the initial estimate.
             _ = mtu_refresh.tick() => {
-                let updated = effective_mtu(&quinn_conn, qsid, ctx);
+                let updated = effective_mtu(&dgram, qsid, ctx);
                 if mtu.swap(updated, Ordering::Relaxed) != updated {
                     tracing::debug!(session = %session_id, mtu = updated, "tunnel MTU updated");
                 }
@@ -280,7 +286,7 @@ async fn run_tunnel(
 /// QUIC DATAGRAM can carry on this connection (RFC 9484 §7.2). quinn's path
 /// MTU only grows after discovery, so sampling here is a safe lower bound
 /// the forwarding loop refreshes.
-fn effective_mtu(conn: &quinn::Connection, qsid: u64, ctx: &Arc<ProxyContext>) -> usize {
+fn effective_mtu(conn: &Arc<dyn DatagramConn>, qsid: u64, ctx: &Arc<ProxyContext>) -> usize {
     let configured = ctx.config.mtu as usize;
     conn.max_datagram_size()
         .and_then(|max| crate::datagram::max_ip_packet_size(max, qsid))
@@ -288,8 +294,8 @@ fn effective_mtu(conn: &quinn::Connection, qsid: u64, ctx: &Arc<ProxyContext>) -
         .unwrap_or(configured)
 }
 
-async fn handle_capsule(
-    stream: &mut ServerStream,
+async fn handle_capsule<S: IpStream>(
+    stream: &mut RequestStream<S, Bytes>,
     capsule: Capsule,
     session_id: SessionId,
     assigned: &mut Vec<AssignedAddress>,
@@ -354,7 +360,10 @@ async fn handle_capsule(
     Ok(())
 }
 
-async fn send_capsule(stream: &mut ServerStream, capsule: &Capsule) -> Result<(), ProxyError> {
+async fn send_capsule<S: IpStream>(
+    stream: &mut RequestStream<S, Bytes>,
+    capsule: &Capsule,
+) -> Result<(), ProxyError> {
     let mut buf = BytesMut::new();
     encode_capsule(capsule, &mut buf);
     stream.send_data(buf.freeze()).await?;

@@ -19,14 +19,14 @@
 
 Everything provisional lives in one registry, `src/codepoints.rs`, so the v2
 standards swap is a single-file edit. Each carries its v2 target and the gate
-blocking the swap.
+blocking the swap. The inner P2P QUIC stack is now **noq** (the n0/iroh quinn fork), which ships the NAT-traversal frames, the `nat_traversal` transport param, and multipath natively — so several of these swaps are no longer gated on upstream quinn, only on the Stage 3 native-multipath integration (see `p2p-direct-path-design.md` §0).
 
 | Codepoint | Value | v2 target | Gate |
 |-----------|-------|-----------|------|
 | `COMPRESSION_ASSIGN` / `ACK` / `CLOSE` | capsules `0x11`–`0x13` | connect-udp-listen final codepoints | RFC publication |
-| `OBSERVED_ADDRESS` | capsule `0x14` | draft-ietf-quic-address-discovery **frame** | quinn frame-extension API |
+| `OBSERVED_ADDRESS` | capsule `0x14` | draft-ietf-quic-address-discovery **frame** | noq `observed_external_addr` — Stage 3 |
 | `PEER_REFLEXIVE` | capsule `0x15` | none (straw-specific relay-assist) | — |
-| NAT-traversal control | CBOR on inner stream 0 | draft-seemann frames (`0x3d7e90`…) + `nat_traversal` transport param | quinn extension-frame API |
+| NAT-traversal control | CBOR on inner stream 0 | draft-seemann frames (`0x3d7e90`…) + `nat_traversal` transport param | **noq ships these** — Stage 3 integration |
 | Inner ALPN | `strawcat/1` | unchanged | — |
 | Token | `v2` / `sc2_` prefix | TBD | — |
 

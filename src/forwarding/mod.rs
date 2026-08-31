@@ -43,8 +43,12 @@ use self::router::RouteTable;
 pub enum SessionSink {
     /// Deliver into a channel (tests, inspection).
     Channel(mpsc::Sender<Bytes>),
-    /// Encode as an HTTP Datagram and send on the session's connection.
-    Datagram { conn: quinn::Connection, qsid: u64 },
+    /// Encode as an HTTP Datagram and send on the session's connection
+    /// (quinn for the proxy, noq for a strawcat peer — via [`DatagramConn`]).
+    Datagram {
+        conn: Arc<dyn crate::datagram::DatagramConn>,
+        qsid: u64,
+    },
 }
 
 /// Where a client packet ended up.

@@ -124,3 +124,23 @@ impl From<quinn::SendDatagramError> for ProxyError {
         ProxyError::Quic(e.to_string())
     }
 }
+
+// noq (the inner P2P QUIC stack) errors — distinct crate types from quinn's,
+// so these coexist with the quinn impls above.
+impl From<noq::ConnectionError> for ProxyError {
+    fn from(e: noq::ConnectionError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
+}
+
+impl From<noq::ConnectError> for ProxyError {
+    fn from(e: noq::ConnectError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
+}
+
+impl From<noq::SendDatagramError> for ProxyError {
+    fn from(e: noq::SendDatagramError) -> Self {
+        ProxyError::Quic(e.to_string())
+    }
+}

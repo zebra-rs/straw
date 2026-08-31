@@ -32,23 +32,32 @@ class is a property of the NAT, so a fresh probe socket answers for the punch
 socket too. `strawcat --stun-detect <server>` reports it; a symmetric verdict says
 to use `--port-map` or expect the relay, instead of burning the punch window.
 
-## The four punch strategies
+## The punch strategies, and why three of them are dormant
 
-`strawcat --punch-strategy` selects how the punch attacks a harder NAT
-(`p2p::strategy::PunchStrategy`):
+`strawcat --punch-strategy` was built against the earlier, application-level
+punch, which dialled addresses of its own choosing from sockets of its own
+choosing:
 
 | Strategy | Targets | Idea |
 |----------|---------|------|
-| `basic` | cone | Reuse the outer socket, advertise the reflexive. (default) |
+| `basic` | cone | Advertise the reflexive candidate. (default) |
 | `predict` | sequential-symmetric | Sample the NAT's port allocation with a few aux bind sessions; predict the peer-facing port for a sequential allocator. |
 | `birthday` | narrow-range random symmetric | Open several sockets and scan a window around every candidate; a fixed-dial birthday attack. |
 | `relay-assisted` | address-dependent-filtering, on-path relay | The relay (`--udp-bind-observe`) reads each peer's peer-facing source off the forwarded packets and signals it. |
 
-The honest result is that **none of these traverses the random,
-address-and-port-dependent symmetric NAT** in the harness — that is a
-fundamental limit, and why every peer-to-peer system keeps a relay fallback. Each
-strategy pushes the boundary out to an *easier* symmetric class a real router
-might have; the relay covers the rest.
+Since the punch moved into the QUIC layer
+([Hole Punching](ch-03-03-hole-punching.md)), only `basic` is live. The frame
+exchange carries a peer's **own** candidate addresses and nothing else, so
+there is no way for a peer to inject a predicted port range, a scan window, or
+a source that the relay observed for the *other* peer. Passing any other
+strategy logs a warning and punches basically; the code and the analysis are
+kept for whoever takes this up again.
+
+That costs less than it sounds, because the honest result was already that
+**none of these traverses the random, address-and-port-dependent symmetric
+NAT** in the harness. That is a fundamental limit, and why every peer-to-peer
+system keeps a relay fallback. Each strategy only pushed the boundary out to an
+*easier* symmetric class a real router might have.
 
 ## Ask the router: `--port-map`
 
@@ -56,10 +65,12 @@ The one approach that *reliably* beats a symmetric NAT is to stop guessing and
 **ask the router to cooperate**. `p2p/portmap.rs` is a
 [PCP](https://www.rfc-editor.org/rfc/rfc6887) (with
 [NAT-PMP](https://www.rfc-editor.org/rfc/rfc6886) fallback) client: `strawcat
---port-map` requests an explicit UDP forward for the punch socket, and advertises
-the router-assigned external address as a `Mapped` candidate. Because the forward
-is explicit, the peer reaches it regardless of the NAT's mapping behaviour — when
-the router speaks PCP or NAT-PMP, which most consumer routers do.
+--port-map` requests an explicit UDP forward for the direct socket, and
+advertises the router-assigned external address as an extra candidate. Because
+the forward is explicit, the peer reaches it regardless of the NAT's mapping
+behaviour — when the router speaks PCP or NAT-PMP, which most consumer routers
+do. `--port-map` is orthogonal to the strategy, so it is unaffected by the
+dormancy above.
 
 The repository's `PORTMAP=1` harness demonstrates this end to end: a PCP/NAT-PMP
 responder installs a 1:1 forward in each NAT, and the punch then **succeeds
@@ -68,6 +79,5 @@ through the symmetric double NAT**, where every other strategy relays.
 ## Choosing
 
 In short: **detect** the NAT (`--stun-detect`); if it is a cone, `basic` punches
-it; if it is symmetric, `--port-map` beats it when the router cooperates, a
-matching strategy may beat an easier symmetric NAT, and otherwise the relay
-carries the traffic — always correctly, just not directly.
+it; if it is symmetric, `--port-map` beats it when the router cooperates, and
+otherwise the relay carries the traffic — always correctly, just not directly.
