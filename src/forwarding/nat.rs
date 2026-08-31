@@ -100,13 +100,21 @@ pub fn setup_nat(pools: &[IpNet], interface: &str) -> Result<NatGuard, ProxyErro
     Ok(NatGuard { rules })
 }
 
-/// NAT is Linux-only. The TUN device it serves now has a macOS backend, but
-/// masquerading there means pf (`pfctl` anchors, `net.inet.ip.forwarding`),
-/// which is stateful in a way `iptables -D` is not — separate work.
+/// NAT is Linux-only, by choice rather than by omission.
+///
+/// The TUN device it serves does have a macOS backend, so this could be
+/// written against pf (`pfctl` anchors, `net.inet.ip.forwarding`) — pf is
+/// global, anchor-scoped state, where an iptables rule is deleted by value, so
+/// it is real work with a real teardown hazard. It is not planned: straw's
+/// deployment runs the **proxy on Linux and the client on macOS**, and nothing
+/// on the client masquerades. The error says so rather than implying a
+/// port is coming.
 #[cfg(not(target_os = "linux"))]
 pub fn setup_nat(_pools: &[IpNet], _interface: &str) -> Result<NatGuard, ProxyError> {
     Err(ProxyError::Config(
-        "--nat-interface is Linux-only for now".to_string(),
+        "--nat-interface needs iptables and is Linux-only; run the proxy on \
+         Linux (macOS is supported as a client: strawc, strawcat)"
+            .to_string(),
     ))
 }
 
