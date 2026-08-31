@@ -213,7 +213,15 @@ candidate, and that one holds even on a symmetric NAT.
 
 `candidates()` assembles and de-duplicates the set (mapped, then reflexive,
 then host), dropping unspecified addresses; behind no NAT the host and
-reflexive addresses coincide and only one slot is spent. Harness: `DIRECT=<mode>
+reflexive addresses coincide and only one slot is spent.
+
+**The direct socket binds in the relay path's address family**
+(`peer::direct_socket`), so an IPv6 session punches like an IPv4 one. This is
+forced, not a preference: noq fixes a connection's family from the paths it
+already has (`is_ipv6`) and rejects a remote in the other family, so a direct
+path can only ever match the relay path. On Linux a `[::]` bind is dual-stack
+by default. Guarded by `peers_punch_a_direct_path_over_ipv6`, which runs the
+whole path — paddr, reflexive, candidates, socket — over `::1`. Harness: `DIRECT=<mode>
 sudo scripts/nat-punch-test.sh` — `off` is asserted not to punch even in cone
 mode, where it otherwise would.
 

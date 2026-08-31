@@ -117,6 +117,27 @@ fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
 /// headroom covers host candidates and future strategies.
 pub const MAX_NAT_ADDRESSES: u8 = 8;
 
+/// Bind the socket that carries direct paths, in the **same address family as
+/// the relay path**.
+///
+/// This is not a free choice. noq derives a connection's family from the
+/// remotes of the paths it already has (`is_ipv6`), and refuses a path whose
+/// remote is in the other family — so on a connection whose relay path is
+/// IPv4, an IPv6 direct path is rejected before it ever reaches the socket,
+/// and vice versa. Matching the relay path is therefore the only binding that
+/// can ever carry traffic. (On Linux a `[::]` bind is dual-stack by default,
+/// so the IPv6 socket also reaches IPv4-mapped destinations.)
+async fn direct_socket(relay_paddr: SocketAddr) -> Result<tokio::net::UdpSocket, ProxyError> {
+    let bind: SocketAddr = if relay_paddr.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(ProxyError::Io)
+}
+
 /// Open a bind session and stand up the inner *server* endpoint over it.
 /// `expected_peer` pins the connecting holder's key when known out of band,
 /// else `None` accepts it on first use (design §3.2).
@@ -135,9 +156,7 @@ pub async fn listen(
         QuicServerConfig::try_from(server_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(ProxyError::Io)?;
+    let direct = direct_socket(paddr).await?;
     // No relay peer to preset: the dialer's paddr is learned from the packet
     // this endpoint answers.
     let (endpoint, mux) = mux_endpoint(
@@ -180,9 +199,7 @@ pub async fn connect(
         QuicClientConfig::try_from(client_tls).map_err(|e| ProxyError::Tls(e.to_string()))?,
     ));
     quic.transport_config(relay_transport());
-    let direct = tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map_err(ProxyError::Io)?;
+    let direct = direct_socket(relay_paddr).await?;
     // The issuer's paddr must be tunnelled from the very first packet.
     let (endpoint, mux) = mux_endpoint(
         bind.into_relay_parts(peer_reflexive_sink),

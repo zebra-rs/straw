@@ -1715,6 +1715,106 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
     assert_eq!(&r2.read_to_end(16).await.unwrap()[..], b"direct!");
 }
 
+/// The same relay, allocating IPv6 public addresses. Loopback `::1` stands in
+/// for a real IPv6 deployment: what matters is that the whole path — paddr,
+/// reflexive, candidates, direct socket — is IPv6.
+fn enable_bind_v6(c: &mut ProxyConfig) {
+    enable_bind(c);
+    c.udp_bind_public_ips = vec!["::1".parse().unwrap()];
+}
+
+#[tokio::test]
+async fn peers_punch_a_direct_path_over_ipv6() {
+    // The direct socket used to be hardcoded to 0.0.0.0, so an IPv6 relay path
+    // could never gain a direct path: noq fixes a connection's address family
+    // from the paths it has and rejects a remote in the other family, and the
+    // socket could not have sent there anyway. It now binds in the relay
+    // path's family, so an IPv6 session punches like an IPv4 one.
+    let relay = TestServer::start_with(enable_bind_v6).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+        .await
+        .unwrap();
+    assert!(
+        listener.paddr.is_ipv6(),
+        "the relay allocated an IPv6 public address: {}",
+        listener.paddr
+    );
+    let issuer_inputs = PunchInputs {
+        mux: listener.mux.clone(),
+        reflexive: listener.reflexive,
+        relay_addr: relay.addr,
+    };
+    assert!(
+        listener.mux.direct_local().is_ipv6(),
+        "the direct socket follows the relay path into IPv6"
+    );
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "relay-bearer".into(),
+        issuer.pin(),
+        vec![listener.paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+        .await
+        .unwrap();
+    let issuer_conn = accept.await.unwrap().unwrap();
+
+    let issuer_session = Session::start(
+        issuer_conn.clone(),
+        false,
+        issuer_inputs,
+        PunchConfig::default(),
+    );
+    let holder_session = Session::start(
+        holder_side.conn.clone(),
+        true,
+        PunchInputs {
+            mux: holder_side.mux.clone(),
+            reflexive: holder_side.reflexive,
+            relay_addr: relay.addr,
+        },
+        PunchConfig::default(),
+    );
+
+    let wait = Duration::from_secs(15);
+    assert!(
+        holder_session.await_direct(wait).await,
+        "holder goes direct"
+    );
+    assert!(
+        issuer_session.await_direct(wait).await,
+        "issuer goes direct"
+    );
+    let peer_addr = holder_session
+        .direct_remote()
+        .expect("the holder holds a direct path");
+    assert!(
+        peer_addr.is_ipv6(),
+        "the direct path is IPv6 end to end: {peer_addr}"
+    );
+
+    let echo = tokio::spawn(async move {
+        let (mut s, mut r) = issuer_conn.accept_bi().await.unwrap();
+        let m = r.read_to_end(64).await.unwrap();
+        s.write_all(&m).await.unwrap();
+        s.finish().unwrap();
+        issuer_conn.closed().await;
+    });
+    let (mut s, mut r) = holder_session.connection().open_bi().await.unwrap();
+    s.write_all(b"v6-direct").await.unwrap();
+    s.finish().unwrap();
+    assert_eq!(&r.read_to_end(64).await.unwrap()[..], b"v6-direct");
+    drop(echo);
+}
+
 #[tokio::test]
 async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
     // The other half of the state machine: DIRECT → (path lost) → RELAY, with
