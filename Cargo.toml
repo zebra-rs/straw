@@ -38,7 +38,7 @@ tun = { version = "0.8.14", features = ["async"] }
 
 # h3 0.0.8 with upstream's ConnectIp protocol variant backported
 # (hyperium/h3 master already has it; drop this vendored patch when the
-# next h3 release ships).
+# next h3 release ships — see UPSTREAM.md for the check).
 [patch.crates-io]
 h3 = { path = "vendor/h3" }
 # quinn-proto 0.11.17's datagram drop loop double-decrements its buffer
@@ -46,5 +46,5 @@ h3 = { path = "vendor/h3" }
 # every later send_datagram panics ("payload_bytes desynchronized"), killing
 # the tunnel under sustained datagram load (found by the Phase D iperf3 UDP
 # sweep). Vendored with the one-line fix; upstream main has it, no 0.11.x
-# release does. Drop when one ships.
+# release does. Drop when one ships — see UPSTREAM.md for the check.
 quinn-proto = { path = "vendor/quinn-proto" }
