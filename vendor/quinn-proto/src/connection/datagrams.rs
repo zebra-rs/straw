@@ -40,14 +40,15 @@ impl Datagrams<'_> {
                 > self.conn.config.datagram_send_buffer_size
             {
                 // straw local patch: `pop_front` already subtracts the
-                // datagram's length from `payload_bytes`; the original code
+                // datagram's length from `payload_bytes`; the released code
                 // subtracted it a second time here, so the first overfull
                 // buffer underflowed the counter and every later `send`
                 // panicked on the expect below ("payload_bytes
-                // desynchronized"). Upstream main fixed this by
-                // restructuring the loop into `make_space_for`, which
-                // relies on `pop_front` alone; no 0.11.x release carries
-                // it, hence this vendored copy.
+                // desynchronized"). `main` never had this — its loop lives in
+                // `make_space_for` and relies on `pop_front` alone. Upstream
+                // has since merged this exact deletion on the 0.11.x branch
+                // (quinn-rs/quinn#2806); drop this vendored copy when 0.11.18
+                // releases. See UPSTREAM.md.
                 let prev = self
                     .conn
                     .datagrams

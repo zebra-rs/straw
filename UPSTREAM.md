@@ -22,9 +22,22 @@ first overfull send buffer underflowed the counter, and every later
 desynchronized")`, killing the tunnel under sustained datagram load. Found by
 the Phase D iperf3 UDP sweep at ~4 Gbit/s.
 
-**What lands it.** Upstream `main` already fixed this by restructuring the loop
-into `make_space_for`, which relies on `pop_front` alone. We need a **0.11.x
-release** carrying that — 0.11.17 is still the newest.
+**Why only the release branch.** `main` was never affected. Its eviction loop
+moved out of `Datagrams::send` into `DatagramState::make_space_for` in June 2026
+(quinn-rs/quinn 8da45f4 and follow-ups), so when the August `DatagramBuffer`
+refactor (de0f03b) moved accounting into `push_back`/`pop_front`, it deleted the
+manual subtraction from that helper. The `0.11.x` branch never took the
+`make_space_for` refactor — the loop is still inline in `send` — so the same
+backport left the call-site `-=` sitting next to a `pop_front` that now
+subtracts too. Hence a bug that exists in a release and not on `main`, and no
+upstream commit to cherry-pick.
+
+**What lands it.** A **0.11.18 release**. The fix is already *merged on the
+`0.11.x` branch* — quinn-rs/quinn issue #2805, PR #2806, merged 2026-08-29 as
+`f650e0f` — and it is byte-identical to what we carry (the same one-line
+deletion), plus a regression test that drives sustained eviction. Our vendored
+file now differs from `0.11.x` only by its explanatory comment. crates.io still
+tops out at 0.11.17 (published 2026-08-17).
 
 **Check:**
 
@@ -34,9 +47,6 @@ cargo search quinn-proto --limit 1     # newer than 0.11.17?
 
 If yes: drop the `[patch.crates-io]` entry and `vendor/quinn-proto`, then run
 the UDP sweep (`sudo bench/iperf-baseline.sh`) to confirm the panic stays gone.
-
-**Not yet reported upstream.** Nothing in this repo records an issue number.
-Worth filing with the reproduction above; see the note at the bottom.
 
 ---
 
