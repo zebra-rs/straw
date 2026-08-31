@@ -71,9 +71,6 @@ pub struct PunchConfig {
     pub strategy: PunchStrategy,
     /// How to reach the relay to open auxiliary bind sessions (predict/birthday).
     pub relay_access: Option<StdArc<RelayAccess>>,
-    /// Peer-facing sources the on-path relay signalled (relay-assisted); a
-    /// shared list a pump task fills and the punch reads.
-    pub peer_reflexive: Option<StdArc<Mutex<Vec<SocketAddr>>>>,
     /// Ask the router (PCP / NAT-PMP) to forward the direct socket, advertising
     /// the mapped address as a candidate (design §11 / P3).
     pub port_map: bool,

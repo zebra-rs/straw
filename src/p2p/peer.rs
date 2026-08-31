@@ -37,8 +37,8 @@ pub struct Listener {
     /// punch pairs the IP with the direct socket's port instead.
     pub reflexive: Option<SocketAddr>,
     /// The outer bind socket. The v1 app-level punch dialled from it; the
-    /// native punch uses the mux's direct socket, so this is only kept for the
-    /// parked [`holepunch`](crate::p2p::holepunch) path.
+    /// native punch uses the mux's direct socket instead, so this is exposed
+    /// only for callers that want the underlying endpoint.
     pub punch_endpoint: quinn::Endpoint,
     /// The combined-transport socket's handle: the direct socket's local
     /// address, which is half of this peer's candidate (Stage 3).
@@ -68,8 +68,7 @@ pub struct PeerConnection {
     pub reflexive: Option<SocketAddr>,
     /// This peer's own relay-allocated public address (its relay candidate).
     pub relay_paddr: SocketAddr,
-    /// The outer bind socket, kept for the parked v1 punch
-    /// (see [`Listener::punch_endpoint`]).
+    /// The outer bind socket (see [`Listener::punch_endpoint`]).
     pub punch_endpoint: quinn::Endpoint,
     /// The combined-transport socket's handle (Stage 3).
     pub mux: PathMuxHandle,
@@ -194,6 +193,11 @@ pub async fn listen(
     relay: RelayAccess,
     identity: &Identity,
     expected_peer: Option<SpkiPin>,
+    // Where to deliver PEER_REFLEXIVE capsules if the relay runs the on-path
+    // observer (`--udp-bind-observe`). No punch strategy consumes them since
+    // the move to native traversal — the probes no longer pass through the
+    // relay for it to observe — so callers pass `None`; the receiving end is
+    // kept because the relay-side feature still exists.
     peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<Listener, ProxyError> {
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
@@ -231,6 +235,11 @@ pub async fn connect(
     relay: RelayAccess,
     identity: &Identity,
     token: &TokenV2,
+    // Where to deliver PEER_REFLEXIVE capsules if the relay runs the on-path
+    // observer (`--udp-bind-observe`). No punch strategy consumes them since
+    // the move to native traversal — the probes no longer pass through the
+    // relay for it to observe — so callers pass `None`; the receiving end is
+    // kept because the relay-side feature still exists.
     peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<PeerConnection, ProxyError> {
     let issuer: SocketAddr = token

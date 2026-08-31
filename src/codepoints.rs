@@ -14,9 +14,9 @@
 //! |---|---|---|
 //! | compression capsules `0x11`–`0x13` | draft-ietf-masque-connect-udp-listen final codepoints | RFC publication |
 //! | `OBSERVED_ADDRESS` capsule `0x14` | draft-ietf-quic-address-discovery OBSERVED_ADDRESS **frame** | quinn frame-extension API |
-//! | `PEER_REFLEXIVE` capsule `0x15` | none (straw-specific relay-assist); keep or retire | — |
-//! | CBOR `Candidate`/`Punch`/`Retire` on inner stream 0 ([`crate::p2p::wire`]) | draft-seemann-quic-nat-traversal ADD_ADDRESS / PUNCH_ME_NOW / REMOVE_ADDRESS frames (`0x3d7e90`..) + `nat_traversal` transport param | quinn extension-frame + transport-param API |
-//! | race a second connection + app switchover ([`crate::p2p::punch`]) | path validation + migration of the one inner connection | quinn client path probing |
+//! | `PEER_REFLEXIVE` capsule `0x15` | none (straw-specific relay-assist) | retire — its only consumer, the `relay-assisted` strategy, does not port to native traversal |
+//! | ~~CBOR `Candidate`/`Punch`/`Retire` on inner stream 0~~ | **done** — noq's NAT-traversal frames + `nat_traversal` transport param | — |
+//! | ~~race a second connection + app switchover~~ | **done** — path validation + promotion of the one inner connection | — |
 //! | token `v2` / `sc2_` | TBD if a standard token format emerges | — |
 //!
 //! Tokens carry `v`, so a v1 and a v2 peer fail cleanly rather than confusingly.
@@ -65,10 +65,13 @@ pub const TOKEN_PREFIX: &str = "sc2_";
 // --- NAT-traversal control (v2 target, documented) --------------------------
 
 /// The base of draft-seemann-quic-nat-traversal's frame range
-/// (`ADD_ADDRESS`=`0x3d7e90`, `PUNCH_ME_NOW`, `REMOVE_ADDRESS`, …). v1 encodes
-/// the same information as CBOR [`Control`](crate::p2p::wire::Control) messages
-/// on inner stream 0; v2 swaps to these QUIC frames once quinn exposes an
-/// extension-frame API. Documented here as the swap target; not yet emitted.
+/// (`ADD_ADDRESS`=`0x3d7e90`, `PUNCH_ME_NOW`, `REMOVE_ADDRESS`, …).
+///
+/// straw no longer encodes this itself: the inner connection runs on noq,
+/// which emits the real frames, and the v1 CBOR stand-in has been deleted. The
+/// constant stays as the documented codepoint the peers rely on, so a change
+/// in the draft is findable from this registry rather than only inside the
+/// dependency.
 pub const NAT_TRAVERSAL_FRAME_BASE: u64 = 0x3d7e90;
 
 #[cfg(test)]

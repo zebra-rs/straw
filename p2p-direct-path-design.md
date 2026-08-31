@@ -42,13 +42,14 @@ what lets **VPN mode punch at all** — its inner protocol is h3, and h3 would
 have read an app-level exchange stream as a request. `scripts/vpn-test.sh` now
 asserts the IP tunnel runs over a direct path to the peer's own address.
 
-The v1 modules (`holepunch`, `punch`, `candidates`, `wire`) are no longer on the
-data path. They remain as the reference for the symmetric-NAT strategies, which
-have **not** been ported: `predict`, `birthday` and `relay-assisted` all worked
-by dialling extra addresses from extra sockets, and the frame exchange only
-carries a peer's *own* candidates. `--punch-strategy` other than `basic` warns
-and punches basically; `--port-map` is unaffected and still traverses a
-symmetric NAT (`sudo PORTMAP=1 scripts/nat-punch-test.sh`).
+The v1 modules (`holepunch`, `punch`, `candidates`, `wire`) have been
+**deleted**: unreachable since the punch moved to QUIC frames, and keeping them
+implied a fallback that did not exist. Of the symmetric-NAT strategies only
+`predict` ported (`p2p::predict`) — a predicted port is still *this peer's own*
+address, which is what the frames carry. `birthday` (needs several sockets) and
+`relay-assisted` (needs the relay to see probes that now go direct) cannot, and
+warn. `--port-map` is unaffected and still traverses a symmetric NAT
+(`sudo PORTMAP=1 scripts/nat-punch-test.sh`).
 
 Design goal **G1 is preserved**: the relay still forwards inner-QUIC ciphertext
 it cannot read (`RelaySocket` sends through the outer bind connection). What
