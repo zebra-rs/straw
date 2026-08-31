@@ -87,8 +87,9 @@ struct RelayArgs {
     punch_wait: u64,
 
     /// NAT-traversal strategy: basic | predict | birthday | relay-assisted.
-    /// Only `basic` is live since the punch moved to QUIC-native NAT traversal;
-    /// the others warn and fall back to it. Use --port-map for a symmetric NAT.
+    /// `basic` and `predict` are live; `birthday` and `relay-assisted` do not
+    /// port to QUIC-native traversal and warn, falling back to basic. Use
+    /// --port-map for a symmetric NAT the router will forward.
     #[arg(long, default_value = "basic")]
     punch_strategy: PunchStrategy,
 

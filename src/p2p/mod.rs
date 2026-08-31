@@ -40,6 +40,7 @@ pub mod inner_tls;
 pub mod native_punch;
 pub mod peer;
 pub mod portmap;
+pub mod predict;
 pub mod punch;
 pub mod relay_socket;
 pub mod session;

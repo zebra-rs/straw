@@ -41,17 +41,25 @@ choosing:
 | Strategy | Targets | Idea |
 |----------|---------|------|
 | `basic` | cone | Advertise the reflexive candidate. (default) |
-| `predict` | sequential-symmetric | Sample the NAT's port allocation with a few aux bind sessions; predict the peer-facing port for a sequential allocator. |
+| `predict` | sequential-symmetric | Sample the NAT's port allocation with a few aux bind sessions; predict the peer-facing port for a sequential allocator. **Live.** |
 | `birthday` | narrow-range random symmetric | Open several sockets and scan a window around every candidate; a fixed-dial birthday attack. |
 | `relay-assisted` | address-dependent-filtering, on-path relay | The relay (`--udp-bind-observe`) reads each peer's peer-facing source off the forwarded packets and signals it. |
 
 Since the punch moved into the QUIC layer
-([Hole Punching](ch-03-03-hole-punching.md)), only `basic` is live. The frame
-exchange carries a peer's **own** candidate addresses and nothing else, so
-there is no way for a peer to inject a predicted port range, a scan window, or
-a source that the relay observed for the *other* peer. Passing any other
-strategy logs a warning and punches basically; the code and the analysis are
-kept for whoever takes this up again.
+([Hole Punching](ch-03-03-hole-punching.md)), the frame exchange carries a
+peer's **own** candidate addresses and nothing else. A strategy survives that
+move exactly when its idea can be phrased as *"this is another address of
+mine"*.
+
+`predict` can: the port a sequential NAT will use toward the peer is still this
+peer's own address, so it is advertised like any other candidate, and `predict`
+works as it always did.
+
+`birthday` and `relay-assisted` cannot. Birthday needs several sockets to punch
+from, and there is now one. Relay-assisted needs the relay to *observe* the
+probes in flight, and the probes now go out the direct socket and never pass
+through it. Both log a warning and fall back to `basic`; their code and the
+analysis are kept for whoever takes this up again.
 
 That costs less than it sounds, because the honest result was already that
 **none of these traverses the random, address-and-port-dependent symmetric
