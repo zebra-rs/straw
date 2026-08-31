@@ -706,10 +706,17 @@ mod tests {
 
     #[test]
     fn mtu_validation() {
-        let mut cfg = ProxyConfig::default();
-        cfg.mtu = 1200;
-        assert!(cfg.validate().is_err());
-        cfg.mtu = 1280;
-        assert!(cfg.validate().is_ok());
+        // 1200 is below the IPv6 minimum link MTU, so it must be refused;
+        // 1280 is exactly it, so it must pass.
+        let too_small = ProxyConfig {
+            mtu: 1200,
+            ..ProxyConfig::default()
+        };
+        assert!(too_small.validate().is_err());
+        let ok = ProxyConfig {
+            mtu: 1280,
+            ..ProxyConfig::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 }

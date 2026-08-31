@@ -153,7 +153,7 @@ impl ContextTable {
     /// Record a peer's `COMPRESSION_ASSIGN`. Client-allocated ids MUST be
     /// even (RFC 9297); a known id cannot be redefined.
     pub fn register(&mut self, assign: CompressionAssign) -> Result<(), ContextError> {
-        if assign.context_id % 2 != 0 {
+        if !assign.context_id.is_multiple_of(2) {
             return Err(ContextError::NotClientAllocated(assign.context_id));
         }
         if self.contexts.contains_key(&assign.context_id)

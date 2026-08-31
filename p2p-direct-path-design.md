@@ -16,6 +16,9 @@ paths — so §5 and §9 build a **v1 app-level stand-in** (CBOR control message
 inner stream 0, a *second* raced QUIC connection for the punch) and gate the v2
 "draft-exact" path on quinn gaining those APIs.
 
+(For how straw compares with iroh itself, which is built on the same
+transport, see `iroh-comparison.md`.)
+
 straw has since **adopted [noq](https://crates.io/crates/noq)** — the n0/iroh
 quinn fork — as the QUIC implementation for the **inner P2P connection**. noq
 ships exactly the APIs quinn lacked: QUIC-native NAT traversal
