@@ -1381,6 +1381,89 @@ async fn bind_session_reports_the_reflexive_candidate() {
     assert_ne!(observed.port(), 0);
 }
 
+#[tokio::test]
+async fn peers_open_a_direct_path_over_the_mux() {
+    // Stage 3 feasibility: two peers meet through the relay (one noq connection
+    // over the combined-transport socket), then each opens a *direct* path to
+    // the other's real UDP socket. On loopback both direct sockets are
+    // reachable, so this proves the mechanism — combined socket + open_path +
+    // noq path validation — without NAT/reflexive discovery.
+    use std::net::Ipv4Addr;
+
+    let relay = TestServer::start_with(enable_bind).await;
+    let issuer = Identity::generate().unwrap();
+    let holder = Identity::generate().unwrap();
+
+    let listener = peer::listen(relay_access(&relay), &issuer, None, None)
+        .await
+        .unwrap();
+    let issuer_paddr = listener.paddr;
+    let issuer_mux = listener.mux.clone();
+    let issuer_direct =
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), issuer_mux.direct_local().port());
+    let token = TokenV2::issue(
+        "h3://relay.test:443".into(),
+        [0u8; 32],
+        "relay-bearer".into(),
+        issuer.pin(),
+        vec![issuer_paddr.to_string()],
+        1_700_000_000,
+        3600,
+    );
+
+    let accept = tokio::spawn(async move { listener.accept().await });
+    let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
+        .await
+        .unwrap();
+    let holder_direct =
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), holder_side.mux.direct_local().port());
+    let issuer_conn = accept.await.unwrap().unwrap();
+
+    assert!(
+        issuer_conn.is_multipath_enabled(),
+        "multipath negotiated over the relay path"
+    );
+
+    // The inner *client* (holder) drives path opening; the server (issuer)
+    // cannot open paths (ServerSideNotAllowed) — it just registers the direct
+    // remote so it routes its PATH_RESPONSEs out the real socket.
+    issuer_mux.register_direct_remote(holder_direct);
+    holder_side.mux.register_direct_remote(issuer_direct);
+
+    // Let the server issue spare connection IDs before opening a new path
+    // (noq needs a remote CID per path, issued shortly after the handshake).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let hpath = tokio::time::timeout(
+        Duration::from_secs(10),
+        holder_side
+            .conn
+            .open_path_ensure(noq::FourTuple::from_remote(issuer_direct), noq::PathStatus::Available),
+    )
+    .await
+    .expect("the direct path opens within 10s")
+    .expect("holder's direct path opens");
+    assert_eq!(
+        hpath.remote_address().unwrap(),
+        issuer_direct,
+        "the direct path targets the issuer's real socket"
+    );
+
+    // Data round-trips (over whichever path noq now uses).
+    let echo = tokio::spawn(async move {
+        let (mut s, mut r) = issuer_conn.accept_bi().await.unwrap();
+        let m = r.read_to_end(64).await.unwrap();
+        s.write_all(&m).await.unwrap();
+        s.finish().unwrap();
+        issuer_conn.closed().await;
+    });
+    let (mut s, mut r) = holder_side.conn.open_bi().await.unwrap();
+    s.write_all(b"direct-path").await.unwrap();
+    s.finish().unwrap();
+    assert_eq!(&r.read_to_end(64).await.unwrap()[..], b"direct-path");
+    drop(echo);
+}
+
 #[cfg(any())] // parked during noq migration: direct-path punch → Stage 3 (noq native multipath)
 #[tokio::test]
 async fn predict_strategy_runs_and_establishes_a_path() {
