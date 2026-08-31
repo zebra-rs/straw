@@ -644,7 +644,7 @@ async fn mtls_requires_client_certificate() {
         TlsMode::Mtls {
             ca: server.cert.clone(),
             cert_chain: vec![client_cert],
-            key: client_key,
+            key: zeroize::Zeroizing::new(client_key),
         },
     )
     .await

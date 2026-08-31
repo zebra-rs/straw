@@ -159,7 +159,7 @@ async fn run() -> Result<(), ProxyError> {
         Command::Genkey => {
             let id = Identity::generate()?;
             eprintln!("pin: {}", hex(&id.pin()));
-            print!("{}", id.to_pem());
+            print!("{}", *id.to_pem());
             Ok(())
         }
         Command::Listen(args) => listen(args).await,

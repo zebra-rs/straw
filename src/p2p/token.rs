@@ -24,7 +24,7 @@ pub use crate::codepoints::TOKEN_VERSION;
 
 /// A decoded rendezvous token (design §3.2). Integer CBOR keys in the
 /// `serde(rename)`s keep the wire form compact and order-independent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenV2 {
     /// Format version; MUST be [`TOKEN_VERSION`].
     #[serde(rename = "1")]
@@ -47,6 +47,25 @@ pub struct TokenV2 {
     /// Expiry, unix seconds.
     #[serde(rename = "7")]
     pub exp: u64,
+}
+
+/// Hand-written so the relay credential cannot reach a log.
+///
+/// `auth` is a bearer token. With a derived `Debug`, one
+/// `tracing::debug!(?token)` anywhere — now or in three years — would print it.
+/// Nothing does today; this makes it stay that way.
+impl std::fmt::Debug for TokenV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenV2")
+            .field("v", &self.v)
+            .field("relay", &self.relay)
+            .field("rpin", &self.rpin)
+            .field("auth", &"<redacted>")
+            .field("ppin", &self.ppin)
+            .field("paddr", &self.paddr)
+            .field("exp", &self.exp)
+            .finish()
+    }
 }
 
 impl TokenV2 {
@@ -138,6 +157,31 @@ impl TokenV2 {
 
 #[cfg(test)]
 mod tests {
+    /// A bearer credential must not be printable. `Debug` is the leak that
+    /// costs nothing to introduce — one `tracing::debug!(?token)` — so the
+    /// redaction is asserted rather than left to review.
+    #[test]
+    fn debug_does_not_print_the_relay_credential() {
+        let token = TokenV2 {
+            v: TOKEN_VERSION,
+            relay: "h3://relay.example:443".into(),
+            rpin: vec![1; 32],
+            auth: "s3cret-bearer-value".into(),
+            ppin: vec![2; 32],
+            paddr: vec!["198.51.100.7:443".into()],
+            exp: 0,
+        };
+        let rendered = format!("{token:?}");
+        assert!(
+            !rendered.contains("s3cret-bearer-value"),
+            "the credential leaked into Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The non-secret fields are still there, or the redaction has made the
+        // type useless to debug with.
+        assert!(rendered.contains("relay.example"), "{rendered}");
+    }
+
     use super::*;
 
     fn sample() -> TokenV2 {

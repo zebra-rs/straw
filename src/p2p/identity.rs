@@ -11,6 +11,7 @@
 //! (a future `strawcat genkey`).
 
 use rcgen::{KeyPair, PublicKeyData};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::ProxyError;
 
@@ -18,8 +19,26 @@ use crate::error::ProxyError;
 pub type SpkiPin = [u8; 32];
 
 /// A peer's inner-TLS keypair.
+///
+/// The private key is wiped on drop — see the `Drop` impl for exactly how far
+/// that reaches, which is less far than it sounds.
 pub struct Identity {
     key_pair: KeyPair,
+}
+
+impl Drop for Identity {
+    /// Wipe the key material this type owns.
+    ///
+    /// **Partial, deliberately documented as such.** `rcgen`'s `Zeroize` clears
+    /// its `serialized_der` — the PKCS#8 copy straw holds — and nothing else.
+    /// The live signing key inside `KeyPairKind` belongs to *ring*, which does
+    /// not expose a way to wipe it, so that copy outlives this. Clearing the
+    /// DER is still worth doing: it is the copy that gets cloned, re-encoded to
+    /// PEM, and handed across an FFI boundary, and on iOS it is the one that
+    /// would otherwise sit in a reallocated heap block after the tunnel stops.
+    fn drop(&mut self) {
+        self.key_pair.zeroize();
+    }
 }
 
 impl Identity {
@@ -38,8 +57,13 @@ impl Identity {
     }
 
     /// Serialize the private key as PKCS#8 PEM, for persistence.
-    pub fn to_pem(&self) -> String {
-        self.key_pair.serialize_pem()
+    /// The private key as PKCS#8 PEM, wiped when the caller drops it.
+    ///
+    /// `Zeroizing` rather than `String` so persisting an identity cannot leave
+    /// the key in a heap block by accident — the caller has to go out of its
+    /// way to keep a plain copy.
+    pub fn to_pem(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.key_pair.serialize_pem())
     }
 
     /// The X.509 SubjectPublicKeyInfo DER — the public half, as pinned and
