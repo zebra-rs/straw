@@ -14,6 +14,7 @@
 //! layers (design §3–6) build on the two modules here.
 
 pub mod candidates;
+pub mod h3_noq;
 pub mod holepunch;
 pub mod identity;
 pub mod inner_tls;

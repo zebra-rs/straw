@@ -13,6 +13,7 @@ bytes = "1"
 ciborium = "0.2.2"
 clap = { version = "4.6.6", features = ["derive"] }
 dashmap = "6.2.1"
+futures = "0.3.34"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http = "1.5.0"
@@ -26,6 +27,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11"
 thiserror = "2"
 tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
