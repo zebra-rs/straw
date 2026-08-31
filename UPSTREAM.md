@@ -53,8 +53,13 @@ cherry-pick, and a fix written directly against the branch.
 **What lands it.** A **0.11.18 release** carrying both commits. crates.io still
 tops out at 0.11.17 (published 2026-08-17).
 
-**Cost of the pin.** Builds fetch from git, so a first build needs network —
-including `sudo make -C bdd`, which builds under root's `CARGO_HOME`.
+**Cost of the pin.** A first build fetches the repo, so it needs network; after
+that the checkout is cached under the *building user's* `CARGO_HOME` and builds
+are offline again. That cache is per-HOME, so a build run under a different
+identity fetches its own copy — run the BDD suite as
+`sudo -E env PATH="$PATH" make -C bdd`, which keeps `HOME` and reuses this
+user's cache (root has no `~/.cargo` here, and a bare `sudo make` cannot even
+find `cargo`).
 
 **Check:**
 
