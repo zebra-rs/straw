@@ -45,6 +45,9 @@ h3 = { path = "vendor/h3" }
 # accounting; the first overfull send buffer then underflows the counter and
 # every later send_datagram panics ("payload_bytes desynchronized"), killing
 # the tunnel under sustained datagram load (found by the Phase D iperf3 UDP
-# sweep). Vendored with the one-line fix; upstream main has it, no 0.11.x
-# release does. Drop when one ships — see UPSTREAM.md for the check.
-quinn-proto = { path = "vendor/quinn-proto" }
+# sweep). Upstream fixed it on the 0.11.x branch (quinn-rs/quinn#2806), which
+# also carries the black-hole-detector backport (#2799); neither is in a
+# release yet. main is 0.12.0 and cannot be patched in here — quinn 0.11.11
+# requires ^0.11, so cargo would silently ignore the patch. Cargo.lock pins the
+# exact rev. Drop this when 0.11.18 ships — see UPSTREAM.md for the check.
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", branch = "0.11.x" }

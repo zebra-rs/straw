@@ -59,8 +59,11 @@ One QUIC DATAGRAM must carry one whole IP packet, so the largest IP packet the
 tunnel can move is bounded by `max_datagram_size` minus the framing overhead —
 the subject of [The Tunnel MTU](ch-01-04-mtu.md).
 
-## A note on the vendored quinn-proto
+## A note on the patched quinn-proto
 
 Sustained datagram overload once tripped an accounting bug in `quinn-proto` that
-panicked the tunnel. straw vendors `quinn-proto` 0.11.17 with a one-line fix
-(`vendor/quinn-proto`); it will be dropped when a fixed 0.11.x releases upstream.
+panicked the tunnel: the 0.11.17 release subtracts a dropped datagram's length
+from its buffer accounting twice, so the counter underflows and every later
+send panics. straw carried a one-line fix as a vendored copy until upstream
+merged the identical change on its `0.11.x` branch, which `[patch.crates-io]`
+now tracks; the patch goes away when 0.11.18 releases.
