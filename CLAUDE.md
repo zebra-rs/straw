@@ -140,7 +140,20 @@ out a real UDP socket**. Direct-by-default is what lets noq's own NAT-traversal
 probes work — they target candidates the application never sees, so they cannot
 be registered in advance, but they are never a relay-paddr. The dialer presets
 the peer's paddr (its first packet must be tunnelled); the acceptor learns it
-from the packet it answers.
+from the packet it answers — and **only that first source**. A bind session
+serves one peer, so there is exactly one relay remote. That bound is a security
+property: the relay's bind port is public and forwards whatever arrives, so an
+unbounded learned set would let a spoofed source claim the tunnel route, and a
+probe aimed at the peer's own candidate would then ride the relay instead of
+the real socket, capturing the punch. Unit-tested in `relay_socket`.
+
+The **full §10.4 lockdown is still open**: after a direct path is stable the
+peer should register a *compressed* context for its peer and close the
+uncompressed one, so the relay drops all other inbound at the edge. The relay
+half is already built (`udp_bind::socket` firewalls unregistered remotes when
+no uncompressed context is open, and the handler serves
+COMPRESSION_ASSIGN/ACK/CLOSE); what is missing is the peer side — the client
+only ever opens the uncompressed context.
 
 `p2p/native_punch` drives the punch over noq's **NAT-traversal frames**
 (`add_nat_traversal_address` / `initiate_nat_traversal_round`, enabled by
