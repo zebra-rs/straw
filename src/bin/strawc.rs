@@ -188,7 +188,7 @@ async fn run() -> Result<(), ProxyError> {
                 if let Some(sampled) = sender.max_packet_size() {
                     let sampled = u16::try_from(sampled).unwrap_or(u16::MAX);
                     if sampled >= current_mtu.saturating_add(MTU_STEP) {
-                        match iface::ip(&iface::mtu_args(&dev, sampled)) {
+                        match iface::run(&iface::mtu_cmd(&dev, sampled)) {
                             Ok(()) => {
                                 tracing::info!(dev = %dev, from = current_mtu, to = sampled, "tunnel MTU raised");
                                 current_mtu = sampled;

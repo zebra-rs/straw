@@ -39,7 +39,7 @@ pub fn spawn_tun(
 
     // IPv6 has to go on after creation, via ip(8).
     if let Some((addr, prefix)) = cfg.ipv6 {
-        crate::iface::ip(&crate::iface::addr_args(
+        crate::iface::run(&crate::iface::addr_cmd(
             "add",
             &cfg.name,
             std::net::IpAddr::V6(addr),
