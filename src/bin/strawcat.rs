@@ -170,8 +170,7 @@ async fn run() -> Result<(), ProxyError> {
 async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let nat_mapping = report_nat_mapping(&args).await;
     let identity = Arc::new(load_identity(&args.identity)?);
-    let sink = peer_reflexive_sink(&args);
-    let listener = peer::listen(relay_access(&args)?, &identity, None, sink.clone()).await?;
+    let listener = peer::listen(relay_access(&args)?, &identity, None, None).await?;
     let inputs = PunchInputs {
         mux: listener.mux.clone(),
         reflexive: listener.reflexive,
@@ -202,7 +201,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     // noq's established Connection exposes remotes per-Path, not as one address
     // (multipath); the relay peer's address is the listener's advertised paddr.
     eprintln!("peer connected via relay at {}", listener.paddr);
-    let session = Session::start(conn, false, inputs, punch_config(&args, sink, nat_mapping)?);
+    let session = Session::start(conn, false, inputs, punch_config(&args, nat_mapping)?);
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
         return straw::p2p::vpn::run_server(
@@ -228,8 +227,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     if token.is_expired(now()) {
         return Err(ProxyError::InvalidRequest("token has expired".into()));
     }
-    let sink = peer_reflexive_sink(&args);
-    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token, sink.clone()).await?;
+    let peer_conn = peer::connect(relay_access(&args)?, &identity, &token, None).await?;
     eprintln!("connected to peer {} via relay", hex(&token.peer_pin()));
     let inputs = PunchInputs {
         mux: peer_conn.mux.clone(),
@@ -240,7 +238,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
         peer_conn.conn,
         true,
         inputs,
-        punch_config(&args, sink, nat_mapping)?,
+        punch_config(&args, nat_mapping)?,
     );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
@@ -333,7 +331,6 @@ async fn report_nat_mapping(args: &RelayArgs) -> Option<NatMapping> {
 /// `listen` where the bind session is opened. Basic needs neither.
 fn punch_config(
     args: &RelayArgs,
-    peer_reflexive: Option<Arc<Mutex<Vec<std::net::SocketAddr>>>>,
     nat_mapping: Option<NatMapping>,
 ) -> Result<PunchConfig, ProxyError> {
     let relay_access = match args.punch_strategy {
@@ -343,17 +340,10 @@ fn punch_config(
     Ok(PunchConfig {
         strategy: args.punch_strategy,
         relay_access,
-        peer_reflexive,
         port_map: args.port_map,
         direct: args.direct,
         nat_mapping,
     })
-}
-
-/// The shared list the relay-assisted strategy reads and the bind session's
-/// capsule reader fills. Only needed for that strategy.
-fn peer_reflexive_sink(args: &RelayArgs) -> Option<Arc<Mutex<Vec<std::net::SocketAddr>>>> {
-    (args.punch_strategy == PunchStrategy::RelayAssisted).then(|| Arc::new(Mutex::new(Vec::new())))
 }
 
 fn relay_access(args: &RelayArgs) -> Result<RelayAccess, ProxyError> {

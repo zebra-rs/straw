@@ -275,8 +275,14 @@ exactly when its idea is expressible as "this is another address of mine":
 - `birthday` / `relay-assisted` — **not portable, and warn**. Birthday needs
   several sockets to punch from; the mux has one. Relay-assisted needs the
   on-path relay to *observe* the probes, and native probes go out the direct
-  socket and never reach it. Their v1 code and the notes below are kept for
-  whoever revisits this.
+  socket and never reach it. The v1 implementation is **deleted** — the notes
+  below are the record of what it did and why it failed. The relay half of
+  relay-assisted (`--udp-bind-observe`, PEER_REFLEXIVE `0x15`) still exists and
+  still emits; nothing on the peer side consumes it.
+
+The v1 app-level punch modules (`holepunch`, `punch`, `candidates`, `wire`) are
+**gone**. They were unreachable from the moment the punch moved to QUIC frames;
+keeping them implied a fallback that did not exist. Their history is in git.
 - `predict` — sample the NAT by opening a few back-to-back aux bind sessions,
   classify the allocation (`classify`), and for a *sequential* allocator
   advertise a predicted peer-facing port range. Sequential-symmetric NATs only;
