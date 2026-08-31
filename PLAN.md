@@ -229,8 +229,17 @@ server.rs (depends on session, quinn, h3, h3-quinn)
 
 ### Step 33: QUIC-Aware Proxying
 
-- draft-ietf-masque-quic-proxy support
-- Multi-path QUIC integration
+- draft-ietf-masque-quic-proxy support — **scoped, deliberately not started**;
+  see `docs/quic-aware-proxying.md`. The draft has been in WG last call since
+  2025-11 and its IANA section says the capsule codepoints will be replaced
+  before publication; there is no public implementation to interoperate with.
+  The CID-awareness half would be a bounded piece of work when that settles;
+  forwarded mode additionally needs path-validation and migration events that
+  quinn does not expose.
+- Multi-path QUIC integration — the inner P2P connection already runs on noq
+  native multipath (`p2p-direct-path-design.md` §0). Multipath for the *proxy*
+  data plane is untouched, and `bench/BASELINE.md` shows extra connections do
+  not raise throughput, so it is not a performance argument.
 
 ---
 
