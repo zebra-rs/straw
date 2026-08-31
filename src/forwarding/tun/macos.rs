@@ -13,6 +13,10 @@
 //!
 //! The cost of the simplicity is throughput: every packet is its own read
 //! syscall, where Linux amortises a 64 KB aggregate across one.
+//!
+//! IPv4 is configured by the crate at creation; IPv6 goes on afterwards with
+//! `ifconfig(8)`, exactly as on Linux — the difference is only which program
+//! does it (see [`crate::iface`]).
 
 use std::sync::Arc;
 
@@ -31,15 +35,6 @@ pub fn spawn_tun(
     cfg: &TunConfig,
     ingress: impl Fn(Bytes) + Send + 'static,
 ) -> Result<TunChannels, ProxyError> {
-    if cfg.ipv6.is_some() {
-        // The address would have to go on with ifconfig(8) after creation,
-        // which is the iface(4) work, not this. Refuse rather than bring the
-        // device up silently missing its IPv6 address.
-        return Err(ProxyError::Config(
-            "IPv6 on the TUN device is not supported on macOS yet".to_string(),
-        ));
-    }
-
     let mut config = tun::Configuration::default();
     config.mtu(cfg.mtu).up();
     // Only `utun<N>` is a legal utun name. Asking for anything else is not an
@@ -72,6 +67,17 @@ pub fn spawn_tun(
             actual = %name,
             "macOS names utun devices itself; using the assigned name"
         );
+    }
+
+    // IPv6 goes on after creation with ifconfig(8), as on Linux — and against
+    // the name the device actually got, which may not be the requested one.
+    if let Some((addr, prefix)) = cfg.ipv6 {
+        crate::iface::run(&crate::iface::addr_cmd(
+            "add",
+            &name,
+            std::net::IpAddr::V6(addr),
+            prefix,
+        ))?;
     }
 
     let (to_net_tx, mut to_net_rx) = mpsc::channel::<Bytes>(CHANNEL_DEPTH);

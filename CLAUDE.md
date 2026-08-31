@@ -78,13 +78,24 @@ itself). Both satisfy one `spawn_tun` contract and return the device's **actual*
 name in `TunChannels::name` — macOS names utun devices itself unless asked for a
 literal `utun<N>`, so callers must configure by that name, not the requested one.
 
-What is *not* ported: `iface.rs` still shells out to `ip(8)`, so anything that
-adds addresses or routes after device creation (`strawc`, `strawcat --vpn`, and
-IPv6 on the proxy's TUN) is Linux-only; `nat.rs` needs pf rather than iptables.
-`straw` as a relay and `strawcat` in pipe mode need none of that and are clean
-on macOS (check, clippy, fmt, and the unit + integration suites all pass there).
-The netns harnesses — the BDD suite, `scripts/*.sh`, `bench/*.sh` — are Linux-only
-by construction.
+`iface/` is split the same way, because the split is forced: Linux configures
+addresses, routes and MTU all through `ip(8)`, while macOS needs `ifconfig(8)`
+for addresses and MTU and `route(8)` for routes — different programs, different
+verbs (`delete`, not `del`), and a point-to-point address shape. So a command
+there is a `Cmd` (program *and* args), not an argument vector with the program
+implied. IPv4 is configured by the `tun` crate at creation on both platforms;
+IPv6 goes on afterwards through `iface`.
+
+What is *not* ported: `nat.rs`, which needs pf rather than iptables — so
+`--nat-interface` is still Linux-only. The netns harnesses (the BDD suite,
+`scripts/*.sh`, `bench/*.sh`) are Linux-only by construction.
+
+Verification status on macOS is uneven and worth knowing before trusting it:
+device creation and naming are confirmed on a real utun; `route -n get` and the
+`ifconfig` commands are confirmed to parse; the `route` *mutation* commands are
+not, because `route(8)` checks for root before parsing, so an unprivileged run
+cannot tell correct syntax from nonsense. Nothing has been exercised end to end
+there — no macOS equivalent of the BDD suite exists.
 
 ## Privileges
 
