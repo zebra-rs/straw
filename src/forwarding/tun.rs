@@ -13,6 +13,10 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::error::ProxyError;
+// GSO re-segmentation is a Linux concern: it is IFF_VNET_HDR that puts a
+// virtio-net header on every read. macOS utun has no such header (and no TSO),
+// so its pump reads plain IP packets and never needs these.
+#[cfg(target_os = "linux")]
 use crate::forwarding::vnet::{self, VNET_HDR_LEN, VnetHdr};
 
 /// Configuration for the kernel TUN device.
