@@ -76,7 +76,9 @@ proxy-side stays on Linux, where the BDD suite and the netns harnesses already
 test it. What macOS has to do is be a good client — `strawc`, `strawcat`, and
 the P2P direct path — and that is what the platform work covers.
 
-The TUN datapath is split per platform in
+A NetworkExtension port (iOS, iPadOS, and a macOS app beside the CLI) is
+planned; `network-extension-design.md` has the design, what is already proven,
+and what it will cost. The TUN datapath is split per platform in
 `src/forwarding/tun/`: `linux.rs` uses `IFF_VNET_HDR` with TSO/GSO and
 re-segments aggregates through `forwarding/vnet.rs`; `macos.rs` drives utun,
 which has neither a virtio-net header nor TSO, so it reads one plain IP packet
