@@ -247,6 +247,6 @@ server.rs (depends on session, quinn, h3, h3-quinn)
 
 1. **h3 crate API instability** — pre-1.0, Extended CONNECT and DATAGRAM APIs may be incomplete. May need to fork or use lower-level quinn APIs.
 2. **DATAGRAM demuxing** — QUIC DATAGRAMs are connection-level; Quarter Stream ID maps to H3 streams. Verify h3 exposes this or implement manually.
-3. **TUN portability** — done for Linux and macOS: `forwarding/tun/` splits per platform behind one `spawn_tun` contract. What remains for a usable macOS client is `iface.rs` (ifconfig/route instead of ip(8)) and, for the proxy, pf instead of iptables.
+3. **TUN portability** — resolved. `forwarding/tun/` and `iface/` both split per platform, so macOS runs the client (utun, ifconfig, route). The proxy stays on Linux by deployment choice, so pf/NAT is out of scope rather than pending.
 4. **Root privileges** — TUN creation needs CAP_NET_ADMIN. Document and consider fd-passing.
 5. **MTU calculation** — Tunnel MTU = QUIC max_datagram_size − overhead. Must be ≥ 1280 for IPv6. Validate at session setup.

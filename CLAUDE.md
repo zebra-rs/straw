@@ -69,7 +69,14 @@ step fails the scenario rather than being skipped.
 
 ## Platforms
 
-Linux is the primary target. The TUN datapath is split per platform in
+**Linux runs the proxy; macOS runs the client.** That is a deployment decision,
+not a gap: `straw --tun --nat-interface` masquerades with iptables, and porting
+that to pf is deliberately *not* planned, because nothing needs it. Anything
+proxy-side stays on Linux, where the BDD suite and the netns harnesses already
+test it. What macOS has to do is be a good client — `strawc`, `strawcat`, and
+the P2P direct path — and that is what the platform work covers.
+
+The TUN datapath is split per platform in
 `src/forwarding/tun/`: `linux.rs` uses `IFF_VNET_HDR` with TSO/GSO and
 re-segments aggregates through `forwarding/vnet.rs`; `macos.rs` drives utun,
 which has neither a virtio-net header nor TSO, so it reads one plain IP packet
@@ -86,9 +93,10 @@ there is a `Cmd` (program *and* args), not an argument vector with the program
 implied. IPv4 is configured by the `tun` crate at creation on both platforms;
 IPv6 goes on afterwards through `iface`.
 
-What is *not* ported: `nat.rs`, which needs pf rather than iptables — so
-`--nat-interface` is still Linux-only. The netns harnesses (the BDD suite,
-`scripts/*.sh`, `bench/*.sh`) are Linux-only by construction.
+`nat.rs` is Linux-only and stays that way, per the deployment decision above;
+`--nat-interface` on macOS fails with a message that says where to run the
+proxy instead. The netns harnesses (the BDD suite, `scripts/*.sh`,
+`bench/*.sh`) are Linux-only by construction.
 
 Verification status on macOS is uneven and worth knowing before trusting it:
 device creation and naming are confirmed on a real utun; `route -n get` and the
