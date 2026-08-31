@@ -68,16 +68,24 @@ pub struct PeerConnection {
 /// Transport config for inner QUIC that runs *inside* the relay's bind
 /// datagrams. Each inner packet is re-encapsulated as one outer QUIC DATAGRAM,
 /// so the inner MTU must never exceed what a single outer datagram carries.
-/// quinn's own path-MTU discovery would probe upward (e.g. to ~1420) and those
+/// noq's own path-MTU discovery would probe upward (e.g. to ~1420) and those
 /// oversize packets fail `send_datagram`, stalling the connection after the
-/// handshake. Pin the inner MTU at quinn's 1200-byte floor and disable
-/// discovery so inner packets always fit; a keepalive holds the idle pipe open.
+/// handshake. Pin the inner MTU at the 1200-byte floor and disable discovery so
+/// inner packets always fit; a keepalive holds the idle pipe open.
+///
+/// **Multipath is enabled** (Stage 3): the connection starts on the relay path
+/// and can add a direct path (`Connection::open_path`) that noq migrates to
+/// natively, replacing the app-level second-connection race. The MTU pin is a
+/// per-path property that stays with the relay path; a direct path over a real
+/// socket runs its own discovery.
 fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
     let mut t = noq::TransportConfig::default();
     t.mtu_discovery_config(None);
     t.initial_mtu(1200);
     t.min_mtu(1200);
     t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    // Allow a relay path + a direct path on one connection (Stage 3).
+    t.max_concurrent_multipath_paths(8);
     std::sync::Arc::new(t)
 }
 
