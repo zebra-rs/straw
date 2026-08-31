@@ -182,8 +182,9 @@ pub async fn handle_connection(
                             let peer_cert = quinn_conn
                                 .peer_identity()
                                 .and_then(|any| {
-                                    any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                                        .ok()
+                                    any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>(
+                                    )
+                                    .ok()
                                 })
                                 .and_then(|certs| certs.first().cloned());
                             crate::session::handler::handle_connect_ip_stream(

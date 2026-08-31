@@ -112,8 +112,14 @@ impl ClientStream {
     }
     async fn recv_data(&mut self) -> Result<Option<Bytes>, ProxyError> {
         Ok(match self {
-            ClientStream::Quinn(s) => s.recv_data().await?.map(|mut b| b.copy_to_bytes(b.remaining())),
-            ClientStream::Noq(s) => s.recv_data().await?.map(|mut b| b.copy_to_bytes(b.remaining())),
+            ClientStream::Quinn(s) => s
+                .recv_data()
+                .await?
+                .map(|mut b| b.copy_to_bytes(b.remaining())),
+            ClientStream::Noq(s) => s
+                .recv_data()
+                .await?
+                .map(|mut b| b.copy_to_bytes(b.remaining())),
         })
     }
     async fn send_data(&mut self, data: Bytes) -> Result<(), ProxyError> {
@@ -1017,7 +1023,9 @@ impl BindClient {
         self,
         peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
     ) -> crate::p2p::relay_socket::RelaySocket {
-        crate::p2p::relay_socket::RelaySocket::from_parts(self.into_relay_parts(peer_reflexive_sink))
+        crate::p2p::relay_socket::RelaySocket::from_parts(
+            self.into_relay_parts(peer_reflexive_sink),
+        )
     }
 }
 

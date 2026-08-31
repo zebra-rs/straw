@@ -39,6 +39,7 @@ use crate::p2p::native_punch;
 use crate::p2p::peer::RelayAccess;
 use crate::p2p::relay_socket::PathMuxHandle;
 use crate::p2p::strategy::{DirectMode, PunchStrategy};
+use crate::p2p::stun::NatMapping;
 
 /// How long one punch attempt may run before falling back to the relay.
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -78,6 +79,33 @@ pub struct PunchConfig {
     pub port_map: bool,
     /// Which candidate kinds to offer, and whether to punch at all (§10.3).
     pub direct: DirectMode,
+    /// The NAT's mapping behaviour if `--stun-detect` measured it beforehand
+    /// (RFC 5780). A verdict that no configured mechanism can traverse lets the
+    /// session skip a punch it already knows will fail.
+    pub nat_mapping: Option<NatMapping>,
+}
+
+/// Whether a measured NAT verdict rules out every mechanism this session has.
+///
+/// A symmetric mapping defeats the *reflexive* candidate, because the port the
+/// relay observed is not the port the peer will see. It does not defeat
+/// everything, so this only reports futility when nothing else is in play:
+///
+/// - `--port-map` installs an explicit forward, which holds whatever the
+///   mapping behaviour is;
+/// - `--punch-strategy predict` targets sequential-symmetric NATs specifically;
+/// - `--direct=full` offers a host candidate, and a peer on the same LAN is
+///   reachable without traversing the NAT at all.
+///
+/// Returns false when no measurement was taken — never skip on a guess.
+fn punch_is_futile(cfg: &PunchConfig) -> bool {
+    let Some(mapping) = cfg.nat_mapping else {
+        return false;
+    };
+    !mapping.is_punchable()
+        && !cfg.port_map
+        && cfg.strategy != PunchStrategy::Predict
+        && !cfg.direct.offers_host()
 }
 
 /// What the punch driver needs about this peer's own addresses.
@@ -201,6 +229,19 @@ async fn manage(
     }
     if !cfg.direct.punches() {
         tracing::info!("--direct=off: pinned to the relay path, not punching");
+        let _ = conn.closed().await;
+        return;
+    }
+    if punch_is_futile(&cfg) {
+        // Measured, not assumed: --stun-detect classified this NAT and nothing
+        // configured can traverse it. Probing anyway would spend the punch
+        // window and a few dozen packets to learn what is already known.
+        tracing::info!(
+            mapping = cfg.nat_mapping.map(|m| m.as_str()),
+            "NAT mapping defeats the reflexive candidate and no other mechanism \
+             is enabled; staying on the relay (try --port-map, --punch-strategy \
+             predict, or --direct=full)"
+        );
         let _ = conn.closed().await;
         return;
     }
@@ -353,5 +394,69 @@ fn warn_unsupported_strategy(strategy: PunchStrategy) {
             "strategy does not port to native NAT traversal; using the basic punch \
              (use --port-map, or --punch-strategy predict for a sequential NAT)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symmetric() -> PunchConfig {
+        PunchConfig {
+            nat_mapping: Some(NatMapping::AddressAndPortDependent),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_nat_is_never_assumed_futile() {
+        // No --stun-detect: punch and find out. Skipping on a guess would turn
+        // a working direct path into a permanent relay session.
+        assert!(!punch_is_futile(&PunchConfig::default()));
+    }
+
+    #[test]
+    fn a_punchable_nat_is_never_futile() {
+        for mapping in [NatMapping::Open, NatMapping::EndpointIndependent] {
+            let cfg = PunchConfig {
+                nat_mapping: Some(mapping),
+                ..Default::default()
+            };
+            assert!(!punch_is_futile(&cfg), "{mapping:?} is punchable");
+        }
+    }
+
+    #[test]
+    fn a_symmetric_nat_is_futile_only_when_nothing_else_can_help() {
+        // Bare symmetric: the reflexive candidate is wrong and nothing else is
+        // enabled, so probing would only burn the punch window.
+        assert!(punch_is_futile(&symmetric()));
+
+        // Each of these targets the symmetric case in its own way, so the
+        // verdict no longer rules the punch out.
+        assert!(!punch_is_futile(&PunchConfig {
+            port_map: true,
+            ..symmetric()
+        }));
+        assert!(!punch_is_futile(&PunchConfig {
+            strategy: PunchStrategy::Predict,
+            ..symmetric()
+        }));
+        assert!(!punch_is_futile(&PunchConfig {
+            direct: DirectMode::Full,
+            ..symmetric()
+        }));
+    }
+
+    #[test]
+    fn address_dependent_filtering_still_counts_as_unpunchable_mapping() {
+        // RFC 5780 separates mapping from filtering; is_punchable() reports on
+        // the mapping, and anything past endpoint-independent breaks the
+        // reflexive candidate.
+        let cfg = PunchConfig {
+            nat_mapping: Some(NatMapping::AddressDependent),
+            ..Default::default()
+        };
+        assert!(punch_is_futile(&cfg));
     }
 }

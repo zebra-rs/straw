@@ -44,7 +44,11 @@ impl DatagramConn for quinn::Connection {
         quinn::Connection::max_datagram_size(self)
     }
     fn close(&self, code: u64, reason: &[u8]) {
-        quinn::Connection::close(self, quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX), reason);
+        quinn::Connection::close(
+            self,
+            quinn::VarInt::from_u64(code).unwrap_or(quinn::VarInt::MAX),
+            reason,
+        );
     }
 }
 
@@ -57,7 +61,11 @@ impl DatagramConn for noq::Connection {
         noq::Connection::max_datagram_size(self)
     }
     fn close(&self, code: u64, reason: &[u8]) {
-        noq::Connection::close(self, noq::VarInt::from_u64(code).unwrap_or(noq::VarInt::MAX), reason);
+        noq::Connection::close(
+            self,
+            noq::VarInt::from_u64(code).unwrap_or(noq::VarInt::MAX),
+            reason,
+        );
     }
 }
 
