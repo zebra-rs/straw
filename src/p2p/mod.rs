@@ -18,6 +18,7 @@ pub mod h3_noq;
 pub mod holepunch;
 pub mod identity;
 pub mod inner_tls;
+pub mod native_punch;
 pub mod peer;
 pub mod portmap;
 pub mod punch;
