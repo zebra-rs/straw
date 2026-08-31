@@ -28,6 +28,8 @@ use crate::datagram::{
     CONTEXT_ID_IP_PACKET, IpProxyingDatagram, decode_quic_datagram, encode_quic_datagram,
     max_ip_packet_size, quarter_stream_id,
 };
+use zeroize::Zeroizing;
+
 use crate::error::ProxyError;
 use crate::tls;
 
@@ -41,16 +43,21 @@ pub enum TlsMode {
     Mtls {
         ca: CertificateDer<'static>,
         cert_chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        /// Wrapped so it is wiped when dropped rather than abandoned on the
+        /// heap. This is not theoretical: `TlsMode` is `Clone`, and
+        /// `RelayAccess` clones it for every auxiliary bind session the
+        /// `predict` strategy opens, so an unwrapped key would leave one
+        /// discarded copy per sample. The copy handed to rustls at connect
+        /// time is rustls's to manage.
+        key: Zeroizing<PrivateKeyDer<'static>>,
     },
 }
 
-/// Manual `Clone`: `PrivateKeyDer` is not `Clone`, so rebuild it from its DER
-/// bytes. Lets a shared `RelayAccess` reconnect auxiliary bind sessions
-/// (predict/birthday NAT sampling).
+/// Manual `Clone`: `PrivateKeyDer` is not `Clone`, so the key is deep-copied
+/// with `clone_key`. Lets a shared `RelayAccess` reconnect auxiliary bind
+/// sessions (predict NAT sampling).
 impl Clone for TlsMode {
     fn clone(&self) -> Self {
-        use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
         match self {
             TlsMode::Insecure => TlsMode::Insecure,
             TlsMode::Ca(c) => TlsMode::Ca(c.clone()),
@@ -58,31 +65,17 @@ impl Clone for TlsMode {
                 ca,
                 cert_chain,
                 key,
-            } => {
-                let key: PrivateKeyDer<'static> = match key {
-                    PrivateKeyDer::Pkcs1(k) => {
-                        PrivatePkcs1KeyDer::from(k.secret_pkcs1_der().to_vec()).into()
-                    }
-                    PrivateKeyDer::Pkcs8(k) => {
-                        PrivatePkcs8KeyDer::from(k.secret_pkcs8_der().to_vec()).into()
-                    }
-                    PrivateKeyDer::Sec1(k) => {
-                        PrivateSec1KeyDer::from(k.secret_sec1_der().to_vec()).into()
-                    }
-                    _ => unreachable!("PrivateKeyDer variant is exhaustive here"),
-                };
-                TlsMode::Mtls {
-                    ca: ca.clone(),
-                    cert_chain: cert_chain.clone(),
-                    key,
-                }
-            }
+            } => TlsMode::Mtls {
+                ca: ca.clone(),
+                cert_chain: cert_chain.clone(),
+                key: Zeroizing::new(key.clone_key()),
+            },
         }
     }
 }
 
 /// Request-level credentials sent with the Extended CONNECT.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum ClientAuth {
     #[default]
     None,
@@ -91,6 +84,22 @@ pub enum ClientAuth {
         user: String,
         password: String,
     },
+}
+
+/// Hand-written so credentials cannot reach a log through `{:?}`.
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientAuth::None => f.write_str("None"),
+            ClientAuth::Bearer(_) => f.write_str("Bearer(<redacted>)"),
+            // The user is not a secret; the password is.
+            ClientAuth::Basic { user, .. } => f
+                .debug_struct("Basic")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 type DatagramDemux = Arc<DashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>;
@@ -529,7 +538,9 @@ impl TunnelClient {
                 ca,
                 cert_chain,
                 key,
-            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
+                // rustls takes ownership of the key; hand it a copy so the
+                // wrapped original is still wiped when this scope ends.
+            } => tls::build_client_tls_config_mtls(ca, cert_chain, key.clone_key())?,
         };
         let quic_tls =
             QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
@@ -772,7 +783,9 @@ impl BindClient {
                 ca,
                 cert_chain,
                 key,
-            } => tls::build_client_tls_config_mtls(ca, cert_chain, key)?,
+                // rustls takes ownership of the key; hand it a copy so the
+                // wrapped original is still wiped when this scope ends.
+            } => tls::build_client_tls_config_mtls(ca, cert_chain, key.clone_key())?,
         };
         let quic_tls =
             QuicClientConfig::try_from(tls_config).map_err(|e| ProxyError::Tls(e.to_string()))?;
@@ -1058,5 +1071,29 @@ fn apply_auth(builder: http::request::Builder, auth: &ClientAuth) -> http::reque
                 base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
             builder.header(http::header::AUTHORIZATION, format!("Basic {encoded}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientAuth;
+
+    /// Credentials must not be printable: `Debug` is the leak that costs
+    /// nothing to introduce -- one `tracing::debug!(?auth)`.
+    #[test]
+    fn client_auth_debug_redacts_credentials() {
+        let bearer = format!("{:?}", ClientAuth::Bearer("s3cret-token".into()));
+        assert!(!bearer.contains("s3cret-token"), "{bearer}");
+
+        let basic = format!(
+            "{:?}",
+            ClientAuth::Basic {
+                user: "alice".into(),
+                password: "s3cret-password".into(),
+            }
+        );
+        assert!(!basic.contains("s3cret-password"), "{basic}");
+        // The username is not a secret and stays legible.
+        assert!(basic.contains("alice"), "{basic}");
     }
 }
