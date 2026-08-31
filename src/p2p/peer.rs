@@ -112,10 +112,13 @@ fn relay_transport() -> std::sync::Arc<noq::TransportConfig> {
     std::sync::Arc::new(t)
 }
 
-/// How many candidate addresses each side may advertise to the other. A peer
-/// offers its reflexive candidate and, with `--port-map`, a mapped one; the
-/// headroom covers host candidates and future strategies.
-pub const MAX_NAT_ADDRESSES: u8 = 8;
+/// How many candidate addresses each side may advertise to the other.
+///
+/// The ordinary case needs two or three (reflexive, host, port-mapped), but
+/// `--punch-strategy predict` offers a *window* of predicted ports — a couple
+/// of dozen — so the cap has to clear that. It is only a ceiling on what the
+/// peer may claim; unused slots cost nothing.
+pub const MAX_NAT_ADDRESSES: u8 = 32;
 
 /// The pinned inner MTU. Every relay-path packet is re-wrapped as one outer
 /// QUIC DATAGRAM, so this must fit inside one — and it is the QUIC floor, the

@@ -221,7 +221,9 @@ async fn manage(
             .then(|| native_punch::host_ip(inputs.relay_addr))
             .flatten(),
     };
-    let local = native_punch::candidates(&inputs.mux, sources);
+    let mut local = native_punch::candidates(&inputs.mux, sources);
+    local.extend(predicted_candidates(&cfg).await);
+    local.truncate(crate::p2p::peer::MAX_NAT_ADDRESSES as usize);
     if local.is_empty() {
         tracing::info!("no direct-path candidate for this peer; staying on the relay path");
         let _ = conn.closed().await;
@@ -321,18 +323,35 @@ async fn request_port_map(port: u16) -> Option<crate::p2p::portmap::Mapping> {
     }
 }
 
-/// The symmetric-NAT strategies were built on the v1 app-level punch, which
-/// dialled extra addresses from extra sockets. Native traversal exchanges
-/// candidates at the QUIC layer instead, where a peer can only advertise its
-/// *own* addresses — so scanning a predicted port range, punching from several
-/// sockets, or injecting a source the relay observed for the *other* peer have
-/// no equivalent yet. Say so rather than silently doing something else.
+/// `predict` samples this peer's NAT and, for a sequential allocator, offers
+/// the port it will use toward the peer. It ports to native traversal because
+/// a prediction is a claim about *this peer's own* address, which is what the
+/// frames carry. Best-effort: a random allocator offers nothing.
+async fn predicted_candidates(cfg: &PunchConfig) -> Vec<SocketAddr> {
+    if cfg.strategy != PunchStrategy::Predict {
+        return Vec::new();
+    }
+    let Some(relay) = &cfg.relay_access else {
+        tracing::warn!("--punch-strategy predict needs relay access to sample the NAT");
+        return Vec::new();
+    };
+    crate::p2p::predict::predicted_candidates(relay).await
+}
+
+/// The other two symmetric-NAT strategies do *not* port to native traversal,
+/// because the frame exchange carries only a peer's own addresses: `birthday`
+/// needs several sockets to punch from, and `relay-assisted` needs the relay to
+/// observe the probes, which now go out the direct socket and never reach it.
+/// Say so rather than silently doing something else.
 fn warn_unsupported_strategy(strategy: PunchStrategy) {
-    if strategy != PunchStrategy::Basic {
+    if matches!(
+        strategy,
+        PunchStrategy::Birthday | PunchStrategy::RelayAssisted
+    ) {
         tracing::warn!(
             ?strategy,
-            "strategy not yet ported to native NAT traversal; using the basic punch \
-             (use --port-map for a symmetric NAT)"
+            "strategy does not port to native NAT traversal; using the basic punch \
+             (use --port-map, or --punch-strategy predict for a sequential NAT)"
         );
     }
 }

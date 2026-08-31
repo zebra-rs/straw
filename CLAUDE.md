@@ -263,14 +263,20 @@ crosses the double NAT both ways:
 
 So real cone NATs (most home routers) punch with the reflexive candidate alone.
 
-**Symmetric-NAT strategies are NOT ported to the native punch.**
-`--punch-strategy` other than `basic` logs a warning and punches basically.
-They worked by dialling extra addresses from extra sockets, and the frame
-exchange only carries a peer's *own* candidates — a peer cannot inject a
-predicted port range, a scan window, or a source the relay observed for the
-*other* peer. `--port-map` is orthogonal and unaffected. The v1 code and the
-notes below are kept for whoever revisits this:
+**Of the symmetric-NAT strategies, only `predict` ported to the native punch.**
+The frame exchange carries a peer's *own* addresses, so a strategy survives
+exactly when its idea is expressible as "this is another address of mine":
 - `basic` (default) — advertise the reflexive candidate; cone NATs.
+- `predict` — **live** (`p2p::predict`, wired in `session::predicted_candidates`).
+  Samples the NAT with a few back-to-back aux bind sessions, classifies the
+  allocation, and for a *sequential* allocator advertises the port it will use
+  toward the peer plus a ±6 window. That is a claim about its own address, so
+  the frames carry it. `MAX_NAT_ADDRESSES` is 32 to leave room for the window.
+- `birthday` / `relay-assisted` — **not portable, and warn**. Birthday needs
+  several sockets to punch from; the mux has one. Relay-assisted needs the
+  on-path relay to *observe* the probes, and native probes go out the direct
+  socket and never reach it. Their v1 code and the notes below are kept for
+  whoever revisits this.
 - `predict` — sample the NAT by opening a few back-to-back aux bind sessions,
   classify the allocation (`classify`), and for a *sequential* allocator
   advertise a predicted peer-facing port range. Sequential-symmetric NATs only;

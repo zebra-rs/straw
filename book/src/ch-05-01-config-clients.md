@@ -43,7 +43,7 @@ writes a persistent identity (PKCS#8 PEM) to stdout and its pin to stderr.
 | Flag | Meaning |
 |------|---------|
 | `--punch-wait <secs>` | How long to wait for a direct path before using the relay. |
-| `--punch-strategy <basic\|predict\|birthday\|relay-assisted>` | The NAT-traversal strategy. Only `basic` is live — the others warn and fall back to it (see [Symmetric NAT Traversal](ch-03-04-symmetric-nat.md)). |
+| `--punch-strategy <basic\|predict\|birthday\|relay-assisted>` | The NAT-traversal strategy. `basic` and `predict` are live; `birthday` and `relay-assisted` warn and fall back to `basic` (see [Symmetric NAT Traversal](ch-03-04-symmetric-nat.md)). |
 | `--direct <reflexive\|full\|off>` | Which candidates to offer the peer: the public address (default), also the LAN address (`full`, for same-LAN peers), or none at all (`off`, pinning the session to the relay). |
 | `--port-map` | Ask the router (PCP / NAT-PMP) for an explicit forward and advertise it. |
 | `--stun-detect <server>` | Classify the NAT (RFC 5780) first and report the class. |
