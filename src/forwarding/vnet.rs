@@ -66,11 +66,11 @@ pub const fn encode_none() -> [u8; VNET_HDR_LEN] {
 fn internet_checksum(seed: u32, parts: &[&[u8]]) -> u16 {
     let mut sum = seed;
     for part in parts {
-        let mut chunks = part.chunks_exact(2);
-        for c in &mut chunks {
-            sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+        let (pairs, rest) = part.as_chunks::<2>();
+        for pair in pairs {
+            sum += u32::from(u16::from_be_bytes(*pair));
         }
-        if let [last] = chunks.remainder() {
+        if let [last] = rest {
             sum += u32::from(u16::from_be_bytes([*last, 0]));
         }
     }
@@ -86,14 +86,14 @@ fn pseudo_sum(ip_hdr: &[u8], l4_len: usize) -> u32 {
     let mut sum: u32 = 0;
     match ip_hdr[0] >> 4 {
         4 => {
-            for c in ip_hdr[12..20].chunks_exact(2) {
-                sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+            for pair in ip_hdr[12..20].as_chunks::<2>().0 {
+                sum += u32::from(u16::from_be_bytes(*pair));
             }
             sum += u32::from(ip_hdr[9]); // protocol
         }
         _ => {
-            for c in ip_hdr[8..40].chunks_exact(2) {
-                sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+            for pair in ip_hdr[8..40].as_chunks::<2>().0 {
+                sum += u32::from(u16::from_be_bytes(*pair));
             }
             sum += u32::from(ip_hdr[6]); // next header
         }

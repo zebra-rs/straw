@@ -171,7 +171,7 @@ mod tests {
             (&[0x25], 37),
         ];
         for &(encoded, expected) in cases {
-            let mut cursor = &encoded[..];
+            let mut cursor = encoded;
             let decoded = read_varint(&mut cursor).unwrap();
             assert_eq!(decoded, expected);
 

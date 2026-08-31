@@ -201,11 +201,11 @@ fn recompute_ipv4_checksum(packet: &mut [u8]) {
 /// Internet checksum (RFC 1071) over a byte slice.
 pub fn ipv4_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (pairs, rest) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
     while sum > 0xffff {

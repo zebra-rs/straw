@@ -1312,7 +1312,10 @@ async fn inner_quic_mutual_raw_public_key_pinning() {
         Some(id_a.pin()),
         "B learned A's key (TOFU)"
     );
-    assert_eq!(conn_a.peer_identity().is_some(), true);
+    assert!(
+        conn_a.peer_identity().is_some(),
+        "the peer authenticated with a raw public key"
+    );
 
     // The pipe carries a stream.
     let (mut send, _recv) = conn_a.open_bi().await.unwrap();
