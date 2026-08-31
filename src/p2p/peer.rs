@@ -193,12 +193,6 @@ pub async fn listen(
     relay: RelayAccess,
     identity: &Identity,
     expected_peer: Option<SpkiPin>,
-    // Where to deliver PEER_REFLEXIVE capsules if the relay runs the on-path
-    // observer (`--udp-bind-observe`). No punch strategy consumes them since
-    // the move to native traversal — the probes no longer pass through the
-    // relay for it to observe — so callers pass `None`; the receiving end is
-    // kept because the relay-side feature still exists.
-    peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<Listener, ProxyError> {
     let bind = BindClient::connect(relay.addr, &relay.server_name, relay.tls, relay.auth).await?;
     log_mtu_headroom(bind.connection());
@@ -213,13 +207,8 @@ pub async fn listen(
     let direct = direct_socket(paddr).await?;
     // No relay peer to preset: the dialer's paddr is learned from the packet
     // this endpoint answers.
-    let (endpoint, mux) = mux_endpoint(
-        bind.into_relay_parts(peer_reflexive_sink),
-        direct,
-        Some(quic),
-        None,
-    )
-    .map_err(|e| ProxyError::Quic(e.to_string()))?;
+    let (endpoint, mux) = mux_endpoint(bind.into_relay_parts(), direct, Some(quic), None)
+        .map_err(|e| ProxyError::Quic(e.to_string()))?;
     Ok(Listener {
         paddr,
         reflexive,
@@ -235,12 +224,6 @@ pub async fn connect(
     relay: RelayAccess,
     identity: &Identity,
     token: &TokenV2,
-    // Where to deliver PEER_REFLEXIVE capsules if the relay runs the on-path
-    // observer (`--udp-bind-observe`). No punch strategy consumes them since
-    // the move to native traversal — the probes no longer pass through the
-    // relay for it to observe — so callers pass `None`; the receiving end is
-    // kept because the relay-side feature still exists.
-    peer_reflexive_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>>,
 ) -> Result<PeerConnection, ProxyError> {
     let issuer: SocketAddr = token
         .paddr
@@ -261,13 +244,8 @@ pub async fn connect(
     quic.transport_config(relay_transport());
     let direct = direct_socket(relay_paddr).await?;
     // The issuer's paddr must be tunnelled from the very first packet.
-    let (endpoint, mux) = mux_endpoint(
-        bind.into_relay_parts(peer_reflexive_sink),
-        direct,
-        None,
-        Some(issuer),
-    )
-    .map_err(|e| ProxyError::Quic(e.to_string()))?;
+    let (endpoint, mux) = mux_endpoint(bind.into_relay_parts(), direct, None, Some(issuer))
+        .map_err(|e| ProxyError::Quic(e.to_string()))?;
     let conn = endpoint
         .connect_with(quic, issuer, "peer")
         .map_err(|e| ProxyError::Quic(e.to_string()))?

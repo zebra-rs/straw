@@ -31,7 +31,7 @@ use crate::error::DecodeError;
 // resolving and the v2 standards swap (design §9) is a one-file edit.
 pub use crate::codepoints::{
     CAPSULE_COMPRESSION_ACK, CAPSULE_COMPRESSION_ASSIGN, CAPSULE_COMPRESSION_CLOSE,
-    CAPSULE_OBSERVED_ADDRESS, CAPSULE_PEER_REFLEXIVE,
+    CAPSULE_OBSERVED_ADDRESS,
 };
 
 /// The first client-allocated (even) context id (design §3.1).
@@ -119,20 +119,6 @@ pub fn decode_observed_address(mut body: Bytes) -> Result<SocketAddr, DecodeErro
         return Err(DecodeError::TrailingBytes(body.remaining()));
     }
     Ok(addr)
-}
-
-/// Encode a PEER_REFLEXIVE capsule carrying the other peer's observed source.
-pub fn encode_peer_reflexive(addr: SocketAddr, buf: &mut BytesMut) {
-    let mut body = BytesMut::new();
-    put_addr(&mut body, addr);
-    write_varint(buf, CAPSULE_PEER_REFLEXIVE).unwrap();
-    write_varint(buf, body.len() as u64).unwrap();
-    buf.extend_from_slice(&body);
-}
-
-/// Decode a PEER_REFLEXIVE capsule body (same address format as OBSERVED).
-pub fn decode_peer_reflexive(body: Bytes) -> Result<SocketAddr, DecodeError> {
-    decode_observed_address(body)
 }
 
 /// One HTTP Datagram body on a bind session: a remote and its UDP payload.

@@ -1,5 +1,15 @@
 # Symmetric NAT traversal in straw
 
+> **Status (2026-08-31): `relay-assisted` and `birthday` have no implementation.**
+> The peer halves went with the v1 app-level punch when candidate exchange moved
+> to QUIC NAT-traversal frames; relay-assisted's relay half — the `AF_PACKET`
+> observer, the `--udp-bind-observe` flag and the `PEER_REFLEXIVE` (`0x15`)
+> capsule — was retired afterwards, since nothing could consume what it emitted
+> and leaving it implied a capability that did not exist. Both names are still
+> accepted on `--punch-strategy`, warn, and fall back to `basic`. Everything
+> below is kept as the record of what was built and why it did not converge;
+> the code is in git history. `predict` is live.
+
 Technical notes on hole punching between two `strawcat` peers, why the easy
 cases work, why symmetric↔symmetric is the hard/unsolved case, and what each of
 straw's four punch strategies does about it. Companion to

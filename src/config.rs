@@ -143,12 +143,6 @@ pub struct ProxyConfig {
     #[arg(long, value_delimiter = ',')]
     pub udp_bind_allow_dest: Vec<IpNet>,
 
-    /// Relay-assisted hole punching: observe forwarded punch packets (needs
-    /// CAP_NET_RAW) and signal each peer the other's peer-facing source, so
-    /// symmetric NATs can be traversed when the relay is on the path (§12).
-    #[arg(long)]
-    pub udp_bind_observe: bool,
-
     /// Primary address of the RFC 5780 STUN server (NAT behaviour discovery).
     /// Enabled together with --stun-alt-addr (a different IP *and* port).
     #[arg(long)]
@@ -193,7 +187,6 @@ impl Default for ProxyConfig {
             udp_bind_max_pps: 0,
             udp_bind_max_bps: 0,
             udp_bind_allow_dest: Vec::new(),
-            udp_bind_observe: false,
             stun_addr: None,
             stun_alt_addr: None,
         }
@@ -363,7 +356,6 @@ fn overlay_cli(config: &mut ProxyConfig, cli: ProxyConfig, matches: &clap::ArgMa
         udp_bind_max_pps,
         udp_bind_max_bps,
         udp_bind_allow_dest,
-        udp_bind_observe,
         stun_addr,
         stun_alt_addr,
     );

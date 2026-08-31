@@ -388,8 +388,11 @@ fn warn_unsupported_strategy(strategy: PunchStrategy) {
     ) {
         tracing::warn!(
             ?strategy,
-            "strategy does not port to native NAT traversal; using the basic punch \
-             (use --port-map, or --punch-strategy predict for a sequential NAT)"
+            "strategy has no implementation — birthday needs several punch sockets \
+             and the mux has one; relay-assisted's on-path observer was removed \
+             when the punch moved to QUIC frames, since probes no longer traverse \
+             the relay. Using the basic punch (see --port-map, or \
+             --punch-strategy predict for a sequential NAT)"
         );
     }
 }

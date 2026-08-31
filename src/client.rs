@@ -11,7 +11,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -938,15 +938,9 @@ impl BindClient {
         self._endpoint.clone()
     }
 
-    pub(crate) fn into_relay_parts(
-        self,
-        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> crate::p2p::relay_socket::RelayParts {
-        use crate::capsule::Capsule;
+    pub(crate) fn into_relay_parts(self) -> crate::p2p::relay_socket::RelayParts {
         use crate::capsule::codec::read_varint;
-        use crate::udp_bind::context::{
-            CAPSULE_PEER_REFLEXIVE, decode_peer_reflexive, decode_uncompressed_body,
-        };
+        use crate::udp_bind::context::decode_uncompressed_body;
 
         let BindClient {
             _endpoint,
@@ -962,12 +956,11 @@ impl BindClient {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let conn_rx = conn.clone();
         let recv = tokio::spawn(async move {
-            // Hold the session's resources open for the socket's lifetime and
-            // serve two streams: inner-QUIC datagrams (to the relay socket) and
-            // control capsules (relay-assisted PEER_REFLEXIVE signals).
+            // Hold the session's resources open for the socket's lifetime,
+            // deliver inner-QUIC datagrams to the relay socket, and notice when
+            // the capsule stream ends — that is how the session reports closure.
             let _endpoint = _endpoint;
             let _send_request = _send_request;
-            let mut capsules = crate::capsule::CapsuleBuffer::new();
             loop {
                 tokio::select! {
                     dg = conn_rx.read_datagram() => {
@@ -984,23 +977,9 @@ impl BindClient {
                     }
                     data = stream.recv_data() => {
                         match data {
-                            Ok(Some(chunk)) => {
-                                capsules.push(chunk);
-                                while let Ok(Some(Capsule::Unknown { type_id, data })) =
-                                    capsules.next_capsule()
-                                {
-                                    if type_id == CAPSULE_PEER_REFLEXIVE
-                                        && let Ok(addr) = decode_peer_reflexive(data)
-                                        && let Some(sink) = &peer_reflexive_sink
-                                    {
-                                        tracing::debug!(%addr, "bind: PEER_REFLEXIVE from relay");
-                                        let mut v = sink.lock().unwrap();
-                                        if !v.contains(&addr) {
-                                            v.push(addr);
-                                        }
-                                    }
-                                }
-                            }
+                            // Nothing on this stream is consumed today; it is
+                            // read only so that its end is noticed.
+                            Ok(Some(_)) => {}
                             // Stream closed or errored: the session is over.
                             _ => return,
                         }
@@ -1019,13 +998,8 @@ impl BindClient {
     }
 
     /// Turn this bind session into a relay-only inner-QUIC socket.
-    pub fn into_relay_socket(
-        self,
-        peer_reflexive_sink: Option<Arc<Mutex<Vec<SocketAddr>>>>,
-    ) -> crate::p2p::relay_socket::RelaySocket {
-        crate::p2p::relay_socket::RelaySocket::from_parts(
-            self.into_relay_parts(peer_reflexive_sink),
-        )
+    pub fn into_relay_socket(self) -> crate::p2p::relay_socket::RelaySocket {
+        crate::p2p::relay_socket::RelaySocket::from_parts(self.into_relay_parts())
     }
 }
 

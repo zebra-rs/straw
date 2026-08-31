@@ -60,6 +60,8 @@ Two capabilities fall out of bind mode:
 1. **Rendezvous + fallback** for strawcat: peers meet here and, if they cannot
    punch a direct path, keep using the relay as a blind forwarder.
 2. **The seed for punching**: `OBSERVED_ADDRESS` gives each peer its reflexive
-   candidate, and — with `--udp-bind-observe` — the on-path relay can also
-   observe each peer's *peer-facing* source for
-   [relay-assisted traversal](ch-03-04-symmetric-nat.md).
+   candidate — the address it advertises to the other side. The relay once
+   also observed each peer's *peer-facing* source, for
+   [relay-assisted traversal](ch-03-04-symmetric-nat.md); that observer has
+   been removed, because probes stopped passing through the relay when the
+   punch moved into the QUIC layer.
