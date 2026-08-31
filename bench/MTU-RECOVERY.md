@@ -66,21 +66,29 @@ of straw itself. The signal is noisier — TCP's own RTO backoff stalls the
 transfer for ~100 s in *any* build — so read the trace after that, not the
 average.
 
-| run | build | throughput | stalls (s) |
-|-----|-------|-----------|------------|
-| 20 s black hole, 200 s | release | 42.7 Mbit/s | 24–123, **155–196** |
-| | branch | 61.0 Mbit/s | 23–123 only |
-| 5 s black hole, 240 s | release | 25.5 Mbit/s | 23–124, **143–235** |
-| | branch | 67.6 Mbit/s | 23–122 only |
+Five runs per build, identical parameters (240 s, 3 % loss, 5 s black hole at
+t = 20 s):
 
-Both builds take the first stall and recover from it at ~122 s. Only the
-release build then collapses a second time — and that one runs to the end of
-the measurement in both pairs, i.e. the tunnel stops passing traffic and does
-not come back. n = 2 per build; the direction is consistent but the sample is
-small.
+| build | throughput (median, range) | terminal stalls | stall windows |
+|-------|---------------------------|-----------------|---------------|
+| release | **23.5** Mbit/s (19.0–39.0) | **5 / 5** | 23–~122, then ~136–end |
+| 0.11.x | **66.7** Mbit/s (62.1–71.8) | **0 / 5** | 23–~124 only |
 
-`straw_packets_mtu_dropped_total` reaches only 14 (release) versus 5 (branch),
-which looks negligible and is not: once the proxy starts dropping oversize
+Both builds take a first stall at t = 23 s and recover from it at ~122 s: that
+one is TCP's own RTO backoff after the black hole, it happens in *both* builds,
+and it says nothing about the fix. What separates them is what follows. Every
+release run then collapses a second time — at 128, 136, 136, 148 and 174 s —
+and that stall runs to the end of the measurement every time: the tunnel stops
+passing traffic and does not come back. No branch run does.
+
+The two throughput ranges do not overlap. Under the null hypothesis that the
+build makes no difference, a 5/5-versus-0/5 split of the terminal stalls has
+probability 1/C(10,5) ≈ 0.004.
+
+The `mtu_dropped` counter reads 13–21 (release) against exactly 5 (branch) in
+every run.
+
+That counter looks negligible and is not: once the proxy starts dropping oversize
 packets there is no ICMP to tell the sender (by design — the only source
 address available is a martian to it), so the origin's TCP simply retransmits
 into a black hole and backs off. A handful of dropped packets is enough to keep

@@ -86,8 +86,11 @@ in two namespaces.
 The release build's detector judges floor-size loss bursts suspicious and
 re-fires forever, so the connection never leaves `min_mtu`; that is what the pin
 avoids, and why it is worth carrying until 0.11.18 ships.
-`bench/tunnel-mtu-recovery.sh` runs the same profile through a real tunnel — a
-noisier signal,
-since TCP's own RTO backoff stalls it for ~100 s in *any* build. Numbers, method
-and the limits of both are in `bench/MTU-RECOVERY.md`; the consequence for the
-tunnel is in [The Tunnel MTU](ch-01-04-mtu.md).
+`bench/tunnel-mtu-recovery.sh` runs the same profile through a real tunnel. Over
+five runs per build the release stalls terminally — the tunnel stops passing
+traffic and never resumes — in **5 of 5**, the branch in **0 of 5**, at a median
+23.5 against 66.7 Mbit/s with no overlap in range. Read the *trace*, not the
+average: TCP's own RTO backoff stalls the first ~100 s in either build and has
+nothing to do with the fix. Numbers, method and the limits of both benchmarks
+are in `bench/MTU-RECOVERY.md`; the consequence for the tunnel is in [The Tunnel
+MTU](ch-01-04-mtu.md).
