@@ -17,14 +17,16 @@ cargo test <test_name> # Run a single test
 cargo clippy           # Lint
 cargo fmt              # Format code
 
-make -C bdd            # End-to-end BDD suite (needs passwordless sudo)
-make -C bdd tunnel_basic     # One feature, by its tag
-BDD_KEEP=1 make -C bdd tunnel_mtu   # …leaving namespaces and daemons up
+sudo -E env PATH="$PATH" make -C bdd          # End-to-end BDD suite
+sudo -E env PATH="$PATH" make -C bdd tunnel_basic   # One feature, by its tag
+sudo -E env PATH="$PATH" BDD_KEEP=1 make -C bdd tunnel_mtu   # …leaving it up
 ```
 
 Uses Rust edition 2024 (requires nightly or recent stable toolchain). A plain
 `cargo test` covers the `straw` package; the `bdd` workspace member's cucumber
-test needs root and is run through its Makefile.
+test needs root and is run through its Makefile. The `-E env PATH="$PATH"` is
+required, not decoration: root has no `CARGO_HOME` here, so a bare `sudo make
+-C bdd` dies at `cargo: No such file or directory`.
 
 ## Architecture
 
