@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use straw::client::{ClientAuth, TlsMode};
 use straw::error::ProxyError;
