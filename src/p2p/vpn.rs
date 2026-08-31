@@ -15,7 +15,6 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use ipnet::Ipv4Net;
-use tokio::sync::watch;
 
 use crate::address_pool::AddressPool;
 use crate::client::{ClientAuth, TunnelClient};
@@ -28,7 +27,7 @@ use crate::forwarding::router::RouteTable;
 use crate::forwarding::tun::{TunConfig, spawn_tun};
 use crate::iface::{self, InterfaceSetup};
 use crate::metrics::Metrics;
-use crate::server::{ProxyContext, handle_connection};
+use crate::server::ProxyContext;
 use crate::session::SessionManager;
 use crate::session::auth::{AuthMode, Authenticator};
 
@@ -40,15 +39,94 @@ const PEER_AUTHORITY: &str = "peer";
 /// `subnet`, run a TUN named `tun_name`, and forward until the connection
 /// closes. Needs ambient `CAP_NET_ADMIN` (it shells out to `ip`).
 pub async fn run_server(
-    conn: quinn::Connection,
+    conn: noq::Connection,
     subnet: Ipv4Net,
     tun_name: String,
     mtu: u16,
 ) -> Result<(), ProxyError> {
     let ctx = build_context(subnet, tun_name, mtu)?;
-    // The peer connection closing ends the handler; no separate shutdown here.
-    let (_tx, rx) = watch::channel(false);
-    handle_connection(conn, 0, ctx, rx).await
+
+    // Uplink: demux inbound QUIC DATAGRAMs to the forwarding engine.
+    let demux_ctx = ctx.clone();
+    let demux_conn = conn.clone();
+    let demux = tokio::spawn(async move { noq_uplink_demux(demux_conn, demux_ctx).await });
+
+    // Serve CONNECT-IP over HTTP/3 on the noq peer connection (h3-noq backend).
+    let mut h3_conn = h3::server::builder()
+        .enable_extended_connect(true)
+        .enable_datagram(true)
+        .build(crate::p2p::h3_noq::Connection::new(conn.clone()))
+        .await?;
+    let dgram: Arc<dyn crate::datagram::DatagramConn> = Arc::new(conn);
+
+    let result = loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                let ctx = ctx.clone();
+                let dgram = dgram.clone();
+                tokio::spawn(async move {
+                    let (req, stream) = match resolver.resolve_request().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!("failed to resolve request: {e}");
+                            return;
+                        }
+                    };
+                    // The peer is already SPKI-authenticated at the inner-TLS
+                    // layer, so there is no client certificate to pass here.
+                    if let Err(e) = crate::session::handler::handle_connect_ip_stream(
+                        req, stream, dgram, None, 0, ctx,
+                    )
+                    .await
+                    {
+                        tracing::debug!("VPN session ended with error: {e}");
+                    }
+                });
+            }
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e.into()),
+        }
+    };
+    demux.abort();
+    result
+}
+
+/// Read inbound QUIC DATAGRAMs off the noq peer connection and forward each IP
+/// packet to the engine (the VPN server's uplink; mirrors the proxy's demux
+/// without the CONNECT-UDP bind path).
+async fn noq_uplink_demux(conn: noq::Connection, ctx: Arc<ProxyContext>) {
+    use crate::session::SessionId;
+    loop {
+        let wire = match conn.read_datagram().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::trace!("VPN datagram demux ended: {e}");
+                return;
+            }
+        };
+        let (qsid, datagram) = match crate::datagram::decode_quic_datagram(wire) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::trace!("malformed datagram dropped: {e}");
+                continue;
+            }
+        };
+        if datagram.context_id != crate::datagram::CONTEXT_ID_IP_PACKET {
+            continue;
+        }
+        let session_id = SessionId::compose(0, qsid * 4);
+        let Some(assigned) = ctx.sessions.assigned_snapshot(session_id) else {
+            tracing::trace!(session = %session_id, "datagram for unknown session dropped");
+            continue;
+        };
+        match ctx
+            .engine
+            .forward_from_client(session_id, &assigned, datagram.payload)
+        {
+            Ok(_) => ctx.sessions.touch(session_id),
+            Err(e) => tracing::debug!(session = %session_id, "packet dropped: {e}"),
+        }
+    }
 }
 
 /// Assemble a minimal single-tunnel proxy context (mirrors the relevant part of
@@ -132,7 +210,7 @@ fn build_context(
 /// and pump packets until the connection closes. `mtu` overrides the sampled
 /// tunnel MTU. Needs ambient `CAP_NET_ADMIN`.
 pub async fn run_client(
-    conn: quinn::Connection,
+    conn: noq::Connection,
     tun_name: String,
     mtu: Option<u16>,
     install_routes: bool,
@@ -141,7 +219,7 @@ pub async fn run_client(
     // Scope the tunnel to the VPN subnet so the server advertises only that
     // route — a full (default) tunnel would capture the peer connection's own
     // transport and dead-lock it (design §8.3 flow scoping).
-    let mut client = TunnelClient::over_connection(
+    let mut client = TunnelClient::over_noq_connection(
         conn,
         PEER_AUTHORITY,
         ClientAuth::None,

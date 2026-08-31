@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use dashmap::DashMap;
 use http::{Method, Request, StatusCode};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -93,9 +93,80 @@ pub enum ClientAuth {
     },
 }
 
-type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
-type SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type DatagramDemux = Arc<DashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>;
+
+/// The CONNECT-IP client request stream, over either transport — h3-quinn for
+/// the proxy, h3-noq for a strawcat peer (VPN mode). One logical stream; the
+/// enum only selects the backend, so the tunnel logic stays single-path.
+enum ClientStream {
+    Quinn(h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>),
+    Noq(h3::client::RequestStream<crate::p2p::h3_noq::BidiStream<Bytes>, Bytes>),
+}
+
+impl ClientStream {
+    async fn recv_response(&mut self) -> Result<http::Response<()>, ProxyError> {
+        Ok(match self {
+            ClientStream::Quinn(s) => s.recv_response().await?,
+            ClientStream::Noq(s) => s.recv_response().await?,
+        })
+    }
+    async fn recv_data(&mut self) -> Result<Option<Bytes>, ProxyError> {
+        Ok(match self {
+            ClientStream::Quinn(s) => s.recv_data().await?.map(|mut b| b.copy_to_bytes(b.remaining())),
+            ClientStream::Noq(s) => s.recv_data().await?.map(|mut b| b.copy_to_bytes(b.remaining())),
+        })
+    }
+    async fn send_data(&mut self, data: Bytes) -> Result<(), ProxyError> {
+        match self {
+            ClientStream::Quinn(s) => s.send_data(data).await?,
+            ClientStream::Noq(s) => s.send_data(data).await?,
+        }
+        Ok(())
+    }
+    async fn finish(&mut self) -> Result<(), ProxyError> {
+        match self {
+            ClientStream::Quinn(s) => s.finish().await?,
+            ClientStream::Noq(s) => s.finish().await?,
+        }
+        Ok(())
+    }
+    fn id(&self) -> h3::quic::StreamId {
+        match self {
+            ClientStream::Quinn(s) => s.id(),
+            ClientStream::Noq(s) => s.id(),
+        }
+    }
+}
+
+/// The CONNECT-IP client stream opener, over either transport.
+enum SendReq {
+    Quinn(h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>),
+    Noq(h3::client::SendRequest<crate::p2p::h3_noq::OpenStreams, Bytes>),
+}
+
+impl SendReq {
+    async fn send_request(&mut self, req: Request<()>) -> Result<ClientStream, ProxyError> {
+        Ok(match self {
+            SendReq::Quinn(sr) => ClientStream::Quinn(sr.send_request(req).await?),
+            SendReq::Noq(sr) => ClientStream::Noq(sr.send_request(req).await?),
+        })
+    }
+}
+
+/// Decode one inbound QUIC DATAGRAM and route its IP packet to the owning
+/// tunnel's queue (shared by both transports' demux loops).
+fn dispatch_client_datagram(wire: Bytes, demux: &DatagramDemux) {
+    match decode_quic_datagram(wire) {
+        Ok((qsid, datagram)) if datagram.context_id == CONTEXT_ID_IP_PACKET => {
+            if let Some(tx) = demux.get(&qsid) {
+                // Datagram semantics: drop on backpressure.
+                let _ = tx.try_send(datagram.payload);
+            }
+        }
+        Ok(_) => {} // unknown context: silently dropped
+        Err(e) => tracing::trace!("malformed datagram dropped: {e}"),
+    }
+}
 
 /// Depth of each tunnel's inbound packet queue.
 const TUNNEL_QUEUE_DEPTH: usize = 256;
@@ -104,7 +175,7 @@ const TUNNEL_QUEUE_DEPTH: usize = 256;
 /// [`Tunnel::sender`]).
 #[derive(Debug, Clone)]
 pub struct PacketSender {
-    conn: quinn::Connection,
+    conn: Arc<dyn crate::datagram::DatagramConn>,
     qsid: u64,
 }
 
@@ -134,7 +205,7 @@ impl PacketSender {
 /// One established CONNECT-IP tunnel (a single request stream).
 pub struct Tunnel {
     stream: ClientStream,
-    conn: quinn::Connection,
+    conn: Arc<dyn crate::datagram::DatagramConn>,
     qsid: u64,
     rx: Option<tokio::sync::mpsc::Receiver<Bytes>>,
     demux: DatagramDemux,
@@ -147,8 +218,8 @@ pub struct Tunnel {
 
 impl Tunnel {
     async fn establish(
-        send_request: &mut SendRequest,
-        conn: &quinn::Connection,
+        send_request: &mut SendReq,
+        conn: &Arc<dyn crate::datagram::DatagramConn>,
         demux: &DatagramDemux,
         authority: &str,
         auth: &ClientAuth,
@@ -384,9 +455,9 @@ pub struct TunnelClient {
     // Held so the sockets outlive the tunnels (None when the connection is
     // supplied externally, e.g. a strawcat peer connection).
     _endpoint: Option<quinn::Endpoint>,
-    conn: quinn::Connection,
+    conn: Arc<dyn crate::datagram::DatagramConn>,
     // Also held because h3 closes the connection when the last one drops.
-    send_request: SendRequest,
+    send_request: SendReq,
     demux: DatagramDemux,
     authority: String,
     tunnel: Tunnel,
@@ -489,8 +560,21 @@ impl TunnelClient {
         Self::from_conn(conn, None, authority.to_string(), auth, target, ipproto).await
     }
 
-    /// Wrap `conn` for HTTP/3, start the driver + datagram demux, and establish
-    /// the first tunnel. `endpoint` is held only when this owns the socket.
+    /// Run the CONNECT-IP client over an established **noq** connection — a
+    /// strawcat peer connection (relay or punched), for VPN mode. Same as
+    /// [`over_connection`](Self::over_connection) but on the h3-noq backend.
+    pub async fn over_noq_connection(
+        conn: noq::Connection,
+        authority: &str,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
+        Self::from_noq_conn(conn, authority.to_string(), auth, target, ipproto).await
+    }
+
+    /// quinn transport: wrap `conn` for HTTP/3, start the driver + datagram
+    /// demux, and assemble. `endpoint` is held only when this owns the socket.
     async fn from_conn(
         conn: quinn::Connection,
         endpoint: Option<quinn::Endpoint>,
@@ -499,43 +583,94 @@ impl TunnelClient {
         target: Option<&str>,
         ipproto: Option<u8>,
     ) -> Result<Self, ProxyError> {
-        // Wrap for HTTP/3, keeping the raw handle for DATAGRAM I/O.
         let h3_conn = h3_quinn::Connection::new(conn.clone());
-        let (mut driver, mut send_request) = h3::client::builder()
+        let (mut driver, send_request) = h3::client::builder()
             .enable_datagram(true)
             .enable_extended_connect(true)
             .build::<_, _, Bytes>(h3_conn)
             .await?;
-
-        // The driver processes control-stream traffic for the connection.
         tokio::spawn(async move {
             let err = driver.wait_idle().await;
             tracing::debug!("h3 driver finished: {err}");
         });
-
-        // Demux inbound datagrams to tunnels by Quarter Stream ID; ends
-        // when the connection closes.
         let demux: DatagramDemux = Arc::new(DashMap::new());
         let demux_conn = conn.clone();
         let demux_map = demux.clone();
         tokio::spawn(async move {
             while let Ok(wire) = demux_conn.read_datagram().await {
-                match decode_quic_datagram(wire) {
-                    Ok((qsid, datagram)) if datagram.context_id == CONTEXT_ID_IP_PACKET => {
-                        if let Some(tx) = demux_map.get(&qsid) {
-                            // Datagram semantics: drop on backpressure.
-                            let _ = tx.try_send(datagram.payload);
-                        }
-                    }
-                    Ok(_) => {} // unknown context: silently dropped
-                    Err(e) => tracing::trace!("malformed datagram dropped: {e}"),
-                }
+                dispatch_client_datagram(wire, &demux_map);
             }
         });
+        let dgram: Arc<dyn crate::datagram::DatagramConn> = Arc::new(conn);
+        Self::assemble(
+            SendReq::Quinn(send_request),
+            dgram,
+            demux,
+            endpoint,
+            authority,
+            auth,
+            target,
+            ipproto,
+        )
+        .await
+    }
 
+    /// noq transport (a strawcat peer connection): the same over the h3-noq
+    /// backend. The connection's lifetime is the caller's, so no endpoint.
+    async fn from_noq_conn(
+        conn: noq::Connection,
+        authority: String,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
+        let h3_conn = crate::p2p::h3_noq::Connection::new(conn.clone());
+        let (mut driver, send_request) = h3::client::builder()
+            .enable_datagram(true)
+            .enable_extended_connect(true)
+            .build::<_, _, Bytes>(h3_conn)
+            .await?;
+        tokio::spawn(async move {
+            let err = driver.wait_idle().await;
+            tracing::debug!("h3 driver finished: {err}");
+        });
+        let demux: DatagramDemux = Arc::new(DashMap::new());
+        let demux_conn = conn.clone();
+        let demux_map = demux.clone();
+        tokio::spawn(async move {
+            while let Ok(wire) = demux_conn.read_datagram().await {
+                dispatch_client_datagram(wire, &demux_map);
+            }
+        });
+        let dgram: Arc<dyn crate::datagram::DatagramConn> = Arc::new(conn);
+        Self::assemble(
+            SendReq::Noq(send_request),
+            dgram,
+            demux,
+            None,
+            authority,
+            auth,
+            target,
+            ipproto,
+        )
+        .await
+    }
+
+    /// Establish the first tunnel and assemble the client (transport-agnostic).
+    #[allow(clippy::too_many_arguments)]
+    async fn assemble(
+        mut send_request: SendReq,
+        dgram: Arc<dyn crate::datagram::DatagramConn>,
+        demux: DatagramDemux,
+        endpoint: Option<quinn::Endpoint>,
+        authority: String,
+        auth: ClientAuth,
+        target: Option<&str>,
+        ipproto: Option<u8>,
+    ) -> Result<Self, ProxyError> {
         let tunnel = Tunnel::establish(
             &mut send_request,
-            &conn,
+            &dgram,
             &demux,
             &authority,
             &auth,
@@ -543,10 +678,9 @@ impl TunnelClient {
             ipproto,
         )
         .await?;
-
         Ok(Self {
             _endpoint: endpoint,
-            conn,
+            conn: dgram,
             send_request,
             demux,
             authority,
@@ -578,7 +712,7 @@ impl TunnelClient {
     pub async fn close(self) {
         let TunnelClient { conn, tunnel, .. } = self;
         tunnel.close().await;
-        conn.close(0u32.into(), b"done");
+        conn.close(0, b"done");
     }
 }
 
@@ -593,7 +727,7 @@ pub struct BindClient {
     _endpoint: quinn::Endpoint,
     _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     conn: quinn::Connection,
-    stream: ClientStream,
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     qsid: u64,
     contexts: crate::udp_bind::context::ContextTable,
     uncompressed: u64,
@@ -753,7 +887,6 @@ impl BindClient {
 
     /// Receive the next UDP payload and its source, from the relay.
     pub async fn recv_from(&self) -> Result<(SocketAddr, Bytes), ProxyError> {
-        use bytes::Buf as _;
         loop {
             let wire = self.conn.read_datagram().await?;
             let mut cursor = wire.clone();
@@ -800,7 +933,6 @@ impl BindClient {
         use crate::udp_bind::context::{
             CAPSULE_PEER_REFLEXIVE, decode_peer_reflexive, decode_uncompressed_body,
         };
-        use bytes::Buf as _;
 
         let BindClient {
             _endpoint,

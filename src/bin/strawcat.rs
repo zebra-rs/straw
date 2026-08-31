@@ -201,11 +201,13 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
-        // Parked during the noq migration: VPN mode runs CONNECT-IP/h3 over the
-        // peer connection, which now needs an h3-over-noq adapter (Stage 2).
-        return Err(ProxyError::Config(
-            "P2P VPN mode is being ported to noq (Stage 2: h3-over-noq adapter);              pipe mode works over the noq relay path".into(),
-        ));
+        return straw::p2p::vpn::run_server(
+            best,
+            args.vpn_subnet,
+            args.vpn_tun.clone(),
+            args.vpn_mtu.unwrap_or(1400),
+        )
+        .await;
     }
     // The connecting peer opens the stream; accept it on the chosen path.
     let (send, recv) = best
@@ -237,10 +239,14 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     );
     let best = best_path(&session, args.punch_wait).await;
     if args.vpn {
-        // Parked during the noq migration (see run/listen above): Stage 2.
-        return Err(ProxyError::Config(
-            "P2P VPN mode is being ported to noq (Stage 2: h3-over-noq adapter);              pipe mode works over the noq relay path".into(),
-        ));
+        return straw::p2p::vpn::run_client(
+            best,
+            args.vpn_tun.clone(),
+            args.vpn_mtu,
+            !args.vpn_no_routes,
+            Some(args.vpn_subnet.to_string()),
+        )
+        .await;
     }
     let (send, recv) = best
         .open_bi()

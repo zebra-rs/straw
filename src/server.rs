@@ -174,8 +174,20 @@ pub async fn handle_connection(
                         // connect-ip and everything else the IP handler
                         // validates and rejects as before.
                         _ => {
+                            // The CONNECT-IP handler is transport-generic; give
+                            // it the datagram seam and the pre-verified client
+                            // cert extracted from this quinn connection.
+                            let dgram: std::sync::Arc<dyn crate::datagram::DatagramConn> =
+                                std::sync::Arc::new(quinn_conn.clone());
+                            let peer_cert = quinn_conn
+                                .peer_identity()
+                                .and_then(|any| {
+                                    any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                                        .ok()
+                                })
+                                .and_then(|certs| certs.first().cloned());
                             crate::session::handler::handle_connect_ip_stream(
-                                req, stream, quinn_conn, conn_seq, ctx,
+                                req, stream, dgram, peer_cert, conn_seq, ctx,
                             )
                             .await
                         }
