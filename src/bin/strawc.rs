@@ -152,7 +152,10 @@ async fn run() -> Result<(), ProxyError> {
             }
         },
     )?;
-    tracing::info!(dev = %args.tun_name, mtu, "TUN device up");
+    // The device may not have the requested name (macOS names utun devices
+    // itself), and everything below configures it by name.
+    let dev = channels.name.clone();
+    tracing::info!(dev = %dev, mtu, "TUN device up");
 
     // A proxy reached over loopback needs no pin route (and pinning would
     // fail: the advertised routes never cover 127.0.0.0/8).
@@ -160,8 +163,8 @@ async fn run() -> Result<(), ProxyError> {
         ip if ip.is_loopback() => None,
         ip => Some(ip),
     };
-    let mut guard = Some(apply(&client, &args.tun_name, pin, !args.no_routes)?);
-    report(&client, &args.tun_name);
+    let mut guard = Some(apply(&client, &dev, pin, !args.no_routes)?);
+    report(&client, &dev);
 
     // Downlink: the connection's demux task feeds the TUN writer directly —
     // no intermediate queue or task (Step 32).
@@ -185,9 +188,9 @@ async fn run() -> Result<(), ProxyError> {
                 if let Some(sampled) = sender.max_packet_size() {
                     let sampled = u16::try_from(sampled).unwrap_or(u16::MAX);
                     if sampled >= current_mtu.saturating_add(MTU_STEP) {
-                        match iface::ip(&iface::mtu_args(&args.tun_name, sampled)) {
+                        match iface::ip(&iface::mtu_args(&dev, sampled)) {
                             Ok(()) => {
-                                tracing::info!(dev = %args.tun_name, from = current_mtu, to = sampled, "tunnel MTU raised");
+                                tracing::info!(dev = %dev, from = current_mtu, to = sampled, "tunnel MTU raised");
                                 current_mtu = sampled;
                             }
                             Err(e) => tracing::debug!("could not raise the tunnel MTU: {e}"),
@@ -200,8 +203,8 @@ async fn run() -> Result<(), ProxyError> {
                     Ok(capsules) => {
                         if capsules.iter().any(reconfigures) {
                             drop(guard.take());
-                            guard = Some(apply(&client, &args.tun_name, pin, !args.no_routes)?);
-                            report(&client, &args.tun_name);
+                            guard = Some(apply(&client, &dev, pin, !args.no_routes)?);
+                            report(&client, &dev);
                         }
                     }
                     Err(e) => {

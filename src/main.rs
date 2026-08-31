@@ -93,7 +93,7 @@ async fn run() -> Result<(), ProxyError> {
                 }
             },
         )?;
-        tracing::info!(name = %config.tun_name, %gateway, "TUN device up");
+        tracing::info!(name = %channels.name, %gateway, "TUN device up");
         tun_engine_slot = Some(engine_slot);
         Some(channels.to_net)
     } else {

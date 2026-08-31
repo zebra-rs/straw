@@ -171,7 +171,7 @@ fn build_context(
             }
         },
     )?;
-    tracing::info!(name = %tun_name, %gateway, "VPN server TUN up");
+    tracing::info!(name = %channels.name, %gateway, "VPN server TUN up");
 
     let icmp_source = IcmpSource {
         v4: gateway,
@@ -256,11 +256,13 @@ pub async fn run_client(
             }
         },
     )?;
-    tracing::info!(dev = %tun_name, mtu, "VPN client TUN up");
+    // macOS may have named the device something other than requested.
+    let dev = channels.name.clone();
+    tracing::info!(dev = %dev, mtu, "VPN client TUN up");
 
     // No pin route: the peer connection rides the relay/punch socket, not the
     // TUN, so no advertised route can capture it.
-    let mut guard = Some(apply(&client, &tun_name, install_routes)?);
+    let mut guard = Some(apply(&client, &dev, install_routes)?);
     client.set_packet_sink(channels.to_net.clone());
 
     // ADDRESS_ASSIGN / ROUTE_ADVERTISEMENT are full-state: a fresh capsule
@@ -270,7 +272,7 @@ pub async fn run_client(
             Ok(capsules) => {
                 if capsules.iter().any(reconfigures) {
                     drop(guard.take());
-                    guard = Some(apply(&client, &tun_name, install_routes)?);
+                    guard = Some(apply(&client, &dev, install_routes)?);
                 }
             }
             Err(e) => {
