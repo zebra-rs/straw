@@ -48,10 +48,13 @@ its length from `payload_bytes` — then subtracts the length **again**. The
 first overfull send buffer underflows the counter, `memory_used()` goes
 astronomical, the drop loop drains the queue and the next send panics. Any
 sustained datagram overload triggers it, on either end of the tunnel.
-Upstream `main` has restructured the loop (`make_space_for`) and doesn't
-double-subtract; no 0.11.x release carries the fix, so `vendor/quinn-proto`
-is 0.11.17 with the one-line patch (see `[patch.crates-io]`). With the patch
-the same sweep runs to completion with zero panics.
+Upstream `main` never had it — its loop lives in `make_space_for`, which
+relies on `pop_front` alone — but the `0.11.x` release branch kept the
+call-site subtraction when that buffer refactor was backported. straw first
+carried the one-line deletion as a vendored copy; upstream has since merged
+the identical fix on `0.11.x` (quinn-rs/quinn#2806), so `[patch.crates-io]`
+now points at that branch instead. With the fix the same sweep runs to
+completion with zero panics.
 
 ## After Step 32 (direct egress + amortized allocation)
 

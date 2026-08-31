@@ -104,9 +104,12 @@ process is at a single-core wall and 8 of 12 cores idle, so the ceiling is
 neither per-connection crypto nor CPU; the shared proxy-side TUN device is the
 untested next suspect, see bench/BASELINE.md). The TUN device uses IFF_VNET_HDR: every read/write
 carries a 10-byte virtio-net header, GSO aggregates are re-segmented in
-`forwarding/vnet.rs`. `vendor/quinn-proto` is 0.11.17 with a one-line
-fix for an upstream datagram-accounting bug that panicked the tunnel under
-sustained datagram overload — drop it when a fixed 0.11.x releases.
+`forwarding/vnet.rs`. `quinn-proto` is patched to upstream's **`0.11.x`
+branch** rather than the 0.11.17 release: the release double-counts dropped
+datagrams and panicked the tunnel under sustained overload, and the branch
+also fixes an MTU black-hole detector that otherwise pins a connection at
+`min_mtu` for the rest of a bulk transfer. `main` cannot be used — it is
+0.12.0, so cargo silently ignores the patch. Drop it when 0.11.18 releases.
 
 ## P2P direct path (`src/p2p/`, `src/udp_bind/`)
 
@@ -340,8 +343,9 @@ re-export from it, so the swap is a one-file edit. See
 ## Upstream gates
 
 `UPSTREAM.md` collects the four things waiting on someone else — the two
-vendored crates (`quinn-proto` 0.11.17's datagram-accounting panic, `h3` 0.0.8's
-backported `ConnectIp`), the provisional codepoints awaiting RFC publication,
+patched crates (`quinn-proto` pinned to upstream's `0.11.x` branch until 0.11.18,
+`vendor/h3` 0.0.8 with `ConnectIp` backported), the provisional codepoints
+awaiting RFC publication,
 and `OBSERVED_ADDRESS` still being a capsule because the *outer* session is
 upstream quinn. Each entry carries the command that answers "is this still
 true?", so the answer is a two-minute check rather than a re-derivation.

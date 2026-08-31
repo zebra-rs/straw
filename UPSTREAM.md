@@ -12,19 +12,54 @@ Last checked: **2026-08-31**.
 
 ---
 
-## 1. Vendored `quinn-proto` — a datagram-accounting panic
+## 1. `quinn-proto` pinned to upstream's `0.11.x` branch
 
-**What we carry.** `vendor/quinn-proto` is 0.11.17 with one deletion in
-`Datagrams::send`: the drop loop subtracted a datagram's length from
-`payload_bytes` a *second* time, after `pop_front` had already done it. The
-first overfull send buffer underflowed the counter, and every later
-`send_datagram` panicked on `expect("datagrams.outgoing.payload_bytes
-desynchronized")`, killing the tunnel under sustained datagram load. Found by
-the Phase D iperf3 UDP sweep at ~4 Gbit/s.
+**What we carry.** `[patch.crates-io]` points `quinn-proto` at the upstream
+`0.11.x` **branch** instead of the 0.11.17 release; `Cargo.lock` pins the exact
+rev. The branch is two commits ahead of the tag, and we want both:
 
-**What lands it.** Upstream `main` already fixed this by restructuring the loop
-into `make_space_for`, which relies on `pop_front` alone. We need a **0.11.x
-release** carrying that — 0.11.17 is still the newest.
+- `f650e0f` (quinn-rs/quinn#2806) — the datagram-accounting fix. In 0.11.17,
+  `Datagrams::send`'s drop loop subtracts a datagram's length from
+  `payload_bytes` a *second* time, after `pop_front` has already done it. The
+  first overfull send buffer underflows the counter, and every later
+  `send_datagram` panics on `expect("datagrams.outgoing.payload_bytes
+  desynchronized")`, killing the tunnel under sustained datagram load. Found by
+  the Phase D iperf3 UDP sweep at ~4 Gbit/s; straw carried the identical
+  one-line deletion as a vendored copy until this landed upstream.
+- `dcb9eab` (backport of #2792) — the MTU black-hole detector. Without it, once
+  a connection has fallen to `min_mtu`, full-size loss bursts keep re-triggering
+  the detector and it stays pinned at the floor for the rest of a bulk
+  transfer. straw's per-session tunnel MTU tracks quinn's live path MTU, so a
+  connection stuck at the floor drags the tunnel MTU down with it — and neither
+  the benchmarks nor the BDD suite would show it, since both run over lossless
+  links.
+
+**Why not `main`.** `main` is version **0.12.0**. quinn 0.11.11 requires
+`^0.11`, so cargo *silently drops* the patch — `warning: patch ... was not used
+in the crate graph` — and builds against the unpatched 0.11.17 with a green
+build. Reaching `main` would mean patching `quinn` to 0.12 as well, and then
+`h3-quinn` breaks: 0.0.10 is its only release and even hyperium's `master` pins
+`quinn = "0.11.7"`, so it would have to be forked too.
+
+**Why the release branch has a bug `main` doesn't.** `main`'s eviction loop
+moved out of `Datagrams::send` into `DatagramState::make_space_for` in June 2026
+(`8da45f4` and follow-ups), so when the August `DatagramBuffer` refactor
+(`de0f03b`) moved accounting into `push_back`/`pop_front`, it deleted the manual
+subtraction from that helper. `0.11.x` never took the `make_space_for` refactor
+— the loop is still inline in `send` — so the same backport left the call-site
+`-=` beside a `pop_front` that now subtracts too. Hence no upstream commit to
+cherry-pick, and a fix written directly against the branch.
+
+**What lands it.** A **0.11.18 release** carrying both commits. crates.io still
+tops out at 0.11.17 (published 2026-08-17).
+
+**Cost of the pin.** A first build fetches the repo, so it needs network; after
+that the checkout is cached under the *building user's* `CARGO_HOME` and builds
+are offline again. That cache is per-HOME, so a build run under a different
+identity fetches its own copy — run the BDD suite as
+`sudo -E env PATH="$PATH" make -C bdd`, which keeps `HOME` and reuses this
+user's cache (root has no `~/.cargo` here, and a bare `sudo make` cannot even
+find `cargo`).
 
 **Check:**
 
@@ -32,11 +67,8 @@ release** carrying that — 0.11.17 is still the newest.
 cargo search quinn-proto --limit 1     # newer than 0.11.17?
 ```
 
-If yes: drop the `[patch.crates-io]` entry and `vendor/quinn-proto`, then run
-the UDP sweep (`sudo bench/iperf-baseline.sh`) to confirm the panic stays gone.
-
-**Not yet reported upstream.** Nothing in this repo records an issue number.
-Worth filing with the reproduction above; see the note at the bottom.
+If yes: drop the `[patch.crates-io]` entry, then run the UDP sweep
+(`sudo bench/iperf-baseline.sh`) to confirm the panic stays gone.
 
 ---
 
