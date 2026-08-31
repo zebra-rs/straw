@@ -58,10 +58,16 @@ Linux/macOS CLI      NE
  undo list)         handed across FFI)
 ```
 
-`DesiredInterface` is the new seam. The CLI backends keep today's behaviour;
-the NE backend never builds a command at all. This also *simplifies* the CLI
-side, because the "what should the interface look like" logic stops being
-interleaved with "which verb removes a route on this platform".
+`DesiredInterface` is the new seam. **Done** — `iface::plan` decides,
+`iface::commands` turns a plan into (apply, undo) pairs, and `iface::realize`
+runs them; `configure` is now `realize(&plan(setup))`. The NE backend will
+consume a `DesiredInterface` and build no commands at all.
+
+It paid for itself before any Apple code exists: with the decision separated
+from its execution, the ordering property — whatever must stay off the tunnel
+is pinned *before* any route that could capture the tunnel's own transport —
+became an assertion instead of a comment. Reversing that order in the source
+now fails a test showing the default-route halves installed first.
 
 ### 1.3 No device — packets arrive by callback
 

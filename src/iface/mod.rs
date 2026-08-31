@@ -146,6 +146,63 @@ pub struct InterfaceSetup<'a> {
     pub install_routes: bool,
 }
 
+/// What the tunnel interface should look like — the decision, with none of
+/// the machinery for carrying it out.
+///
+/// This is the seam between *deciding* and *realising*, and it exists because
+/// the two platforms that realise it could not be less alike. The CLI backends
+/// turn this into a sequence of `ifconfig`/`ip`/`route` invocations with an
+/// undo list. Apple's NetworkExtension cannot execute anything at all: a
+/// provider hands the system one `NEPacketTunnelNetworkSettings` object, which
+/// is applied atomically and replaced wholesale — there is no "add one route"
+/// and nothing to undo. A plan that is pure data maps onto both;
+/// a plan expressed as commands maps onto only one.
+///
+/// Being pure also makes the interesting part testable without a kernel:
+/// `plan` decides everything, and every test below drives it directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredInterface {
+    /// Device to configure. Whatever the device actually ended up being
+    /// called — see `TunChannels::name`.
+    pub dev: String,
+    /// Addresses to put on it, as (address, prefix length).
+    pub addresses: Vec<(IpAddr, u8)>,
+    /// Routes to send through it, already decomposed from the advertised
+    /// ranges and already split if they are default routes.
+    pub routes: Vec<IpNet>,
+    /// An address that must stay reachable *outside* the tunnel — the proxy's
+    /// own, or the tunnel's transport captures itself.
+    ///
+    /// Only the requirement is stated here, not how to meet it, because the
+    /// answers differ in kind: a host route over the pre-tunnel path on the
+    /// CLI, an excluded route (or nothing at all) under NetworkExtension.
+    pub keep_off_tunnel: Option<IpAddr>,
+}
+
+/// Decide what the interface should look like. Pure: no I/O, no commands.
+pub fn plan(setup: &InterfaceSetup<'_>) -> DesiredInterface {
+    DesiredInterface {
+        dev: setup.dev.to_string(),
+        addresses: setup
+            .assigned
+            .iter()
+            .map(|a| (a.ip_address, a.prefix_length))
+            .collect(),
+        // `install_routes: false` configures addresses only, so there is
+        // nothing to keep off a tunnel that carries nothing.
+        routes: if setup.install_routes {
+            prefixes_from_ranges(setup.routes)
+        } else {
+            Vec::new()
+        },
+        keep_off_tunnel: if setup.install_routes {
+            setup.pin
+        } else {
+            None
+        },
+    }
+}
+
 /// Kernel state installed by [`configure`]; reverted on drop.
 ///
 /// Routes on the TUN device disappear with the device, so the undo list
@@ -171,31 +228,63 @@ impl Drop for InterfaceGuard {
 /// The pin route goes in before any tunnel route, so there is never a moment
 /// where a default-route half captures the QUIC connection.
 pub fn configure(setup: &InterfaceSetup<'_>) -> Result<InterfaceGuard, ProxyError> {
+    realize(&plan(setup))
+}
+
+/// The commands that realise `want`, each paired with the command that undoes
+/// it, in the order they must be applied.
+///
+/// Split out from [`realize`] so the ordering can be asserted: the address that
+/// must stay off the tunnel is pinned **first**, before any route exists that
+/// could capture the tunnel's own transport. That is a correctness property,
+/// not a style preference, and a comment saying so is not a test.
+///
+/// `pin_path` is the pre-tunnel route to that address, which only the kernel
+/// can answer — the one piece [`plan`] cannot decide on its own.
+fn commands(
+    want: &DesiredInterface,
+    pin_path: Option<&(IpAddr, (Option<IpAddr>, String))>,
+) -> Vec<(Cmd, Cmd)> {
+    let mut out = Vec::new();
+    if let Some((proxy, (gateway, dev))) = pin_path {
+        out.push((
+            pin_cmd("add", *proxy, *gateway, dev),
+            pin_cmd("del", *proxy, *gateway, dev),
+        ));
+    }
+    for (addr, len) in &want.addresses {
+        out.push((
+            addr_cmd("add", &want.dev, *addr, *len),
+            addr_cmd("del", &want.dev, *addr, *len),
+        ));
+    }
+    for prefix in &want.routes {
+        out.push((
+            route_cmd("add", *prefix, &want.dev),
+            route_cmd("del", *prefix, &want.dev),
+        ));
+    }
+    out
+}
+
+/// Carry out a [`DesiredInterface`] with this platform's commands.
+///
+/// The ordering is the one part that is not mechanical: the address that keeps
+/// the proxy off the tunnel goes in **before** any tunnel route, so there is
+/// never a moment where a default-route half captures the QUIC connection.
+pub fn realize(want: &DesiredInterface) -> Result<InterfaceGuard, ProxyError> {
+    // Resolving the pre-tunnel path is the only I/O the plan cannot carry:
+    // it has to be asked of the kernel, before any tunnel route exists.
+    let pin_path = match want.keep_off_tunnel {
+        Some(proxy) => Some((proxy, path_to(proxy)?)),
+        None => None,
+    };
+
     let mut guard = InterfaceGuard { undo: Vec::new() };
-
-    if setup.install_routes
-        && let Some(proxy) = setup.pin
-    {
-        let (gateway, dev) = path_to(proxy)?;
-        run(&pin_cmd("add", proxy, gateway, &dev))?;
-        guard.undo.push(pin_cmd("del", proxy, gateway, &dev));
-        tracing::info!(%proxy, ?gateway, dev, "pinned proxy to the pre-tunnel path");
-    }
-
-    for a in setup.assigned {
-        run(&addr_cmd("add", setup.dev, a.ip_address, a.prefix_length))?;
-        guard
-            .undo
-            .push(addr_cmd("del", setup.dev, a.ip_address, a.prefix_length));
-        tracing::info!(addr = %a.ip_address, len = a.prefix_length, dev = setup.dev, "address configured");
-    }
-
-    if setup.install_routes {
-        for prefix in prefixes_from_ranges(setup.routes) {
-            run(&route_cmd("add", prefix, setup.dev))?;
-            guard.undo.push(route_cmd("del", prefix, setup.dev));
-            tracing::info!(%prefix, dev = setup.dev, "route installed");
-        }
+    for (apply, undo) in commands(want, pin_path.as_ref()) {
+        tracing::info!(cmd = %apply, "configuring interface");
+        run(&apply)?;
+        guard.undo.push(undo);
     }
 
     Ok(guard)
@@ -234,6 +323,141 @@ mod tests {
         // Anything more specific is installed as it stands.
         let specific: IpNet = "10.0.0.0/8".parse().unwrap();
         assert_eq!(split_default(specific), vec![specific]);
+    }
+
+    fn assigned(ip: &str, len: u8) -> AssignedAddress {
+        AssignedAddress {
+            request_id: 0,
+            ip_version: if ip.contains(':') { 6 } else { 4 },
+            ip_address: ip.parse().unwrap(),
+            prefix_length: len,
+        }
+    }
+
+    /// The whole point of the split: what the interface should look like is
+    /// decided without a kernel, so it can be asserted directly.
+    #[test]
+    fn plan_decides_addresses_routes_and_what_must_stay_off_the_tunnel() {
+        let want = plan(&InterfaceSetup {
+            dev: "strawc0",
+            assigned: &[assigned("10.100.0.2", 32)],
+            routes: &[range("10.0.0.0", "10.255.255.255", 0)],
+            pin: Some("203.0.113.9".parse().unwrap()),
+            install_routes: true,
+        });
+        assert_eq!(want.dev, "strawc0");
+        assert_eq!(want.addresses, vec![("10.100.0.2".parse().unwrap(), 32)]);
+        assert_eq!(want.routes, vec!["10.0.0.0/8".parse::<IpNet>().unwrap()]);
+        assert_eq!(want.keep_off_tunnel, Some("203.0.113.9".parse().unwrap()));
+    }
+
+    /// `install_routes: false` is address-only. The pin goes with the routes:
+    /// nothing is capturing the transport, so nothing needs keeping off it —
+    /// and installing a host route on a physical interface anyway would be a
+    /// side effect the caller did not ask for.
+    #[test]
+    fn address_only_setup_plans_no_routes_and_no_pin() {
+        let want = plan(&InterfaceSetup {
+            dev: "strawc0",
+            assigned: &[assigned("10.100.0.2", 32)],
+            routes: &[range("0.0.0.0", "255.255.255.255", 0)],
+            pin: Some("203.0.113.9".parse().unwrap()),
+            install_routes: false,
+        });
+        assert_eq!(want.addresses.len(), 1, "addresses are still configured");
+        assert!(want.routes.is_empty(), "no routes were asked for");
+        assert_eq!(
+            want.keep_off_tunnel, None,
+            "nothing to keep off an empty tunnel"
+        );
+    }
+
+    /// A full tunnel arrives as a default route and must reach the plan
+    /// already split, because a plan carrying 0.0.0.0/0 would be one that
+    /// captures the tunnel's own transport on any platform that applies it.
+    #[test]
+    fn a_full_tunnel_plan_carries_halves_not_a_default_route() {
+        let want = plan(&InterfaceSetup {
+            dev: "utun9",
+            assigned: &[assigned("10.100.0.2", 32)],
+            routes: &[range("0.0.0.0", "255.255.255.255", 0)],
+            pin: Some("203.0.113.9".parse().unwrap()),
+            install_routes: true,
+        });
+        assert_eq!(
+            want.routes,
+            vec![
+                "0.0.0.0/1".parse::<IpNet>().unwrap(),
+                "128.0.0.0/1".parse().unwrap()
+            ]
+        );
+        assert!(
+            !want.routes.contains(&"0.0.0.0/0".parse::<IpNet>().unwrap()),
+            "a default route must never reach the plan"
+        );
+    }
+
+    /// The ordering property, asserted rather than commented: whatever must
+    /// stay off the tunnel is pinned before any route exists that could
+    /// capture the tunnel's own transport, and the undo list unwinds it last.
+    #[test]
+    fn the_pin_is_applied_before_any_route() {
+        let want = plan(&InterfaceSetup {
+            dev: "strawc0",
+            assigned: &[assigned("10.100.0.2", 32)],
+            routes: &[range("0.0.0.0", "255.255.255.255", 0)],
+            pin: Some("203.0.113.9".parse().unwrap()),
+            install_routes: true,
+        });
+        let proxy: IpAddr = "203.0.113.9".parse().unwrap();
+        let path = (
+            proxy,
+            (Some("192.168.1.1".parse().unwrap()), "en0".to_string()),
+        );
+        let cmds = commands(&want, Some(&path));
+
+        let rendered: Vec<String> = cmds.iter().map(|(apply, _)| apply.to_string()).collect();
+        assert!(
+            rendered[0].contains("203.0.113.9"),
+            "the pin must come first, got {rendered:?}"
+        );
+        let first_route = rendered
+            .iter()
+            .position(|c| c.contains("0.0.0.0/1"))
+            .expect("a default-route half is installed");
+        assert!(
+            first_route > 0,
+            "a route was installed before the pin: {rendered:?}"
+        );
+        // Addresses land between the two.
+        let addr = rendered
+            .iter()
+            .position(|c| c.contains("10.100.0.2"))
+            .expect("the assigned address is configured");
+        assert!(addr > 0 && addr < first_route, "{rendered:?}");
+    }
+
+    /// Every applied command carries the command that undoes it, or teardown
+    /// silently leaves state behind — which matters most for the pin, since it
+    /// lives on a physical interface and outlives the TUN device.
+    #[test]
+    fn every_command_has_an_undo() {
+        let want = plan(&InterfaceSetup {
+            dev: "strawc0",
+            assigned: &[assigned("10.100.0.2", 32)],
+            routes: &[range("10.0.0.0", "10.255.255.255", 0)],
+            pin: None,
+            install_routes: true,
+        });
+        let cmds = commands(&want, None);
+        assert_eq!(cmds.len(), 2, "one address, one route");
+        for (apply, undo) in &cmds {
+            assert_ne!(
+                apply, undo,
+                "an undo that repeats the command is not an undo"
+            );
+            assert_eq!(apply.program, undo.program);
+        }
     }
 
     #[test]
