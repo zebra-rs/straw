@@ -125,11 +125,16 @@ impl Session {
         }
     }
 
+    /// The promoted direct path, once there is one — for callers that want to
+    /// inspect it (`Connection::path_stats`, `rtt`) or close it.
+    pub fn direct_path(&self) -> Option<PathId> {
+        *self.direct.lock().unwrap()
+    }
+
     /// The peer address the direct path reaches, once there is one. It is the
     /// peer's *own* address — proof the data no longer goes through the relay.
     pub fn direct_remote(&self) -> Option<SocketAddr> {
-        let id = (*self.direct.lock().unwrap())?;
-        self.conn.path(id)?.remote_address().ok()
+        self.conn.path(self.direct_path()?)?.remote_address().ok()
     }
 
     /// The peer connection. It is the same connection whichever path is in use

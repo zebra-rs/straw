@@ -22,7 +22,7 @@ use straw::p2p::identity::Identity;
 use straw::p2p::inner_tls;
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::relay_socket::inner_endpoint;
-use straw::p2p::session::{PunchConfig, PunchInputs, Session};
+use straw::p2p::session::{PathState, PunchConfig, PunchInputs, Session};
 use straw::p2p::token::TokenV2;
 use straw::server::{ProxyContext, build_endpoint, run_server, spawn_idle_reaper};
 use straw::session::SessionManager;
@@ -1713,11 +1713,17 @@ async fn peers_upgrade_to_a_direct_path_by_hole_punching() {
     assert_eq!(&r2.read_to_end(16).await.unwrap()[..], b"direct!");
 }
 
-#[cfg(any())] // parked during noq migration: direct-path punch → Stage 3 (noq native multipath)
 #[tokio::test]
-async fn session_upgrades_to_direct_then_falls_back_on_loss() {
-    // The path state machine: RELAY → PUNCHING → DIRECT, connection() tracks
-    // the best path, and killing the direct path reverts to the relay.
+async fn a_session_falls_back_to_the_relay_when_the_direct_path_dies() {
+    // The other half of the state machine: DIRECT → (path lost) → RELAY, with
+    // the pipe surviving it. This is design goal G3 — the relay path is only
+    // *demoted* when a direct path wins, never closed, so losing the direct
+    // path costs latency and nothing else.
+    //
+    // The loss is injected by closing the direct path on one side. Both ends
+    // see it: the closer emits PathEvent::Abandoned locally, and the peer gets
+    // a PATH_ABANDON frame and abandons too — so one close exercises both
+    // sessions' fallback.
     let relay = TestServer::start_with(enable_bind).await;
     let issuer = Identity::generate().unwrap();
     let holder = Identity::generate().unwrap();
@@ -1725,85 +1731,112 @@ async fn session_upgrades_to_direct_then_falls_back_on_loss() {
     let listener = peer::listen(relay_access(&relay), &issuer, None, None)
         .await
         .unwrap();
-    let issuer_paddr = listener.paddr;
-    let issuer_punch = listener.punch_endpoint.clone();
-    let issuer_reflexive = listener.reflexive;
+    let issuer_inputs = PunchInputs {
+        mux: listener.mux.clone(),
+        reflexive: listener.reflexive,
+    };
     let token = TokenV2::issue(
-        "h3://r:443".into(),
+        "h3://relay.test:443".into(),
         [0u8; 32],
-        "a".into(),
+        "relay-bearer".into(),
         issuer.pin(),
-        vec![issuer_paddr.to_string()],
+        vec![listener.paddr.to_string()],
         1_700_000_000,
         3600,
     );
+
     let accept = tokio::spawn(async move { listener.accept().await });
     let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
         .await
         .unwrap();
     let issuer_conn = accept.await.unwrap().unwrap();
 
-    let issuer_pin = issuer.pin();
-    let holder_pin = holder.pin();
-    let issuer_relay = issuer_conn.clone();
-    let issuer_sess = Session::start(
-        issuer_conn,
+    let issuer_session = Session::start(
+        issuer_conn.clone(),
         false,
-        Arc::new(issuer),
-        Some(holder_pin),
-        issuer_punch,
-        issuer_reflexive,
-        issuer_paddr,
+        issuer_inputs,
         PunchConfig::default(),
     );
-    let holder_sess = Session::start(
-        holder_side.conn,
+    let holder_session = Session::start(
+        holder_side.conn.clone(),
         true,
-        Arc::new(holder),
-        Some(issuer_pin),
-        holder_side.punch_endpoint.clone(),
-        holder_side.reflexive,
-        issuer_paddr,
+        PunchInputs {
+            mux: holder_side.mux.clone(),
+            reflexive: holder_side.reflexive,
+        },
         PunchConfig::default(),
     );
 
-    // Both reach DIRECT.
+    let wait = Duration::from_secs(15);
     assert!(
-        issuer_sess.await_direct(Duration::from_secs(10)).await,
-        "issuer direct"
+        holder_session.await_direct(wait).await,
+        "holder goes direct"
     );
     assert!(
-        holder_sess.await_direct(Duration::from_secs(10)).await,
-        "holder direct"
-    );
-    assert_eq!(issuer_sess.state(), PathState::Direct);
-
-    // connection() now returns the direct path, not the relay.
-    let direct = issuer_sess.connection();
-    assert!(direct.remote_address().ip().is_loopback());
-    assert_ne!(
-        direct.stable_id(),
-        issuer_relay.stable_id(),
-        "distinct from the relay conn"
+        issuer_session.await_direct(wait).await,
+        "issuer goes direct"
     );
 
-    // Kill the direct path from the holder side; the issuer session reverts.
-    holder_sess.connection().close(0u32.into(), b"drop direct");
-    let mut rx_state = PathState::Direct;
-    for _ in 0..50 {
-        if issuer_sess.state() == PathState::Relay {
-            rx_state = PathState::Relay;
-            break;
+    // An echo responder that outlives the transition, so the same connection
+    // is asked to carry a stream before and after the path is lost.
+    let echo = tokio::spawn(async move {
+        while let Ok((mut s, mut r)) = issuer_conn.accept_bi().await {
+            let m = r.read_to_end(64).await.unwrap();
+            s.write_all(&m).await.unwrap();
+            s.finish().unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let round_trip = |msg: &'static [u8]| {
+        let conn = holder_session.connection();
+        async move {
+            let (mut s, mut r) = conn.open_bi().await.unwrap();
+            s.write_all(msg).await.unwrap();
+            s.finish().unwrap();
+            r.read_to_end(64).await.unwrap()
+        }
+    };
+    assert_eq!(round_trip(b"over-direct").await, b"over-direct");
+
+    // Kill the direct path.
+    let direct = holder_session
+        .direct_path()
+        .expect("the holder holds a direct path while DIRECT");
+    holder_session
+        .connection()
+        .path(direct)
+        .expect("the path is still open")
+        .close()
+        .expect("closing the direct path");
+
+    // Both sessions revert to the relay: the holder from its own close, the
+    // issuer from the PATH_ABANDON it receives.
+    for (name, session) in [("holder", &holder_session), ("issuer", &issuer_session)] {
+        let mut state = session.state();
+        for _ in 0..100 {
+            state = session.state();
+            if state == PathState::Relay {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(state, PathState::Relay, "{name} fell back to the relay");
+        assert_eq!(
+            session.direct_remote(),
+            None,
+            "{name} no longer reports a direct path"
+        );
     }
-    assert_eq!(rx_state, PathState::Relay, "issuer fell back to the relay");
-    // And connection() is the relay again.
+
+    // The point of the exercise: the pipe still works, on the same connection,
+    // without the caller doing anything.
     assert_eq!(
-        issuer_sess.connection().stable_id(),
-        issuer_relay.stable_id(),
-        "back on the relay connection"
+        tokio::time::timeout(Duration::from_secs(10), round_trip(b"over-relay"))
+            .await
+            .expect("the relay path carries traffic after the direct path is lost"),
+        b"over-relay"
     );
+    echo.abort();
 }
 
 /// A tiny in-process PCP server that answers one MAP request with a fixed
