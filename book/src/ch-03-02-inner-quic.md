@@ -59,8 +59,14 @@ probe past 1200 and would miss the bug entirely.
 MTU discovery is a connection-wide setting, and the relay path and the
 [direct path](ch-03-03-hole-punching.md) are two paths of the *same*
 connection — so the direct path is capped at 1200 as well, even though a real
-socket could carry more. Conservative, but correct; lifting it needs per-path
-discovery.
+socket could carry around 1400.
+
+Lifting that needs a per-path MTU, which the QUIC implementation does not
+expose: discovery is configured per connection, and whether it is permitted at
+all is fixed per endpoint when the endpoint is built. Raising the shared pin
+instead would reintroduce exactly the stall above. straw therefore logs the
+cost per session — the outer datagram size, how much of it is usable after bind
+framing, and the pin — so the gap is a measured number rather than a guess.
 
 ## Piping over the connection
 

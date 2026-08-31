@@ -183,8 +183,16 @@ fail `send_datagram`, stalling the connection *after* the handshake. This only
 bites once packets exceed ~1200 B, so small-payload tests miss it —
 `relay_path_carries_a_large_transfer` guards it with a 256 KiB transfer. MTU
 discovery is a connection-wide setting in noq, so the *direct* path is capped
-at 1200 too even though a real socket could carry more — correct but
-conservative, and worth revisiting if per-path discovery lands.
+at 1200 too even though a real socket could carry ~1400.
+
+**This is blocked upstream, not an oversight.** noq 1.2.0 exposes no per-path
+MTU: `TransportConfig::mtu_discovery_config` is per *connection*, and
+`allow_mtud` is fixed per *endpoint* at construction (from
+`AsyncUdpSocket::may_fragment`). Raising the shared pin instead is the trap the
+pin exists for. `peer::log_mtu_headroom` reports the cost per session at debug
+(`outer_datagram`, `usable`, `inner_mtu`) so it is measurable rather than
+theoretical — on loopback that is 1351/1316/1200 — and warns if the outer
+datagram cannot even carry a floor-sized inner packet.
 
 `pipe_stdio` in `strawcat` awaits **both** directions (never aborts the
 upload): aborting drops the `SendStream` unfinished, which quinn turns into a
