@@ -201,6 +201,22 @@ the port comes from the mux's direct socket. That is exact on a port-preserving
 targets. `--port-map` adds a PCP/NAT-PMP-forwarded address as a second
 candidate, and that one holds even on a symmetric NAT.
 
+**`strawcat --direct` (`p2p::strategy::DirectMode`) picks what is offered:**
+- `reflexive` (default) — the public address only.
+- `full` — also the **host** candidate, the local interface address, so two
+  peers on one LAN (or behind one NAT, where hairpinning often fails) connect
+  locally. It discloses a private address to the peer, hence opt-in (§10.3).
+  The address comes from `native_punch::host_ip`: a *connected* UDP socket
+  toward the relay, which performs the route lookup without sending anything —
+  the mux socket is wildcard-bound and so cannot report it.
+- `off` — never punch; pin the session to the relay path.
+
+`candidates()` assembles and de-duplicates the set (mapped, then reflexive,
+then host), dropping unspecified addresses; behind no NAT the host and
+reflexive addresses coincide and only one slot is spent. Harness: `DIRECT=<mode>
+sudo scripts/nat-punch-test.sh` — `off` is asserted not to punch even in cone
+mode, where it otherwise would.
+
 `scripts/nat-punch-test.sh` is the netns double-NAT harness
 (`peerA─natA══relay══natB─peerB`) with two NAT modes, both asserting payload
 crosses the double NAT both ways:

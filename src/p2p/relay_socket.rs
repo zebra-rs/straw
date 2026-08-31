@@ -269,6 +269,13 @@ impl PathMuxHandle {
     pub fn direct_local(&self) -> SocketAddr {
         self.direct_local
     }
+
+    /// A handle with no socket behind it, so candidate assembly can be tested
+    /// against a known port without standing up an endpoint.
+    #[cfg(test)]
+    pub(crate) fn for_test(direct_local: SocketAddr) -> Self {
+        Self { direct_local }
+    }
 }
 
 /// A noq socket that multiplexes a relay tunnel and a real UDP socket.

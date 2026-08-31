@@ -46,6 +46,19 @@ socket's **port**. The relay only ever sees the outer bind socket's source, so
 only the IP is reused from it. With `--port-map`, an explicitly forwarded
 address is advertised as well.
 
+`--direct` chooses what a peer offers:
+
+| Mode | Offers | For |
+|------|--------|-----|
+| `reflexive` | The public address. (default) | The ordinary case. |
+| `full` | Also the local interface address. | Two peers on one LAN, or behind one NAT where hairpinning fails. Discloses a private address to the peer. |
+| `off` | Nothing; never punches. | Pinning a session to the relay path. |
+
+The host address cannot come from the mux socket, which is wildcard-bound and
+would report `0.0.0.0`. It comes from a *connected* UDP socket aimed at the
+relay: connecting performs the route lookup and fixes the source address
+without sending a packet.
+
 This exchange used to be a CBOR message on an application stream. Moving it
 into the QUIC layer is what lets [VPN mode](ch-03-05-vpn-mode.md) punch at all:
 its inner protocol is HTTP/3, which would have read a stray application stream

@@ -210,7 +210,7 @@ The dialing peer (token holder) sends the inner QUIC Initial as a proxied datagr
 
 Each peer gathers, in priority order (ICE-style, host > reflexive > relay):
 
-1. **Host candidates** — local interface addresses. Leaks LAN topology to the peer; gated by `--direct=full` vs. the default `--direct=reflexive` (§10.3).
+1. **Host candidates** — local interface addresses. Leaks LAN topology to the peer; gated by `--direct=full` vs. the default `--direct=reflexive` (§10.3). **Implemented** (`p2p::strategy::DirectMode`, `native_punch::host_ip`): the address is found by connecting a UDP socket toward the relay and reading its local address, since the mux socket is wildcard-bound. `--direct=off` offers nothing and never punches.
 2. **Server-reflexive candidate** — the source (IP, port) of the peer's *outer* connection as seen by the relay. v1: the relay reports it in a vendor capsule on the bind session (we control both ends, no STUN needed):
 
 ```

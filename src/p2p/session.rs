@@ -38,7 +38,7 @@ use std::sync::Arc as StdArc;
 use crate::p2p::native_punch;
 use crate::p2p::peer::RelayAccess;
 use crate::p2p::relay_socket::PathMuxHandle;
-use crate::p2p::strategy::PunchStrategy;
+use crate::p2p::strategy::{DirectMode, PunchStrategy};
 
 /// How long one punch attempt may run before falling back to the relay.
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,6 +76,8 @@ pub struct PunchConfig {
     /// Ask the router (PCP / NAT-PMP) to forward the direct socket, advertising
     /// the mapped address as a candidate (design §11 / P3).
     pub port_map: bool,
+    /// Which candidate kinds to offer, and whether to punch at all (§10.3).
+    pub direct: DirectMode,
 }
 
 /// What the punch driver needs about this peer's own addresses.
@@ -87,6 +89,10 @@ pub struct PunchInputs {
     /// this peer's public IP; the port belongs to the outer bind socket, so
     /// only the IP is reused.
     pub reflexive: Option<SocketAddr>,
+    /// The relay's address. Not a candidate — it is the destination whose route
+    /// lookup reveals which local interface faces the peer, for the host
+    /// candidate under `--direct=full`.
+    pub relay_addr: SocketAddr,
 }
 
 /// A peer session that manages the relay↔direct path transition.
@@ -193,6 +199,11 @@ async fn manage(
         let _ = conn.closed().await;
         return;
     }
+    if !cfg.direct.punches() {
+        tracing::info!("--direct=off: pinned to the relay path, not punching");
+        let _ = conn.closed().await;
+        return;
+    }
     warn_unsupported_strategy(cfg.strategy);
 
     let mapped = if cfg.port_map {
@@ -200,11 +211,17 @@ async fn manage(
     } else {
         None
     };
-    let local = native_punch::candidates(
-        &inputs.mux,
-        inputs.reflexive.map(|r| r.ip()),
-        mapped.map(|m| m.external),
-    );
+    let sources = native_punch::Sources {
+        reflexive_ip: inputs.reflexive.map(|r| r.ip()),
+        mapped: mapped.map(|m| m.external),
+        // Costs a route lookup, so only when the mode asks for it.
+        host_ip: cfg
+            .direct
+            .offers_host()
+            .then(|| native_punch::host_ip(inputs.relay_addr))
+            .flatten(),
+    };
+    let local = native_punch::candidates(&inputs.mux, sources);
     if local.is_empty() {
         tracing::info!("no direct-path candidate for this peer; staying on the relay path");
         let _ = conn.closed().await;

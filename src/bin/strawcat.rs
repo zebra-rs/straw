@@ -29,7 +29,7 @@ use straw::p2p::identity::Identity;
 
 use straw::p2p::peer::{self, RelayAccess};
 use straw::p2p::session::{PathState, PunchConfig, PunchInputs, Session};
-use straw::p2p::strategy::PunchStrategy;
+use straw::p2p::strategy::{DirectMode, PunchStrategy};
 use straw::p2p::token::TokenV2;
 
 #[derive(Debug, Parser)]
@@ -91,6 +91,13 @@ struct RelayArgs {
     /// the others warn and fall back to it. Use --port-map for a symmetric NAT.
     #[arg(long, default_value = "basic")]
     punch_strategy: PunchStrategy,
+
+    /// Which candidates to offer the peer: reflexive (default, public address
+    /// only) | full (also the local interface address, so same-LAN peers
+    /// connect locally — discloses it to the peer) | off (never punch, pin the
+    /// session to the relay path).
+    #[arg(long, default_value = "reflexive")]
+    direct: DirectMode,
 
     /// VPN mode: run an IP tunnel between the peers (straw's CONNECT-IP stack
     /// over the peer connection) instead of piping stdin/stdout. Needs ambient
@@ -166,6 +173,7 @@ async fn listen(args: RelayArgs) -> Result<(), ProxyError> {
     let inputs = PunchInputs {
         mux: listener.mux.clone(),
         reflexive: listener.reflexive,
+        relay_addr: args.relay,
     };
 
     // Mint and print a token the other peer connects with. The relay pin and
@@ -224,6 +232,7 @@ async fn connect(token: String, args: RelayArgs) -> Result<(), ProxyError> {
     let inputs = PunchInputs {
         mux: peer_conn.mux.clone(),
         reflexive: peer_conn.reflexive,
+        relay_addr: args.relay,
     };
     let session = Session::start(peer_conn.conn, true, inputs, punch_config(&args, sink)?);
     let best = best_path(&session, args.punch_wait).await;
@@ -324,6 +333,7 @@ fn punch_config(
         relay_access,
         peer_reflexive,
         port_map: args.port_map,
+        direct: args.direct,
     })
 }
 
