@@ -335,6 +335,15 @@ standard and the gate; `udp_bind::context`, `p2p::token`, `p2p::inner_tls`
 re-export from it, so the swap is a one-file edit. See
 `p2p-direct-path-design.md` §9.
 
+## Upstream gates
+
+`UPSTREAM.md` collects the four things waiting on someone else — the two
+vendored crates (`quinn-proto` 0.11.17's datagram-accounting panic, `h3` 0.0.8's
+backported `ConnectIp`), the provisional codepoints awaiting RFC publication,
+and `OBSERVED_ADDRESS` still being a capsule because the *outer* session is
+upstream quinn. Each entry carries the command that answers "is this still
+true?", so the answer is a two-minute check rather than a re-derivation.
+
 ## Key RFCs
 
 | RFC  | Role |
