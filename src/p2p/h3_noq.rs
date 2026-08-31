@@ -457,7 +457,10 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn poll_finish(&mut self, _cx: &mut task::Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+    fn poll_finish(
+        &mut self,
+        _cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), StreamErrorIncoming>> {
         Poll::Ready(
             self.stream
                 .finish()

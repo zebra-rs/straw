@@ -135,11 +135,7 @@ impl UdpSender for RelaySender {
             transmit.destination,
             transmit.contents,
         );
-        Poll::Ready(
-            self.conn
-                .send_datagram(wire)
-                .map_err(io::Error::other),
-        )
+        Poll::Ready(self.conn.send_datagram(wire).map_err(io::Error::other))
     }
 
     fn max_transmit_segments(&self) -> NonZeroUsize {

@@ -6,7 +6,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use noq::crypto::rustls::{QuicClientConfig as NoqQuicClientConfig, QuicServerConfig as NoqQuicServerConfig};
+use noq::crypto::rustls::{
+    QuicClientConfig as NoqQuicClientConfig, QuicServerConfig as NoqQuicServerConfig,
+};
 use rustls::pki_types::CertificateDer;
 use straw::address_pool::AddressPool;
 use straw::capsule::{IpAddressRange, RequestedAddress};
@@ -1416,8 +1418,10 @@ async fn peers_open_a_direct_path_over_the_mux() {
     let holder_side = peer::connect(relay_access(&relay), &holder, &token, None)
         .await
         .unwrap();
-    let holder_direct =
-        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), holder_side.mux.direct_local().port());
+    let holder_direct = SocketAddr::new(
+        Ipv4Addr::LOCALHOST.into(),
+        holder_side.mux.direct_local().port(),
+    );
     let issuer_conn = accept.await.unwrap().unwrap();
 
     assert!(
@@ -1437,9 +1441,10 @@ async fn peers_open_a_direct_path_over_the_mux() {
 
     let hpath = tokio::time::timeout(
         Duration::from_secs(10),
-        holder_side
-            .conn
-            .open_path_ensure(noq::FourTuple::from_remote(issuer_direct), noq::PathStatus::Available),
+        holder_side.conn.open_path_ensure(
+            noq::FourTuple::from_remote(issuer_direct),
+            noq::PathStatus::Available,
+        ),
     )
     .await
     .expect("the direct path opens within 10s")
