@@ -1942,6 +1942,23 @@ async fn stun_detects_endpoint_independent_over_loopback() {
     use straw::p2p::stun::{self, NatMapping};
     let primary: std::net::SocketAddr = "127.0.0.1:34790".parse().unwrap();
     let alternate: std::net::SocketAddr = "127.0.0.2:34791".parse().unwrap();
+    // Linux owns the whole 127/8 implicitly; macOS assigns only 127.0.0.1 to
+    // lo0, so the alternate address does not exist unless someone adds it
+    // (`sudo ifconfig lo0 alias 127.0.0.2 up`). RFC 5780 mapping detection
+    // needs a genuinely different *address* to probe, so with only one there
+    // is nothing to test — skip loudly rather than assert something weaker.
+    match std::net::UdpSocket::bind(alternate) {
+        Ok(probe) => drop(probe),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            eprintln!(
+                "skipping stun_detects_endpoint_independent_over_loopback: \
+                 {alternate} is not bindable on this host \
+                 (`sudo ifconfig lo0 alias 127.0.0.2 up` enables it on macOS)"
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected error binding {alternate}: {e}"),
+    }
     tokio::spawn(async move {
         let _ = stun::serve(primary, alternate).await;
     });
