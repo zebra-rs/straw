@@ -1,6 +1,6 @@
 # Upstream gates
 
-Four things in this repo are waiting on someone else. They are collected here
+Five things in this repo are waiting on someone else. They are collected here
 because each one is otherwise a comment in a different file, and "is this still
 true?" is a question worth being able to answer in a couple of minutes rather
 than by re-deriving it.
@@ -96,6 +96,20 @@ moving the outer session to noq as well.
 # does upstream quinn expose extension frames / custom transport params yet?
 cargo search quinn --limit 1
 ```
+
+---
+
+## 5. `draft-ietf-masque-quic-proxy` — WG last call
+
+**What we carry.** Nothing: `PLAN.md` Step 33 is deliberately not started.
+
+**What lands it.** Publication, or at least exit from WG last call. The draft
+has been in last call since 2025-11-03, changed intended status mid-call, and
+its IANA section says the capsule codepoints will be replaced before
+publication. There is also nothing public to interoperate against.
+
+**Check:** <https://datatracker.ietf.org/doc/draft-ietf-masque-quic-proxy/> —
+and see `docs/quic-aware-proxying.md` for what implementing it would involve.
 
 ---
 
