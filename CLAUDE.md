@@ -108,14 +108,24 @@ sustained datagram overload — drop it when a fixed 0.11.x releases.
 
 ## P2P direct path (`src/p2p/`, `src/udp_bind/`)
 
+**Inner QUIC stack = noq.** The peer↔peer inner connection runs on **noq** (the
+n0/iroh quinn fork), adopted for its native NAT traversal + multipath +
+extension-frame APIs (branch `feature/adopt-iroh-quinn`; see
+`p2p-direct-path-design.md` §0). The **outer** bind session, the proxy, and
+CONNECT-UDP stay on upstream quinn + h3-quinn; `RelaySocket` bridges the two.
+Stage 1 (inner conn on noq) and Stage 2 (VPN over noq via the `p2p/h3_noq`
+adapter + a transport-agnostic CONNECT-IP data plane) are done; Stage 3 (direct
+path on noq native multipath, replacing the app-level punch) is in progress, so
+the punch modules (`holepunch`, `punch`) are currently parked.
+
 `strawcat` peers form a mutually SPKI-pinned inner QUIC connection through a
 straw relay running CONNECT-UDP **bind mode** (`--udp-bind`, off by default,
 auth mandatory), which forwards only ciphertext (design goal G1). Layers:
 `udp_bind/` is the relay's bind side (per-session public (IP,port) allocation,
 compression-context codec, encap/decap socket loop, connect-udp handler);
 `p2p/identity` + `p2p/token` are the trust model (Ed25519 SPKI pin, `sc2_`
-CBOR token); `p2p/relay_socket` runs an inner `quinn::AsyncUdpSocket` over a
-bind session; `p2p/inner_tls` is RFC 7250 raw-public-key mTLS pinned by SPKI;
+CBOR token); `p2p/relay_socket` runs an inner **`noq::AsyncUdpSocket`** over a
+bind session (holding the outer `quinn::Connection` — the bridge); `p2p/inner_tls` is RFC 7250 raw-public-key mTLS pinned by SPKI;
 `p2p/peer` orchestrates listen/connect. The egress SSRF guard always denies
 loopback/RFC1918/etc.; `--udp-bind-allow-dest` re-permits ranges for
 private/single-host relays (design §10.1).
@@ -146,10 +156,13 @@ stream reset that discards buffered bytes the peer never sees.
 over the peer connection instead of piping stdio, giving a real IP tunnel
 between the two hosts (`src/p2p/vpn.rs`; needs ambient `CAP_NET_ADMIN`). The
 listener is the tunnel **server** (`run_server`: a minimal `ProxyContext` + TUN,
-runs `server::handle_connection` over the inner conn, assigns from
-`--vpn-subnet`, default `10.9.0.0/24`); the connector is the **client**
-(`run_client`: `TunnelClient::over_connection` — the h3 client over an existing
-`quinn::Connection` — + TUN). The client **scopes the tunnel to the VPN subnet**
+serves CONNECT-IP/h3 over the **noq** peer connection via the `p2p/h3_noq`
+adapter + its own datagram demux, assigns from `--vpn-subnet`, default
+`10.9.0.0/24`); the connector is the **client** (`run_client`:
+`TunnelClient::over_noq_connection` — the h3 client over the existing
+`noq::Connection` — + TUN). The CONNECT-IP data plane is transport-agnostic (a
+`datagram::DatagramConn` send seam + a stream-generic server handler); proven in
+netns by `scripts/vpn-test.sh`. The client **scopes the tunnel to the VPN subnet**
 (`--vpn-subnet` as the flow scope, §8.3) so the server advertises only that
 route — a full/default tunnel would capture the peer connection's own transport
 and dead-lock it. It rides whichever path the `Session` picked (relay or
@@ -226,8 +239,10 @@ narrow port range / address-dependent filtering) that a real router may have.
 Harness: `STRATEGY=<name>` (relay-assisted also sets `--udp-bind-observe`);
 the punch stays best-effort in `symmetric` mode and asserted only in `cone`.
 
-The standards-codepoint swap (§9) is still future work (gated on quinn
-extension-frame / transport-param APIs and RFC publication), but **every
+The standards-codepoint swap (§9) is **no longer gated on upstream quinn** —
+noq ships the NAT-traversal frames, the `nat_traversal` transport param, and
+multipath; it now rides on completing Stage 3 (native multipath) and RFC
+publication. **Every
 provisional codepoint now lives in one registry, `src/codepoints.rs`** — bind
 capsule types 0x11–0x15, the `strawcat/1` ALPN, the `sc2_` token marker,
 and the documented v2 NAT-traversal frame target — each annotated with its v2

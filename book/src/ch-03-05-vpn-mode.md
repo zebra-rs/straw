@@ -13,12 +13,12 @@ the strawcat roles onto it:
 
 - The **listener** is the tunnel **server** (`run_server`). It builds a minimal
   `ProxyContext` — an address pool over `--vpn-subnet` (default `10.9.0.0/24`), a
-  TUN device, a forwarding engine — and runs the ordinary
-  `server::handle_connection` over the inner peer connection. It assigns the
-  connector an address and forwards.
+  TUN device, a forwarding engine — and serves CONNECT-IP/h3 over the inner
+  **noq** peer connection (via the `p2p::h3_noq` adapter, with its own datagram
+  demux). It assigns the connector an address and forwards.
 - The **connector** is the tunnel **client** (`run_client`). It runs
-  `TunnelClient::over_connection` — the h3 CONNECT-IP client over an already-open
-  `quinn::Connection` — receives its address, stands up its own TUN, and pumps
+  `TunnelClient::over_noq_connection` — the h3 CONNECT-IP client over the
+  already-open `noq::Connection` — receives its address, stands up its own TUN, and pumps
   packets, exactly like [`strawc`](ch-02-00-strawc.md).
 
 The tunnel rides whichever path the [`Session`](ch-03-03-hole-punching.md) picked:

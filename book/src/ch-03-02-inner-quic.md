@@ -6,19 +6,22 @@ and encrypted end to end so the relay stays a blind forwarder.
 
 ## The relay socket
 
-quinn drives a connection over anything that implements `AsyncUdpSocket`. straw
-provides `p2p::relay_socket::RelaySocket`, an `AsyncUdpSocket` whose "wire" is a
-bind session:
+The inner connection runs on **noq** (the n0/iroh quinn fork straw adopted for
+its native NAT traversal + multipath; see the P2P design doc §0). Like quinn, noq
+drives a connection over anything that implements `AsyncUdpSocket`. straw provides
+`p2p::relay_socket::RelaySocket`, a `noq::AsyncUdpSocket` whose "wire" is a bind
+session (it holds the *outer* `quinn::Connection` — the bridge between the two
+stacks):
 
-- **send** — `try_send` frames the inner packet as a bind datagram (Quarter
-  Stream ID + uncompressed body naming the peer's relay-public address) and calls
-  `send_datagram` on the *outer* connection.
+- **send** — a `UdpSender` (from noq's `create_sender`) frames the inner packet
+  as a bind datagram (Quarter Stream ID + uncompressed body naming the peer's
+  relay-public address) and calls `send_datagram` on the *outer* connection.
 - **receive** — a pump task reads the outer connection's datagrams, filters by
   Quarter Stream ID, decodes the body, and feeds the inner packet to the inner
   endpoint's receive path.
 
-An inner `quinn::Endpoint` is built over that socket
-(`inner_endpoint`, via `Endpoint::new_with_abstract_socket`). To quinn it is an
+An inner `noq::Endpoint` is built over that socket
+(`inner_endpoint`, via `Endpoint::new_with_abstract_socket`). To noq it is an
 ordinary connection; underneath, every packet is one outer QUIC DATAGRAM the
 relay forwards to the peer.
 
@@ -41,7 +44,7 @@ middle of it.
 ## The relay-path MTU pin
 
 Nesting QUIC in QUIC datagrams has one sharp edge. Each inner packet must fit in
-one outer QUIC DATAGRAM, but quinn's path-MTU discovery, left to itself, probes
+one outer QUIC DATAGRAM, but noq's path-MTU discovery, left to itself, probes
 the *inner* connection upward until its packets (≈1420 bytes) no longer fit the
 outer datagram. Those oversize packets fail `send_datagram`; the handshake — whose
 packets are ≤1200 bytes — completes, and then the connection goes dark the moment
@@ -59,5 +62,5 @@ runs over a real socket and has no such limit.
 The simplest use of the inner connection is `strawcat`'s default: pipe stdin and
 stdout over a bidirectional stream. `pipe_stdio` awaits **both** directions and
 never aborts the upload — aborting would drop the `SendStream` unfinished, which
-quinn turns into a stream reset that discards buffered bytes the peer never sees.
+noq turns into a stream reset that discards buffered bytes the peer never sees.
 The richer use — a full IP tunnel — is [VPN mode](ch-03-05-vpn-mode.md).

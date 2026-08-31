@@ -8,6 +8,40 @@ The design deliberately lands the two fixes in separate phases: end-to-end encry
 
 ---
 
+## 0. Status: the inner QUIC stack is now **noq** (2026-08)
+
+This design was written against upstream **quinn**, which has no extension-frame
+API, no custom transport parameters, and no client-side probing of new remote
+paths — so §5 and §9 build a **v1 app-level stand-in** (CBOR control messages on
+inner stream 0, a *second* raced QUIC connection for the punch) and gate the v2
+"draft-exact" path on quinn gaining those APIs.
+
+straw has since **adopted [noq](https://crates.io/crates/noq)** — the n0/iroh
+quinn fork — as the QUIC implementation for the **inner P2P connection**. noq
+ships exactly the APIs quinn lacked: QUIC-native NAT traversal
+(draft-seemann-quic-nat-traversal: the `nat_traversal` transport parameter and
+ADD_ADDRESS / PUNCH_ME_NOW / REMOVE_ADDRESS frames), **multipath** with
+`Connection::open_path` / `PathEvent`, and address discovery
+(`Connection::observed_external_addr` / `NatTraversalUpdates`). This unblocks
+the v2 path (§9) — it is no longer gated on upstream quinn.
+
+The migration is staged (branch `feature/adopt-iroh-quinn`), and each stage is a
+compiling, tested checkpoint:
+
+| Stage | What | State |
+|---|---|---|
+| **1** | The **inner** connection runs on noq (`RelaySocket: noq::AsyncUdpSocket`). The **outer** bind session, the proxy, and CONNECT-UDP stay on upstream quinn + h3-quinn — `RelaySocket` bridges the two (holds a `quinn::Connection`, presents a `noq::AsyncUdpSocket`). The app-level punch (§5.3) is parked. | ✅ done |
+| **2** | VPN mode (P3) runs its CONNECT-IP/h3 stack over the noq peer connection, via an **h3-over-noq adapter** (`src/p2p/h3_noq.rs`) plus a transport-agnostic CONNECT-IP data plane (a `DatagramConn` send seam + a stream-generic server handler + an enum-dispatch client). Proven end-to-end in netns (`scripts/vpn-test.sh`). | ✅ done |
+| **3** | Restore + improve the direct path on noq **native multipath**: a combined-transport `AsyncUdpSocket` (relay tunnel + a real UDP socket presented as two remotes of one connection) + `open_path` + address discovery, so the single inner connection migrates relay→direct in-protocol — replacing the parked app-level race (§5.3, §6). | ⬜ in progress |
+
+Design goal **G1 is preserved**: the relay still forwards inner-QUIC ciphertext
+it cannot read (`RelaySocket` sends through the outer bind connection). What
+changes below with noq: §5.3's "second raced connection" and §6's app-level
+switchover become one connection that noq migrates natively; §9's "gated on
+quinn" gate becomes "Stage 3 native-multipath integration."
+
+---
+
 ## 1. Overview
 
 ### 1.1 Goals
@@ -134,8 +168,8 @@ Token v2 {
 ## 4. Phase B — End-to-End QUIC Through the Relay
 
 > **Status:** transport landed — `src/p2p/relay_socket.rs` runs an inner QUIC
-> endpoint over a bind session (`RelaySocket: quinn::AsyncUdpSocket` via
-> `Endpoint::new_with_abstract_socket`); an integration test handshakes a
+> endpoint over a bind session (`RelaySocket: noq::AsyncUdpSocket` via
+> `Endpoint::new_with_abstract_socket`; see §0); an integration test handshakes a
 > peer↔peer connection and round-trips a stream through the relay. Inner TLS
 > is RFC 7250 raw-public-key mTLS pinned by SPKI (`src/p2p/inner_tls.rs`):
 > each peer presents its identity's public key and verifies the other's
@@ -187,11 +221,11 @@ PUNCH { round, pairs: [(local_seq, remote_seq), ...] }      // mirrors PUNCH_ME_
 CANDIDATE_RETIRE { seq }                                    // mirrors REMOVE_ADDRESS
 ```
 
-This is the v1 stand-in for the NAT-traversal draft's QUIC frames, chosen because **quinn has no extension-frame API today** (§12). Semantics are kept 1:1 with the draft — inner *server* offers addresses, inner *client* pairs them with its own and initiates rounds, a higher `round` cancels outstanding probes, and pair count per round respects a concurrency limit (default 4) — so the v2 swap is mechanical.
+This is the v1 stand-in for the NAT-traversal draft's QUIC frames, chosen because **upstream quinn has no extension-frame API** (§12). straw has since adopted **noq**, which *does* carry the draft frames natively (§0); Stage 3 replaces this stand-in with them. Semantics are kept 1:1 with the draft — inner *server* offers addresses, inner *client* pairs them with its own and initiates rounds, a higher `round` cancels outstanding probes, and pair count per round respects a concurrency limit (default 4) — so the v2 swap is mechanical.
 
 ### 5.3 Punching — Coordinated Simultaneous Open
 
-v1 does **not** migrate the existing inner connection (client-side path probing to a *new remote address* is not exposed by quinn either). Instead, DCUtR-style:
+v1 does **not** migrate the existing inner connection (client-side path probing to a *new remote address* is not exposed by *upstream quinn*). Instead, DCUtR-style — noq's `open_path` (§0) lifts this limit, and Stage 3 migrates the single connection natively:
 
 1. Inner client sends `PUNCH { round, pairs }` and immediately dials a **second QUIC connection** (same certs, same ALPN, `probe=1` in ALPN suffix or transport-level marker) from a fresh UDP socket toward each paired remote candidate.
 2. Inner server, on receiving `PUNCH`, immediately sends UDP toward the client's paired candidates (its own dial attempts, staggered ~50 ms). Both directions transmitting is what opens the NAT bindings; whichever handshake completes wins.
@@ -279,9 +313,9 @@ Everything provisional lives in one constant table — the `crate::codepoints` r
 
 | v1 (this design) | v2 (standards) | Gate |
 |---|---|---|
-| CBOR `ADDRESS_CANDIDATE` / `PUNCH` / `CANDIDATE_RETIRE` on inner stream 0 | ADD_ADDRESS / PUNCH_ME_NOW / REMOVE_ADDRESS frames (0x3d7e90..94), transport param `nat_traversal` | quinn extension-frame + custom-transport-param API |
-| Race second connection, app-level switchover | Path validation + connection migration of the single inner connection | quinn client-side probing of new remote paths |
-| Vendor OBSERVED_ADDRESS capsule on outer session | draft-ietf-quic-address-discovery OBSERVED_ADDRESS frame | same quinn gate |
+| CBOR `ADDRESS_CANDIDATE` / `PUNCH` / `CANDIDATE_RETIRE` on inner stream 0 | ADD_ADDRESS / PUNCH_ME_NOW / REMOVE_ADDRESS frames (0x3d7e90..94), transport param `nat_traversal` | ~~quinn~~ **noq ships these** — Stage 3 integration (§0) |
+| Race second connection, app-level switchover | Path validation + connection migration of the single inner connection | ~~quinn~~ **noq `open_path`** — Stage 3 (§0) |
+| Vendor OBSERVED_ADDRESS capsule on outer session | draft-ietf-quic-address-discovery OBSERVED_ADDRESS frame | noq `observed_external_addr` — Stage 3 (§0) |
 | listen-draft codepoints as of -16 | final RFC codepoints | RFC publication |
 
 Tokens carry `v`, so old and new peers fail cleanly, never confusingly.
@@ -311,7 +345,7 @@ P1 ships user-visible value on its own (E2E privacy; relay = untrusted forwarder
 | Risk | Impact | Position |
 |------|--------|----------|
 | listen draft codepoint churn before RFC | interop only with ourselves until final | acceptable — both endpoints are ours; isolated in `wire.rs` |
-| quinn: no extension frames / custom transport params / remote-path probing | blocks draft-exact v2 | v1 architecture avoids the need entirely; watch upstream, consider contributing |
+| ~~quinn: no extension frames / custom transport params / remote-path probing~~ | ~~blocks draft-exact v2~~ | **Resolved by adopting noq** (§0), which ships all three; Stage 3 integrates them |
 | symmetric NATs both sides | no direct path | relay fallback is the design, not an error; P3 port mapping recovers some |
 | double congestion control on relay path | throughput loss pre-upgrade | accepted for v1; relay path is transitional or low-volume |
 | MTU squeeze on relay path (inner 1200-byte floor) | handshake failure on small-MTU outer paths | relay advertises large datagram size; inner clamps `max_udp_payload_size`; document 1400+ MTU requirement for relay deployment |

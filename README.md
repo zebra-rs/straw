@@ -14,7 +14,9 @@ straw is three things that share one protocol stack:
 - **`strawc`** — the VPN client daemon: opens a tunnel to a proxy, creates a TUN
   device, applies the assigned addresses and routes, and pumps packets.
 - **`strawcat`** — the peer-to-peer peer: two peers rendezvous through a relay,
-  form a mutually SPKI-pinned inner QUIC connection the relay cannot read, and —
+  form a mutually SPKI-pinned inner QUIC connection (on **noq**, the n0/iroh
+  quinn fork straw adopted for native NAT traversal + multipath) the relay cannot
+  read, and —
   where the NATs allow — hole-punch a direct path. Over it they pipe stdio or run
   a full IP tunnel between the hosts (`--vpn`).
 
