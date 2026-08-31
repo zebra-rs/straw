@@ -36,6 +36,33 @@ The one exception is a **hairpin between two clients**: there both ends are insi
 the tunnel, so an oversize packet does earn a proper ICMP Packet Too Big that the
 sending client can act on.
 
+## When the path MTU collapses and stays there
+
+Tracking quinn's path MTU live is the right design, but it inherits whatever
+quinn believes — including a mistake. QUIC's black-hole detector watches for
+loss bursts that could be explained by a shrunken path and, when it has seen
+enough, drops the connection to `min_mtu` (1200) and re-searches after a
+cooldown. In the `quinn-proto` **0.11.17 release** that detector never lets go:
+once at the floor, every packet is exactly `min_mtu`, and a burst of them is
+judged suspicious (`burst.smallest_packet_size < self.min_mtu` — and `1200 <
+1200` is false), so the detector re-fires for as long as the transfer lasts.
+
+For straw that is not an abstract QUIC problem. The session MTU is the smaller
+of `--mtu` and what one datagram carries, so a connection pinned at the floor
+drags the tunnel MTU down with it and holds it there. Worse, the failure is
+**silent in both directions**: the proxy drops the now-oversize packets without
+ICMP (for the reason above), and `strawc` only ever ratchets its TUN device
+*up*, so the client keeps advertising the old, too-large MTU. The origin's TCP
+retransmits into a hole and backs off. Measured through a real tunnel, that
+shows up as the transfer stalling and never resuming.
+
+straw therefore pins `quinn-proto` to upstream's `0.11.x` branch, which carries
+the fix (see `UPSTREAM.md`). `bench/mtu-recovery.sh` is the A/B that
+demonstrates it — the release build collapses at t = 49 s and stays at 1200 for
+the remaining 152 s with 2463 detections, the branch build never leaves 1452 —
+and `bench/MTU-RECOVERY.md` records both the numbers and what the experiment
+does *not* establish.
+
 ## The relay path is stricter
 
 When two peers tunnel over the [relay](ch-03-02-inner-quic.md), the inner QUIC

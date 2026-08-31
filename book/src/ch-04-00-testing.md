@@ -22,10 +22,14 @@ binaries inside Linux network namespaces, so they test genuine kernel TUN I/O,
 routing, and NAT — not mocks.
 
 ```bash
-make -C bdd                    # the whole suite, 4-way parallel
-make -C bdd tunnel_basic       # one feature, by its tag
-BDD_KEEP=1 make -C bdd tunnel_mtu   # …leaving namespaces and daemons up
+sudo -E env PATH="$PATH" make -C bdd                  # the whole suite, 4-way parallel
+sudo -E env PATH="$PATH" make -C bdd tunnel_basic     # one feature, by its tag
+sudo -E env PATH="$PATH" BDD_KEEP=1 make -C bdd tunnel_mtu   # …leaving it up
 ```
+
+The namespaces need root, and `-E env PATH="$PATH"` is not decoration: root has
+no `CARGO_HOME` of its own here, so a bare `sudo make -C bdd` fails at
+`cargo: No such file or directory` before a single scenario runs.
 
 Each feature scopes its namespaces, veths, and pid files by its first tag
 (`@tunnel_basic` → `tunnel_basic_client`, …) so features run concurrently. `make
@@ -64,5 +68,8 @@ the 1:1 iptables forward that makes the symmetric-NAT punch succeed.
 
 ## Benchmarks
 
-`sudo bench/iperf-baseline.sh` measures throughput through the tunnel; the numbers
-and their analysis are the next chapter.
+`sudo bench/iperf-baseline.sh` measures throughput through the tunnel;
+`sudo -E env PATH="$PATH" bench/mtu-recovery.sh` measures whether a connection's
+path MTU recovers after a black-hole detection, as an A/B between two
+`quinn-proto` revisions, and `bench/tunnel-mtu-recovery.sh` runs that profile
+through a real tunnel. The numbers and their analysis are the next chapter.

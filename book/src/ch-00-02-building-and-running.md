@@ -16,6 +16,13 @@ A plain `cargo test` covers the `straw` library and its integration tests. The
 binaries in Linux network namespaces; it needs root and is driven through its
 own `Makefile` (see [Testing](ch-04-00-testing.md)).
 
+**The first build needs network access to git.** `quinn-proto` is patched to
+upstream's `0.11.x` branch rather than the crates.io release — it carries two
+fixes straw depends on, and neither is in a release yet (`UPSTREAM.md` entry 1
+has the details and the check for when that changes). `Cargo.lock` pins the
+exact revision, and the checkout is cached under `CARGO_HOME` afterwards, so
+only the first build reaches out.
+
 ## A proxy and a client, by hand
 
 The quickest way to see a tunnel is a self-signed proxy and one client. This
