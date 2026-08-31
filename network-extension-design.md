@@ -153,13 +153,34 @@ device testing.
 
 ## 5. Open questions
 
-- **UniFFI or a hand-rolled C ABI?** UniFFI generates the Swift bindings and is
-  less error-prone across an async boundary; a hand-rolled ABI is smaller and
-  has no build-time codegen. Leaning UniFFI, but the packet path is hot enough
-  that the copy cost per batch should be measured before committing.
-- **Where do credentials live?** The `sc2_` token and the client identity are
-  currently files. On iOS they belong in the Keychain, which means the container
-  app owns them and passes them in — a change to how `p2p::identity` is loaded.
+- **UniFFI or a hand-rolled C ABI?** Probably both, split by traffic shape.
+  Three things cross the boundary and they could not be less alike: *control*
+  (start/stop/status — rare, rich types, wants real error mapping), *settings*
+  (the `DesiredInterface` — rare, structured), and *packets* (hot, and just
+  bytes). UniFFI earns its keep on the first two, where hand-written Swift
+  bindings are where ownership and enum-ABI bugs live. It is the third that
+  makes people nervous, and the NE API shape mostly settles it: `readPackets`
+  delivers an *array* and `writePackets` takes one, so the boundary is crossed
+  per **batch**, not per packet. At 900 Mbit/s of 1400-byte packets — ~80k
+  pps — batches of 32 mean ~2.5k crossings/s, where even a microsecond of
+  per-call overhead is under 0.3% of a core. Keep the packet path as a narrow
+  `extern "C"` pair anyway, so it can be tuned without regenerating bindings,
+  and measure before assuming either way.
+- **Where do credentials live?** Smaller than it first looked: the *library* is
+  already storage-agnostic. `Identity::from_pem(&str)`, `TokenV2::decode(&str)`
+  and `TlsMode::Ca(CertificateDer)` all take values, not paths — the only
+  filesystem access on the client side is `load_identity` in `strawcat.rs`, a
+  binary that will not exist on iOS. So the Keychain work lives entirely in
+  Swift: read the item, pass a string across FFI. What still needs deciding is
+  the *item policy*, and one choice there is load-bearing —
+  `kSecAttrAccessible` must be `AfterFirstUnlock`, not `WhenUnlocked`, or an
+  on-demand tunnel cannot start after a reboot until the user unlocks the
+  device. The container app and the extension are separate processes, so the
+  item also needs a shared access group (App Groups entitlement).
+  Key hygiene is the one real gap: `Identity` holds an rcgen `KeyPair` and
+  nothing in the path zeroizes, so private key bytes sit in ordinary heap
+  allocations that may be reallocated. Worth a `zeroize` pass before shipping,
+  independent of Apple.
 - **Does the tokio runtime fit the extension's threading model?** The provider
   is callback-driven; straw's stack is `tokio`-native throughout. Almost
   certainly fine with a multi-thread runtime owned by the FFI layer, but worth
