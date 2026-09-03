@@ -85,3 +85,10 @@ The final part is [configuration](ch-05-00-config-straw.md) and a
 > straw is a work in progress. Where a capability is deliberately deferred — the
 > v2 standards-codepoint swap, some NAT-traversal cases that no technique solves
 > — this book says so plainly rather than implying more than exists.
+
+## License
+
+straw is dual licensed under [MIT](https://github.com/zebra-rs/straw/blob/main/LICENSE-MIT)
+or [Apache-2.0](https://github.com/zebra-rs/straw/blob/main/LICENSE-APACHE), at
+your option — the same terms as the Rust project itself, and as nearly every
+crate straw depends on. Contributions are taken under the same dual license.

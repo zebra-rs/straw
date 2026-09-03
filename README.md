@@ -58,3 +58,25 @@ make -C bdd            # end-to-end BDD suite (needs passwordless sudo)
 Neither `straw` nor `strawc` needs root — both need ambient `CAP_NET_ADMIN`. See
 [Building and Running](book/src/ch-00-02-building-and-running.md) in the manual
 for a first proxy + client and a first peer-to-peer pipe.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option — the same dual license the Rust project itself uses, so straw
+carries no terms its ecosystem does not already.
+
+`vendor/h3` is a vendored copy of the [h3](https://github.com/hyperium/h3)
+crate and stays under its own MIT license; see `vendor/h3/LICENSE` and
+[`UPSTREAM.md`](UPSTREAM.md) for why it is vendored at all.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
